@@ -1,0 +1,12 @@
+# Pinned with compatible-release ranges so a fresh install a year from now gets
+# the same numerics. If you regenerate: pip freeze > requirements.lock
+fastapi~=0.115
+uvicorn[standard]~=0.30
+python-multipart~=0.0.9
+requests~=2.32
+pandas~=2.2
+numpy~=1.26
+python-dateutil~=2.9
+openpyxl~=3.1
+prophet~=1.1.5
+statsforecast~=1.7

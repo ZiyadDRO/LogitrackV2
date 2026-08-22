@@ -1,0 +1,201 @@
+// ─────────────────────────────────────────────────────────────────────────
+// ForecastDetailsDrawer.jsx
+// A self-contained "why this forecast?" side panel for the statsforecast engine.
+//
+// Renders a small vertical tab pinned to the right edge of the screen; clicking
+// it slides in a panel that explains, in plain language, how the forecast was
+// produced: data-quality classification, which model was chosen and why, what
+// it accounts for (seasonality / price), how consistent demand is, and the
+// candidate models that were backtested.
+//
+// Reads `data.forecastDetails`, which the new engine returns from /api/forecast.
+// If that field is absent (e.g. you're running the old Prophet backend), the
+// panel degrades gracefully to a short note instead of breaking.
+//
+// Integration (already wired if you used the provided App.jsx edit):
+//   import ForecastDetailsDrawer from './ForecastDetailsDrawer';
+//   ...inside the SKU detail view, where `mlData` and `lm` exist:
+//   <ForecastDetailsDrawer data={mlData} lm={lm} />
+// ─────────────────────────────────────────────────────────────────────────
+import React from 'react';
+
+function Section({ title, children, lm }) {
+  return (
+    <div className="mb-5">
+      <div className={`text-[11px] font-semibold uppercase tracking-widest mb-2 ${lm ? 'text-slate-500' : 'text-slate-400'}`}>
+        {title}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+export default function ForecastDetailsDrawer({ data, lm = false, open = false, onClose = () => {} }) {
+  const d = data?.forecastDetails || null;
+
+  // Theming tokens (mirror the rest of the app)
+  const panelBg  = lm ? 'bg-white' : 'bg-[#0d1117]';
+  const border   = lm ? 'border-slate-200' : 'border-slate-800';
+  const textMain = lm ? 'text-slate-900' : 'text-white';
+  const textBody = lm ? 'text-slate-600' : 'text-slate-300';
+  const textMute = lm ? 'text-slate-500' : 'text-slate-500';
+  const cardBg   = lm ? 'bg-slate-50 border-slate-200' : 'bg-[#0a0f16] border-slate-800/60';
+
+  return (
+    <>
+      {!open ? null : (
+        <div className="fixed inset-0 z-50">
+          <div className="absolute inset-0 bg-black/40 backdrop-blur-[1px]" onClick={onClose} />
+          <aside className={`absolute right-0 top-0 h-full w-full max-w-md overflow-y-auto border-l ${border} ${panelBg} shadow-2xl`}>
+            {/* Header */}
+            <div className={`sticky top-0 z-10 flex items-center justify-between px-5 py-4 border-b ${border} ${panelBg}`}>
+              <div>
+                <div className={`text-sm font-bold ${textMain}`}>How this forecast was made</div>
+                <div className={`text-[11px] ${textMute}`}>{data?.skuName || data?.skuId || ''}</div>
+              </div>
+              <button
+                onClick={onClose}
+                className={`rounded-lg px-2 py-1 text-lg leading-none ${lm ? 'text-slate-400 hover:text-slate-700' : 'text-slate-500 hover:text-white'}`}
+              >×</button>
+            </div>
+
+            <div className="px-5 py-5">
+              {!d ? (
+                <div className={`rounded-xl border ${cardBg} p-4 text-xs leading-relaxed ${textBody}`}>
+                  Detailed model breakdown is available when the dashboard is connected to the
+                  <span className="font-semibold"> statsforecast engine</span>. The current backend didn’t return
+                  these details (you may be running the original Prophet model).
+                </div>
+              ) : (
+                <>
+                  {/* Last-resort caution banner */}
+                  {d.caution && (
+                    <div className={`mb-4 rounded-xl border px-3 py-2.5 text-xs leading-relaxed
+                      ${lm ? 'bg-amber-50 text-amber-800 border-amber-300' : 'bg-amber-950/40 text-amber-300 border-amber-800'}`}>
+                      <span className="font-semibold">⚠ {d.caution}</span>
+                    </div>
+                  )}
+
+                  {/* Model used */}
+                  <Section title="Model used" lm={lm}>
+                    <div className={`rounded-xl border ${cardBg} p-4`}>
+                      {d.routeLabel && (
+                        <span className={`inline-flex items-center rounded-full border px-2 py-0.5 mb-2 text-[11px] font-semibold uppercase tracking-wide
+                          ${lm ? 'bg-sky-50 text-sky-700 border-sky-200' : 'bg-sky-950 text-sky-300 border-sky-800'}`}>
+                          {d.routeLabel}
+                        </span>
+                      )}
+                      <div className={`text-base font-bold ${textMain}`}>{d.model?.label}</div>
+                      <div className={`mt-1 text-xs ${textBody} leading-relaxed`}>{d.whyChosen}</div>
+                    </div>
+                  </Section>
+
+                  {/* Lifecycle status — baseline / young / discontinued */}
+                  {(data.inactive || data.tooNew || data.young) && (
+                    <Section title="Lifecycle status" lm={lm}>
+                      <div className={`rounded-xl border ${cardBg} p-4 text-xs ${textBody} leading-relaxed`}>
+                        {data.inactive
+                          ? <><span className="font-semibold">Discontinued / dormant.</span> {data.inactiveMessage}</>
+                          : data.tooNew
+                          ? <><span className="font-semibold">Establishing baseline — {data.ownDays}/{data.baselineDays} days.</span> {data.tooNewMessage}{data.observedRunwayDays != null ? ` At ~${data.observedDailyRate}/day, about ${data.observedRunwayDays} days of stock left.` : ''}</>
+                          : <><span className="font-semibold">Young / provisional — {data.ownDays}/{data.youngThreshold} days.</span> {data.youngMessage}</>}
+                      </div>
+                    </Section>
+                  )}
+
+                  {/* Behavioural peer group — which products it pools from and why */}
+                  {data.clusterInfo && (
+                    <Section title="Behavioural peer group" lm={lm}>
+                      <div className={`rounded-xl border ${cardBg} p-4`}>
+                        <p className={`text-xs ${textBody} leading-relaxed`}>
+                          {data.route === 'global'
+                            ? <>It borrows its seasonal shape from {data.clusterInfo.chosen?.length} behaviourally-similar product{data.clusterInfo.chosen?.length !== 1 ? 's' : ''}: <span className="font-semibold">{(data.clusterInfo.chosen || []).join(', ')}</span>. They were grouped because their weekly/seasonal patterns line up, not just because they share a category label.</>
+                            : <>Within its category it clusters with: <span className="font-semibold">{(data.clusterInfo.chosen || []).join(', ')}</span>.</>}
+                        </p>
+                        <p className={`mt-1.5 text-[11px] ${textMute}`}>Matched by: {data.clusterInfo.basis}.</p>
+                        {data.clusterInfo.clusters?.length > 1 && (
+                          <p className={`mt-1.5 text-[11px] ${textMute}`}>This category splits into {data.clusterInfo.clusters.length} behavioural groups — only the matching one is pooled; the others behave differently and were left out.</p>
+                        )}
+                      </div>
+                    </Section>
+                  )}
+
+                  {/* Data quality */}
+                  <Section title="Data quality" lm={lm}>
+                    <div className="flex items-center gap-2 mb-1.5">
+                      <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold
+                        ${lm ? 'bg-sky-50 text-sky-700 border-sky-200' : 'bg-sky-950 text-sky-300 border-sky-800'}`}>
+                        {d.demand?.label}
+                      </span>
+                      <span className={`text-[11px] ${textMute}`}>{d.dataPoints?.toLocaleString()} days with sales</span>
+                    </div>
+                    <p className={`text-xs ${textBody} leading-relaxed`}>{d.demand?.description}</p>
+                  </Section>
+
+                  {/* What it accounts for */}
+                  <Section title="What it accounts for" lm={lm}>
+                    <ul className="space-y-2">
+                      <li className={`text-xs ${textBody} leading-relaxed flex gap-2`}>
+                        <span className="text-sky-500">•</span><span>{d.seasonality?.text}</span>
+                      </li>
+                      <li className={`text-xs ${textBody} leading-relaxed flex gap-2`}>
+                        <span className={d.price?.used ? 'text-emerald-500' : 'text-slate-500'}>•</span>
+                        <span>{d.price?.text}</span>
+                      </li>
+                    </ul>
+                  </Section>
+
+                  {/* Consistency */}
+                  <Section title="Demand consistency" lm={lm}>
+                    <p className={`text-xs ${textBody} leading-relaxed`}>{d.consistency?.text}</p>
+                  </Section>
+
+                  {/* Forecast range (conformal band) */}
+                  {d.interval && (
+                    <Section title="Forecast range" lm={lm}>
+                      <div className={`rounded-xl border ${cardBg} p-4`}>
+                        <div className="flex items-center gap-2 mb-1.5">
+                          <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold
+                            ${lm ? 'bg-violet-50 text-violet-700 border-violet-200' : 'bg-violet-950 text-violet-300 border-violet-800'}`}>
+                            {d.interval.level}% band
+                          </span>
+                          {d.interval.method === 'conformal' && (
+                            <span className={`text-[11px] ${textMute}`}>empirically calibrated</span>
+                          )}
+                        </div>
+                        <p className={`text-xs ${textBody} leading-relaxed`}>{d.interval.text}</p>
+                      </div>
+                    </Section>
+                  )}
+
+                  {/* Candidates tested */}
+                  {Array.isArray(d.candidates) && d.candidates.length > 0 && (
+                    <Section title={`Models tested (${d.candidates.length})`} lm={lm}>
+                      <div className={`rounded-xl border ${cardBg} divide-y ${lm ? 'divide-slate-200' : 'divide-slate-800/60'}`}>
+                        {d.candidates.map((c, i) => (
+                          <div key={i} className="flex items-center justify-between px-3 py-2">
+                            <div className="flex items-center gap-2">
+                              {c.chosen && (
+                                <span className={`inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wide
+                                  ${lm ? 'bg-emerald-100 text-emerald-700' : 'bg-emerald-950 text-emerald-400'}`}>Chosen</span>
+                              )}
+                              <span className={`text-xs ${c.chosen ? `font-semibold ${textMain}` : textBody}`}>{c.label}</span>
+                            </div>
+                            <span className={`font-mono text-[11px] ${textMute}`}>
+                              {c.mae == null ? '—' : `MAE ${c.mae}`}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                      <p className={`mt-1.5 text-[11px] ${textMute}`}>{d.backtestText} Lower MAE = more accurate.</p>
+                    </Section>
+                  )}
+                </>
+              )}
+            </div>
+          </aside>
+        </div>
+      )}
+    </>
+  );
+}

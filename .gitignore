@@ -1,0 +1,60 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Secrets. The Groq key used to be hardcoded in src/lib/ai.js and GitHub's push
+# protection blocked the commit carrying it (GH013). It lives in .env.local now.
+# `*.local` above already covers .env.local; these make the intent explicit and
+# catch the other shapes. .env.local.example IS committed — it holds no key.
+.env
+.env.*
+!.env.local.example
+
+# Python
+__pycache__/
+*.pyc
+.venv
+venv/
+
+# Runtime state
+model_switches.json
+# Sealed forecast history. Unrecoverable if lost (see forecast_log.py) — this
+# ignores it in git, it does NOT delete it. Keep the local copy; back it up
+# separately if it matters. Never commit: it's live data, not source.
+engine_statsforecast/forecast_log.json
+
+# Test-run artifacts. Inspect dumps + preview PNGs from dataset builds.
+outputs/
+*.inspect.ndjson
+inspect_errors.ndjson
+
+# Test catalogues stay out of the repo — they're data, not source.
+# Regenerate the two documented ones with the seeded builders in test_data/:
+#   python build_catalogue_v2.py    -> logitrack_catalogue_v2.xlsx  (32 SKUs)
+#   python build_master_dataset.py  -> logitrack_master_test.xlsx   (24 SKUs)
+# Drop your own catalogues in test_data/ freely; they won't be committed.
+# The small .csv fixtures ARE committed — they test malformed/short input.
+test_data/*.xlsx
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+backtest_tiers.json
+backtest_last_result.json

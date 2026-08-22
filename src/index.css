@@ -1,0 +1,12 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Match the app's default (dark) theme on the root elements so the overscroll
+   "rubber-band" gutter never flashes white — before React mounts and after,
+   above/below/left/right of the page. The app re-paints this per light/dark toggle. */
+html, body {
+  margin: 0;
+  background-color: #070b10;
+  overscroll-behavior: none;
+}
