@@ -25,9 +25,18 @@
 export const GROQ_API_KEY = import.meta.env?.VITE_GROQ_API_KEY ?? "";
 
 export const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
-// NOTE: meta-llama/llama-4-scout-17b-16e-instruct was deprecated by Groq on
-// 2026-06-17 for free/developer tiers and now 404s with "model does not exist".
-// llama-3.3-70b-versatile is a current Groq *production* model (131k context,
-// 32k max completion) and matches the "Llama 3.3 70B" label shown in AiDrawer.
+// Groq retires models on a published schedule, and this one has now been bitten
+// twice. The history, so the next person can see the pattern rather than the
+// symptom:
+//   meta-llama/llama-4-scout-17b-16e-instruct  shut down 2026-07-17
+//   llama-3.3-70b-versatile                    shut down 2026-08-16
+// Both began failing with "model does not exist", which reads like a broken key
+// or a bad request rather than a retired model.
+//
+// openai/gpt-oss-120b is a current Groq PRODUCTION model with the same 131k
+// context, and is the replacement Groq itself names for llama-3.3-70b-versatile.
+// Preview models (qwen3.6-27b and friends) are explicitly not for production use,
+// so they are not an option here however tempting the benchmarks look.
+//
 // Check https://console.groq.com/docs/deprecations before changing this again.
-export const GROQ_MODEL = "llama-3.3-70b-versatile";
+export const GROQ_MODEL = "openai/gpt-oss-120b";

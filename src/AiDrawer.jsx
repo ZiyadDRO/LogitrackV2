@@ -740,7 +740,9 @@ ${fleetCtx}
             <div className="text-[10px] text-slate-500 font-mono">
               {skuForecasts?.length ?? 0} SKU{skuForecasts?.length !== 1 ? "s" : ""}
               {folderCount > 0 ? ` · ${folderCount} folder${folderCount !== 1 ? "s" : ""}` : ""}
-              {" · full context · Llama 3.3 70B"}
+              {/* Derived from GROQ_MODEL rather than typed, so the label can't outlive
+                  the model it names the next time Groq retires one. */}
+              {` · full context · ${GROQ_MODEL.split("/").pop()}`}
             </div>
           </div>
           <button onClick={() => setOpen(false)}
