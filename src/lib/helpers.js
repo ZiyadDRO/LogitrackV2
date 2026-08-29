@@ -302,16 +302,19 @@ export function getEffectiveLeadTime(skuId, manualLeadTime, suppliers) {
 }
 
 // Maps forecast reliability (a proxy for demand volatility) to CI strategy
-export function autoStrategy(demandVolatilityColor) {
-  if (demandVolatilityColor === "GREEN")  return "lean";         // low noise → 70% CI
-  if (demandVolatilityColor === "YELLOW") return "balanced";     // moderate noise → 80% CI
-  return "conservative";                                     // ORANGE/RED → 90% CI
-}
-export const AUTO_STRATEGY_LABEL = {
-  lean:         { label: "Lean",     desc: "stable demand history",    ci: "70%" },
-  balanced:     { label: "Moderate", desc: "variable demand history",  ci: "80%" },
-  conservative: { label: "High",     desc: "volatile demand history",  ci: "90%" },
-};
+/* Every product now uses the same 80% forecast band.
+ *
+ * This used to widen or narrow the CONFIDENCE LEVEL by demand volatility: steady
+ * products were shown a 70% interval, volatile ones 90%. That double-counted, because
+ * the band's WIDTH already varies with volatility through sigma, and it left two
+ * products' bands incomparable since they were drawn to different promises. It also read
+ * backwards: a 70% band looks tighter but promises less (reality lands outside it about
+ * 3 weeks in 10) than a 90% one.
+ *
+ * Volatility still matters and is still shown; it just describes the product now instead
+ * of quietly changing what the shaded region means. Kept as a function rather than
+ * deleted so every call site keeps working and none of them re-fetch on a mismatch. */
+export function autoStrategy() { return "balanced"; }
 
 // Shipping methods have genuinely different lead times — averaging a 42-day sea
 // container with a 7-day air freight gives a number that is wrong for both. Tagging is
@@ -350,10 +353,15 @@ export function poEtaDays(po) {
   if (!po || !po.delivery) return null;
   const eta = new Date(po.delivery);
   if (Number.isNaN(eta.getTime())) return null;
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  eta.setHours(0, 0, 0, 0);
-  return Math.max(0, Math.round((eta - today) / 86400000));
+  /* Both sides on the SAME day grid, and that grid is UTC — "2026-08-30" parses as UTC
+     midnight, and todayStr() is a UTC date too. The old code parsed the ETA as UTC and
+     then floored it with local setHours(), which for anyone west of Greenwich lands on
+     the previous local day: every ETA came back a day short, so in-transit stock started
+     counting toward cover a day before it could possibly arrive. */
+  const etaUtc = Date.UTC(eta.getUTCFullYear(), eta.getUTCMonth(), eta.getUTCDate());
+  const now = new Date();
+  const todayUtc = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+  return Math.max(0, Math.round((etaUtc - todayUtc) / 86400000));
 }
 
 

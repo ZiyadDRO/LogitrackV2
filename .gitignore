@@ -58,3 +58,10 @@ test_data/*.xlsx
 *.sw?
 backtest_tiers.json
 backtest_last_result.json
+
+# Persisted app state — your store's sales history and the last backtest.
+# Data, not code: it is rebuilt from an upload or a sync, and must never be committed.
+engine_statsforecast/catalog_store/
+engine_statsforecast/backtest_store/
+# Hourly inventory readings. Runtime state like the forecast log above, not code.
+engine_statsforecast/stock_log.json

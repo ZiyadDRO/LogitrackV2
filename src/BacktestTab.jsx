@@ -1,10 +1,14 @@
 import React from "react";
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, Fragment } from "react";
 // Use the shared Groq config rather than a local copy — a duplicated model string
 // here was left behind when the model was last changed, and silently 404'd.
 import { GROQ_URL, GROQ_MODEL } from "./lib/ai";
 
-const Z = { 90: 1.2816, 95: 1.6449, 98: 2.0537, 99: 2.3263 };  // service level → z
+// Service level → z. A THIRD copy of this table (backtest.py has Z, main.py has
+// PROTECTION_TIERS) — the backend pair check each other on import; this one can only
+// be kept in step by hand. A level missing here doesn't throw: the buffer worked
+// example below silently substitutes 1.6449 and shows arithmetic the engine never did.
+const Z = { 90: 1.2816, 95: 1.6449, 98: 2.0537, 99: 2.3263, 99.5: 2.5758 };
 
 // ── plain-English hover explanations (what it is · how it affects orders · what it means) ──
 const TIP = {
@@ -26,7 +30,7 @@ const TIP = {
   train:     "How much sales history the model had at the moment it made each forecast. Accuracy naturally improves with history, so this splits 'the model is weak' from 'there wasn't enough data yet'.",
   block:     "Recent windows test how things work now. Historic windows reach further back and may reflect an older pricing or channel mix — useful for seasonal coverage, but a worse guide to today.",
   baseline:  "The same tests re-run with ONE engine forced onto every product, instead of picking per product. If routing isn't clearly better, the added complexity isn't paying for itself.",
-  optimal:   "The service level where one more unit of safety stock stops paying for itself, worked out from your own margins and holding rate. It's a continuous answer — the four tiers are just the dial settings you can pick from.",
+  optimal:   "The service level where one more unit of safety stock stops paying for itself, worked out from your own margins and holding rate. It's a continuous answer — the tiers are just the dial settings you can pick from.",
   achievedVsTarget: "Tiers are TARGETS. The buffer under-delivers, so a 99% target may only achieve 97%. Pick the tier whose ACHIEVED number lands nearest the optimum, not the one whose label looks right.",
   pcheapest: "How often this tier came out cheapest when we resampled your products. Tier costs come from averages over a handful of windows, so a small dollar gap can be pure chance. Under about 2-to-1 over the runner-up, treat them as equivalent.",
   capacity:  "How many test windows your sales history can actually support. Asking for more doesn't exclude any product — short-history products just quietly return fewer windows, which then looks like a result when it's really a sample-size problem.",
@@ -56,7 +60,7 @@ const COLDEF = {
   vstarget: ["vs target", "Achieved minus the level. Negative means under-protecting.", "Near 0. Marked 'n/s' when the gap is inside the confidence range, i.e. not meaningful."],
   pcheap:   ["P(cheapest)", "How often this level came out cheapest when we re-ran the maths on resampled products.", "Over about 60% is a real preference. Two levels near 50/50 are a coin flip."],
   lostprofit:["Lost profit / yr", "Margin you'd forgo each year to stockouts at this level, across the catalog.", "Falls as the level rises. Trade it against buffer cost."],
-  buffercost:["Buffer cost / yr", "Yearly cost of holding the safety stock — storage, tied-up cash, obsolescence.", "Rises as the level rises."],
+  buffercost:["Buffer holding / yr", "The HOLDING COST on your safety stock each year — tied-up cash, storage, insurance, obsolescence. It is Cash in buffer × your holding rate.", "Rises as the level rises. Trade it against lost profit."],
   totalcost:["Total $/yr", "Lost profit plus buffer cost. The number to minimise.", "Lowest wins — but check P(cheapest) before trusting a small gap."],
   cash:     ["Cash in buffer", "One-time working capital parked in safety stock. Not a yearly cost; its yearly cost is the buffer column.", "Lower frees cash. Worth weighing if capital is tight."],
   history:  ["History", "How much sales history the model had when it made these forecasts.", "Accuracy usually improves with history — that's data, not model quality."],
@@ -148,7 +152,7 @@ const buildCsv = (res) => {
     { label: "Buffer units", get: (t) => t.safetyUnits },
     { label: "Missed units/yr", get: (t) => t.unitsShortYr },
     { label: "Lost profit $/yr", get: (t) => t.stockoutCost },
-    { label: "Buffer cost $/yr", get: (t) => t.holdingCost },
+    { label: "Buffer holding $/yr", get: (t) => t.holdingCost },
     { label: "Total $/yr", get: (t) => t.totalCost },
     { label: "Cash in buffer $", get: (t) => t.bufferCash },
   ], ta.tiers);
@@ -172,10 +176,15 @@ const buildCsv = (res) => {
     { label: "Sells at/below cost", get: (r) => (r.lossMaking ? "yes" : "no") },
     { label: "Windows", get: (r) => r.windows },
     { label: "Its own best level %", get: (r) => r.bestTier },
+    // Same order the on-screen tables run in, and complete enough to reconcile:
+    // lost profit + buffer holding = total. Holding and cash used to be missing, so
+    // the exported "total" couldn't be rebuilt from its own neighbouring columns.
     ...tiers.flatMap((t) => [
       { label: `${t}% missed units/yr`, get: (r) => r.tiers?.[t]?.unitsYr },
-      { label: `${t}% buffer units`, get: (r) => r.tiers?.[t]?.safetyUnits },
       { label: `${t}% lost profit $/yr`, get: (r) => r.tiers?.[t]?.profitYr },
+      { label: `${t}% buffer units`, get: (r) => r.tiers?.[t]?.safetyUnits },
+      { label: `${t}% cash in buffer $`, get: (r) => r.tiers?.[t]?.bufferCash },
+      { label: `${t}% buffer holding $/yr`, get: (r) => r.tiers?.[t]?.holdingCostYr },
       { label: `${t}% total $/yr`, get: (r) => r.tiers?.[t]?.totalCostYr },
     ]),
   ], ta.bySku);
@@ -233,6 +242,7 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
   const [viewMode, setView]   = useState("client");        // "client" | "analyst"
   const [showFormulas, setShowFormulas] = useState(false);
   const [showTierDetail, setShowTierDetail] = useState(false);
+  const [matrixMetric, setMatrixMetric] = useState("profitYr");   // which metric fills the full matrix
   const [openSections, setOpenSections] = useState({});
   const [diagLoading, setDiagLoading] = useState(false);
   // Only the two methodology knobs remain local. Cutoffs are sized per product, holding
@@ -270,6 +280,26 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
           <span className={`ml-auto text-[11px] font-semibold shrink-0 ${lm ? "text-sky-600" : "text-sky-400"}`}>{open ? "Hide" : "Show"}</span>
         </button>
         {open && <div className={`border-t ${lm ? "border-slate-200" : "border-slate-800"} p-4 space-y-4`}>{children}</div>}
+      </div>
+    );
+  };
+
+  // A card whose body folds away, for the supporting tables inside a Section.
+  // "How accurate is the forecast?" used to stack six of these open at once: the two
+  // that answer the question, plus four diagnostics you only want once the answer is
+  // "not very". Same content, one question on screen at a time. `note` puts the thing
+  // you'd have opened it to check — a count, a verdict — on the closed header.
+  const Panel = ({ id, title, note = null, defaultOpen = false, children }) => {
+    const open = openSections[`p:${id}`] ?? defaultOpen;
+    return (
+      <div className={`${card} border rounded-2xl overflow-hidden`}>
+        <button onClick={() => setOpenSections((s) => ({ ...s, [`p:${id}`]: !open }))}
+          className={`w-full px-4 py-2 flex items-center gap-3 text-left transition-colors ${lm ? "hover:bg-slate-50" : "hover:bg-slate-800/40"}`}>
+          <span className={`text-[11px] uppercase tracking-widest font-bold shrink-0 ${muted}`}>{title}</span>
+          {note && <span className={`text-[11px] truncate ${muted}`}>{note}</span>}
+          <span className={`ml-auto text-[11px] font-semibold shrink-0 ${lm ? "text-sky-600" : "text-sky-400"}`}>{open ? "Hide" : "Show"}</span>
+        </button>
+        {open && <div className={`border-t ${lm ? "border-slate-200" : "border-slate-800"}`}>{children}</div>}
       </div>
     );
   };
@@ -360,8 +390,13 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
           setAutoLoad(null);
           return;
         }
-        if (res) { setAutoLoad(null); return; }
         if (d?.job?.status === "running") { setAutoLoad("running"); timer = setTimeout(pull, 4000); return; }
+        /* The server has no run. Say so, rather than leaving whatever is on screen.
+           This used to bail out when `res` was set, which meant a report could survive
+           the run it described — after a reset, or after the data changed enough that
+           the saved run no longer applies. Showing a stale report is worse than showing
+           none: it reads as current. */
+        if (res) { setRes(null); setDiag?.(null); }
         setAutoLoad("none");
       } catch { if (!cancelled) setAutoLoad("none"); }
     };
@@ -406,7 +441,7 @@ HARD RULES — do not violate:
 3. A SKU with EXCELLENT accuracy (low WAPE, MASE<1, bias≈0, coverage≈80) but LOW service does NOT have a forecast problem. Its service gap is a buffer/trend issue — recommend a higher protection tier (more safety stock), or note it's a growth-trend SKU under-buffered on the upside. Do NOT tell the user to "improve the forecast."
 4. Over-ordering (+order_err) AND low service TOGETHER is the fingerprint of VOLATILE demand (spikes beat the buffer near-term while the forecast runs high on average). Explain it as volatility, not a contradiction — you can't fix both by changing the order size.
 5. Few "forecasts" (cutoffs) ⇒ noisy numbers. Any SKU with reportable=false (under ${res.params?.minWindowsReportable ?? 4} windows) must be called out as not yet trustworthy, never acted on.
-6a. tierAnalysis.criticalRatio.optimalService is the service level that MINIMISES cost under the user's own margins and holding rate — a continuous optimum. tierAnalysis.nearestTier is the tier whose ACHIEVED service lands closest to it. Because tiers are TARGETS and the buffer under-delivers, recommend on ACHIEVED, not on the tier label. If nearestTier and bestTier disagree, say so and explain that bestTier ranks four discrete points while criticalRatio describes the underlying curve.
+6a. tierAnalysis.criticalRatio.optimalService is the service level that MINIMISES cost under the user's own margins and holding rate — a continuous optimum. tierAnalysis.nearestTier is the tier whose ACHIEVED service lands closest to it. Because tiers are TARGETS and the buffer under-delivers, recommend on ACHIEVED, not on the tier label. If nearestTier and bestTier disagree, say so and explain that bestTier ranks a few discrete points while criticalRatio describes the underlying curve.
 6b. tierAnalysis.ranking.pCheapest gives P(each tier is cheapest) over product resamples. If ranking.decisive is false, you MUST say the tier choice is too close to call and refuse to pick one on cost alone — point to the optimal-service line, working capital, or risk appetite instead.
 6c. capacity tells you how many test windows the data supports. If capacity.cappedSkus or capacity.thinSkus is non-empty, note that those products returned fewer windows than requested and their individual numbers are under-powered.
 6. CONFIDENCE INTERVALS OVERRIDE POINT ESTIMATES. Fields ending _ci are 95% intervals from resampling PRODUCTS (windows overlap in time and repeat per product, so the raw forecast count overstates the evidence). If the service target falls INSIDE service_achieved%_ci, you must say the run cannot distinguish the buffer from correctly sized — do NOT recommend a tier change off that gap. Same for MASE_ci straddling 1.0: that is "indistinguishable from naive", not "beats naive".
@@ -591,11 +626,11 @@ Write a short, plain-English read in concise "• " bullet lines (no markdown he
                 <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
                 Download CSV
               </button>
-              <button onClick={() => { setRes(null); setDiag(null); }}
-                className={`ml-auto flex items-center gap-1 text-[11px] font-semibold px-2.5 py-1 rounded-lg border transition-all ${lm ? "text-rose-600 border-rose-200 hover:bg-rose-50" : "text-rose-400 border-rose-900/40 hover:bg-rose-950/30"}`}>
-                <svg className="h-3 w-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
-                Clear results
-              </button>
+              {/* "Clear results" lived here. It only ever emptied this tab's local copy,
+                  which made sense while the browser held the report. The server persists
+                  it now, so the very next poll (5s) pulled the same report straight back
+                  — a button that visibly undid itself. What's on this tab is whatever the
+                  server has: a stored run, a new one, or nothing. */}
             </div>
             <div className={`text-[11px] ${muted}`}>
               {viewMode === "client" ? "Plain-language summary — safe to share." : "Full metrics, formulas & per-SKU detail."}
@@ -790,19 +825,31 @@ Write a short, plain-English read in concise "• " bullet lines (no markdown he
 
           {/* ───────────────── ANALYST VIEW ───────────────── */}
           {viewMode === "analyst" && (<>
-          {/* Three questions, in order: can I trust it → what do I do → how accurate is it.
-              Everything below folds away; only the decision is open by default. */}
+          {/* What do I do → what should I know first → how accurate is it. Everything folds
+              away; the decision is open by default, and the caveats section doesn't render at
+              all unless the run actually has something wrong with it. */}
           {(() => {
             const ov = res.overall || {}, cap = res.capacity || {}, ta = res.tierAnalysis || {};
+            // INVARIANT: this list gates whether the caveats section renders at all, so it
+            // must fire for EVERY warning that section can display. Miss one and a product
+            // drops out of the results with nothing anywhere saying it did — the exact
+            // silent-loss bug the section exists to prevent. Untested products used to be
+            // missing from here: they aren't in bySku (never tested, so `reportable` can't
+            // flag them) and aren't in cappedSkus (that's "tested with fewer windows").
             const issues = [];
-            if (res.failedCutoffs > 0) issues.push(`${res.failedCutoffs} window${res.failedCutoffs === 1 ? "" : "s"} failed`);
-            if (cap.cappedSkus?.length) issues.push(`${cap.cappedSkus.length} product${cap.cappedSkus.length === 1 ? "" : "s"} under-tested`);
+            const notTested = (res.skipped || []).filter((s) => s.kind !== "error").length;
+            const plural = (n) => (n === 1 ? "" : "s");
+            if (res.failedCutoffs > 0) issues.push(`${res.failedCutoffs} window${plural(res.failedCutoffs)} failed`);
+            if (notTested > 0) issues.push(`${notTested} product${plural(notTested)} not tested`);
+            if (cap.untestableSkus > 0 && !notTested) issues.push(`${cap.untestableSkus} product${plural(cap.untestableSkus)} not tested`);
+            if (cap.cappedSkus?.length) issues.push(`${cap.cappedSkus.length} product${plural(cap.cappedSkus.length)} under-tested`);
+            if (cap.thinSkus?.length || (res.bySku || []).some((r) => r.reportable === false)) issues.push("some products too thin to read");
             if (ov["interval_cov%"] != null && (ov["interval_cov%"] < 75 || ov["interval_cov%"] > 88)) issues.push("bands miscalibrated");
-            if ((res.bySku || []).some((r) => r.reportable === false)) issues.push("some products too thin to read");
             runQualityIssues = issues;
-            trustSummary = issues.length
-              ? `${res.forecasts} tests on ${res.tested} products · ${issues.join(" · ")}`
-              : `${res.forecasts} tests on ${res.tested} products · nothing flagged`;
+            // No "nothing flagged" branch any more: the section this feeds is only rendered
+            // when issues is non-empty, so a clean run shows nothing at all rather than a
+            // card whose entire message is that there's no message.
+            trustSummary = `${res.forecasts} tests on ${res.tested} products · ${issues.join(" · ")}`;
             const nt = (ta.tiers || []).find((t) => t.tier === (ta.nearestTier ?? ta.bestTier));
             const _mp = ta.mixedPolicy;
             const _bu = Math.min(...(ta.tiers || []).map((t) => t.totalCost).filter((v) => v != null));
@@ -861,14 +908,18 @@ Write a short, plain-English read in concise "• " bullet lines (no markdown he
                       <Th tip={TIP.ci}>95% CI</Th>
                       <Th tip="Achieved service minus the tier's target. Negative = under-protecting — but only if the target falls outside the confidence interval.">vs target</Th>
                       {ta.ranking && <Th tip={TIP.pcheapest}>P(cheapest)</Th>}
-                      <Th tip="Spare units you'd carry across the catalog at this level. This is the quantity the buffer cost is built from: buffer units x unit cost x holding rate.">Buffer units</Th>
+                      {/* Ordered as two halves of one trade-off, each running units -> money:
+                            what stockouts cost you, then what protecting against them costs.
+                            "Buffer units" and "Cash in buffer" are the same quantity in two
+                            units and now sit together — they used to be five columns apart. */}
                       <Th tip="Units of demand per year you'd fail to cover at this level, across the catalog. This is the quantity the lost profit is built from: missed units x profit per unit.">Missed units / yr</Th>
                       <Th tip={lostProfitTip}>Lost profit / yr</Th>
-                      <Th tip="The yearly cost of carrying the safety buffer = Cash in buffer × your holding rate. Rises with the tier because more safety stock costs more to hold (tied-up capital + storage + obsolescence).">Buffer cost / yr</Th>
-                      <Th tip="Lost profit/yr + Buffer cost/yr. The lowest total is the economically right tier — this is the profit decision.">Total $/yr</Th>
-                      <th className={`${th} border-l ${lm ? "border-slate-200" : "border-slate-800"}`} title="Working capital parked in the safety buffer at this tier (safety units × cost). A ONE-TIME amount you tie up — like a till float — NOT a yearly cost (its yearly cost is the Buffer cost column). The sub-line is the extra/less cash vs the recommended tier. It is NOT added to Total.">
+                      <Th tip="Spare units you'd carry across the catalog at this level. This is the quantity the holding cost is built from: buffer units x unit cost x holding rate.">Buffer units</Th>
+                      <th className={`${th} border-l ${lm ? "border-slate-200" : "border-slate-800"}`} title="Working capital parked in the safety buffer at this tier (buffer units × unit cost). A ONE-TIME amount you tie up — like a till float — NOT a yearly cost. Its yearly cost is the next column. The sub-line is the extra/less cash vs the recommended tier. It is NOT added to Total.">
                         <span className="underline decoration-dotted decoration-slate-500/60 underline-offset-4 cursor-help">Cash in buffer</span>
                       </th>
+                      <Th tip="HOLDING COST on the safety buffer = Cash in buffer × your holding rate. Covers tied-up capital, storage, insurance and obsolescence. Rises with the tier because more safety stock costs more to hold. This is the yearly figure; Cash in buffer is the one-time amount it's charged on.">Buffer holding / yr</Th>
+                      <Th tip="Lost profit/yr + Buffer holding/yr. The lowest total is the economically right tier — this is the profit decision. Cash in buffer is NOT included: it's capital tied up, not an annual expense.">Total $/yr</Th>
                     </tr></thead>
                     <tbody>
                       {ta.tiers.map((t) => {
@@ -896,15 +947,15 @@ Write a short, plain-English read in concise "• " bullet lines (no markdown he
                                 </td>
                               );
                             })()}
-                            <td className={`px-3 py-2 text-xs tabular-nums ${muted}`}>{t.safetyUnits == null ? "—" : Math.round(t.safetyUnits).toLocaleString()}</td>
                             <td className={`px-3 py-2 text-xs font-semibold tabular-nums ${text}`}>{t.unitsShortYr == null ? "—" : Math.round(t.unitsShortYr).toLocaleString()}</td>
                             <td className={`px-3 py-2 text-xs tabular-nums ${muted}`}>{money(t.stockoutCost)}</td>
-                            <td className={`px-3 py-2 text-xs tabular-nums ${muted}`}>{money(t.holdingCost)}</td>
-                            <td className={`px-3 py-2 text-xs font-bold tabular-nums ${isBest ? tone(lm, "good") : text}`}>{money(t.totalCost)}</td>
+                            <td className={`px-3 py-2 text-xs tabular-nums ${muted}`}>{t.safetyUnits == null ? "—" : Math.round(t.safetyUnits).toLocaleString()}</td>
                             <td className={`px-3 py-2 tabular-nums align-top border-l ${lm ? "border-slate-200" : "border-slate-800"}`}>
                               <div className={`text-xs font-semibold ${text}`}>{money(t.bufferCash)}</div>
                               <div className={`text-[10px] ${muted}`}>{isBest ? "baseline" : t.bufferCashDelta == null ? "" : `${t.bufferCashDelta > 0 ? "+" : "−"}$${Math.round(Math.abs(t.bufferCashDelta)).toLocaleString()} vs ${best}%`}</div>
                             </td>
+                            <td className={`px-3 py-2 text-xs tabular-nums ${muted}`}>{money(t.holdingCost)}</td>
+                            <td className={`px-3 py-2 text-xs font-bold tabular-nums ${isBest ? tone(lm, "good") : text}`}>{money(t.totalCost)}</td>
                           </tr>
                         );
                       })}
@@ -955,8 +1006,8 @@ Write a short, plain-English read in concise "• " bullet lines (no markdown he
                   <Guide id="tiers" cols={["tier","achieved","ci","vstarget","pcheap","bufunits","missunits","lostprofit","buffercost","totalcost","cash"]}
                     extra={[
                       ...(ta.mixedPolicy ? [["Per-product mix", "Every product on its own cheapest level instead of one shared level. Scored fairly: each simulated reorder is graded with a level chosen from that product's OTHER test windows, never the one being graded — otherwise the mix would win automatically by keeping every product's lucky result. Hindsight scoring would have claimed " + money(ta.mixedPolicy.inSampleTotal) + "/yr.", "If it beats the best single level, the app deploys the per-product levels; if not, everyone gets the winning single level. Applied automatically either way."]] : []),
-                      ["How the dollars are built", "Lost profit/yr = missed units/yr × profit per unit (price − cost − fees), summed per product. Buffer cost/yr = buffer units × unit cost × your holding rate. The shortfall is a simulation per tier — would forecast + that tier's buffer have covered the next lead-time's real demand — not the stockouts in your history.", "Costs cover only the safety-stock policy, the part the tier changes."],
-                      ["Cash in buffer vs Buffer cost", "Cash in buffer is one-time working capital parked in safety stock — not a yearly cost and not added to Total. Its yearly cost is already the Buffer cost column (cash × holding rate).", "Use it to judge affordability, not to rank tiers."],
+                      ["How the dollars are built", "Lost profit/yr = missed units/yr × profit per unit (price − cost − fees), summed per product. Buffer holding/yr = buffer units × unit cost × your holding rate. The shortfall is a simulation per tier — would forecast + that tier's buffer have covered the next lead-time's real demand — not the stockouts in your history.", "Costs cover only the safety-stock policy, the part the tier changes."],
+                      ["Cash in buffer vs Buffer holding", "Cash in buffer is one-time working capital parked in safety stock — not a yearly cost and not added to Total. Its yearly cost is already the Buffer holding column (cash × holding rate).", "Use it to judge affordability, not to rank tiers."],
                     ]} />
                 </div>
               );
@@ -976,22 +1027,72 @@ Write a short, plain-English read in concise "• " bullet lines (no markdown he
               const money = (v) => v == null ? "—" : `$${Math.round(v).toLocaleString()}`;
               const thc = `text-right text-[11px] uppercase tracking-widest font-bold ${muted} px-3 py-2`;
               const colHL = (t) => t === best ? (lm ? "bg-emerald-50" : "bg-emerald-950/20") : "";
+              // Count what's actually RANKED, not what was tested. The header used to read
+              // ta.bySku.length ("27 products") above a table listing only the ones with a
+              // costed best tier ("24 rows"), so three products silently went missing
+              // between a label and the table right under it.
+              const withTier = ta.bySku.filter((s) => s.bestTier != null);
+              const noRank = ta.bySku.length - withTier.length;
               return (
                 <div className={`${card} border rounded-2xl overflow-hidden`}>
                   <button onClick={() => setShowTierDetail((v) => !v)}
                     className={`w-full px-4 py-2 flex items-center justify-between ${lm ? "hover:bg-slate-50" : "hover:bg-slate-800/40"} transition-colors`}>
                     <span className={`text-[11px] uppercase tracking-widest font-bold ${muted}`}>Per-product breakdown</span>
-                    <span className={`text-[11px] font-semibold ${lm ? "text-sky-600" : "text-sky-400"}`}>{showTierDetail ? "Hide" : "Show"} · {ta.bySku.length} products</span>
+                    <span className={`text-[11px] font-semibold ${lm ? "text-sky-600" : "text-sky-400"}`}>
+                      {showTierDetail ? "Hide" : "Show"} · {withTier.length} product{withTier.length === 1 ? "" : "s"}
+                      {noRank > 0 && <span className={`font-normal ${muted}`}> · {noRank} without a cost</span>}
+                    </span>
                   </button>
                   {showTierDetail && (
                     <div className={`border-t ${lm ? "border-slate-200" : "border-slate-800"}`}>
-                      {/* Per-product recommended tier — one catalog-wide tier leaves money on
-                          the table whenever margins differ between products. */}
+                      {/* Per-product view, rebuilt.
+                          It used to be five stacked product x tier tables — the same rows
+                          and the same tier columns, five times over, several hundred numbers
+                          on screen at once, with the actual decision (which tier for which
+                          product) buried in the first of them. Now: one decision row per
+                          product, that product's own numbers on click, and the raw matrix
+                          behind a switcher. Same data, one thing visible at a time — and it
+                          stops growing a new full-width table every time a metric is added. */}
                       {(() => {
-                        const withTier = ta.bySku.filter((s) => s.bestTier != null);
                         if (!withTier.length) return null;
                         const differing = withTier.filter((s) => s.bestTier !== best);
                         const crBySku = ta.criticalRatio?.bySku || {};
+
+                        // A product that never ran short in ANY test window has zero lost
+                        // profit at every tier, so its total cost is holding cost alone and
+                        // the CHEAPEST tier always wins — mechanically, not because thin
+                        // protection suits it. Its critical ratio meanwhile says protect
+                        // heavily, because that's computed from margin, not from this run.
+                        // The two columns then flatly contradicted each other with nothing
+                        // to explain why. They aren't in conflict: this run simply can't
+                        // rank tiers for that product, and saying so is the honest answer.
+                        const unranked = (s) => !tiers.some((t) => (s.tiers[t]?.profitYr || 0) > 0);
+                        const nUnranked = withTier.filter(unranked).length;
+
+                        const METRICS = [
+                          { key: "unitsYr",       label: "Missed units / yr",   fmt: (v) => Math.round(v).toLocaleString(), total: (t) => t.unitsShortYr, round: true },
+                          { key: "profitYr",      label: "Lost profit / yr",    fmt: money, total: (t) => t.stockoutCost },
+                          { key: "safetyUnits",   label: "Buffer units",        fmt: (v) => Math.round(v).toLocaleString(), total: (t) => t.safetyUnits, round: true },
+                          { key: "bufferCash",    label: "Cash in buffer",      fmt: money, total: (t) => t.bufferCash },
+                          { key: "holdingCostYr", label: "Buffer holding / yr", fmt: money, total: (t) => t.holdingCost },
+                        ];
+                        const metric = METRICS.find((m) => m.key === matrixMetric) || METRICS[1];
+
+                        // Magnitude as a neutral wash, so the shape of a row reads without
+                        // reading its digits. Deliberately grey, not red/green: these are
+                        // quantities, and half of them are good when large.
+                        const shade = (v, lo, hi) => {
+                          if (v == null || !(hi > lo)) return "";
+                          const f = (v - lo) / (hi - lo);
+                          if (f < 0.2) return "";
+                          return lm ? (f > 0.75 ? "bg-slate-200/70" : f > 0.45 ? "bg-slate-100" : "bg-slate-50")
+                                    : (f > 0.75 ? "bg-slate-700/40" : f > 0.45 ? "bg-slate-800/50" : "bg-slate-800/25");
+                        };
+                        const rowRange = (s, key) => {
+                          const vs = tiers.map((t) => s.tiers[t]?.[key]).filter((v) => v != null);
+                          return vs.length ? [Math.min(...vs), Math.max(...vs)] : [0, 0];
+                        };
+
                         return (
                           <>
                             <div className={`px-4 pt-3 pb-1.5 text-xs uppercase tracking-widest font-bold ${text}`}>
@@ -1002,7 +1103,7 @@ Write a short, plain-English read in concise "• " bullet lines (no markdown he
                             </div>
                             <table className="w-full">
                               <thead><tr>
-                                <th className={th} title="The product this row is about."><span className="underline decoration-dotted decoration-slate-500/60 underline-offset-4 cursor-help">Product</span></th>
+                                <th className={th} title="The product this row is about. Click any row to see its own numbers at every tier."><span className="underline decoration-dotted decoration-slate-500/60 underline-offset-4 cursor-help">Product</span></th>
                                 <th className={thc} title="The protection level that costs this product the least, from its own margin and demand swing."><span className="underline decoration-dotted decoration-slate-500/60 underline-offset-4 cursor-help">Its own best tier</span></th>
                                 <th className={thc} title={TIP.optimal}><span className="underline decoration-dotted underline-offset-4 cursor-help">Optimal service</span></th>
                                 <th className={thc} title="Yearly lost profit + buffer cost for this product at its own best level."><span className="underline decoration-dotted decoration-slate-500/60 underline-offset-4 cursor-help">Cost at its tier</span></th>
@@ -1015,15 +1116,60 @@ Write a short, plain-English read in concise "• " bullet lines (no markdown he
                                   const cat = s.tiers[best]?.totalCostYr;
                                   const pen = own != null && cat != null ? cat - own : null;
                                   const off = s.bestTier !== best;
+                                  const flat = unranked(s);
+                                  const openRow = openSections[`sku:${s.sku}`] ?? false;
                                   return (
-                                    <tr key={s.sku} className={lm ? "border-t border-slate-100" : "border-t border-slate-800/60"}>
-                                      <td className={`px-3 py-2 text-sm font-semibold ${text}`}>{s.sku}</td>
-                                      <td className={`px-3 py-2 text-sm font-bold tabular-nums text-right ${off ? tone(lm, "warn") : text}`}>{s.bestTier}%</td>
-                                      <td className={`px-3 py-2 text-sm tabular-nums text-right ${muted}`}>{crBySku[s.sku] != null ? `${crBySku[s.sku]}%` : "—"}</td>
-                                      <td className={`px-3 py-2 text-sm tabular-nums text-right ${muted}`}>{money(own)}</td>
-                                      <td className={`px-3 py-2 text-sm tabular-nums text-right ${muted}`}>{money(cat)}</td>
-                                      <td className={`px-3 py-2 text-sm font-bold tabular-nums text-right ${!pen ? muted : tone(lm, "warn")}`}>{pen ? money(pen) : "—"}</td>
-                                    </tr>
+                                    // Fragment, keyed: a bare <> cannot take a key, and the
+                                    // key has to sit on the OUTERMOST node returned from the
+                                    // map or React reconciles these two-row groups by position
+                                    // — expanding one row would move another row's open state.
+                                    <Fragment key={s.sku}>
+                                      <tr
+                                          onClick={() => setOpenSections((o) => ({ ...o, [`sku:${s.sku}`]: !openRow }))}
+                                          className={`cursor-pointer ${lm ? "border-t border-slate-100 hover:bg-slate-50" : "border-t border-slate-800/60 hover:bg-slate-800/40"}`}>
+                                        <td className={`px-3 py-2 text-sm font-semibold ${text}`}>
+                                          <span className={`inline-block w-3 ${muted}`}>{openRow ? "▾" : "▸"}</span>
+                                          {s.sku}
+                                          {flat && <span className={`ml-1.5 text-[10px] font-semibold ${muted}`} title="This product never ran short in any test window, so every tier costs it the same in lost profit and the cheapest buffer wins by default. This run can't rank tiers for it — the Optimal service column, which comes from its margin rather than from this run, is the better guide.">never short</span>}
+                                        </td>
+                                        <td className={`px-3 py-2 text-sm font-bold tabular-nums text-right ${flat ? muted : off ? tone(lm, "warn") : text}`}>{flat ? "—" : `${s.bestTier}%`}</td>
+                                        <td className={`px-3 py-2 text-sm tabular-nums text-right ${flat ? text : muted}`}>{crBySku[s.sku] != null ? `${crBySku[s.sku]}%` : "—"}</td>
+                                        <td className={`px-3 py-2 text-sm tabular-nums text-right ${muted}`}>{money(own)}</td>
+                                        <td className={`px-3 py-2 text-sm tabular-nums text-right ${muted}`}>{money(cat)}</td>
+                                        <td className={`px-3 py-2 text-sm font-bold tabular-nums text-right ${!pen ? muted : tone(lm, "warn")}`}>{pen ? money(pen) : "—"}</td>
+                                      </tr>
+                                      {openRow && (
+                                        <tr className={lm ? "bg-slate-50/70" : "bg-slate-900/40"}>
+                                          <td colSpan={6} className="px-3 pb-3 pt-1">
+                                            <table className="w-full">
+                                              <thead><tr>
+                                                <th className={`text-left text-[10px] uppercase tracking-widest font-bold ${muted} px-2 py-1`}>{s.sku} at every tier</th>
+                                                {tiers.map((t) => <th key={t} className={`text-right text-[10px] uppercase tracking-widest font-bold ${muted} px-2 py-1 ${colHL(t)}`}>{t}%</th>)}
+                                              </tr></thead>
+                                              <tbody>
+                                                {METRICS.map((m) => {
+                                                  const [lo, hi] = rowRange(s, m.key);
+                                                  return (
+                                                    <tr key={m.key}>
+                                                      <td className={`px-2 py-1 text-[11px] ${muted}`}>{m.label}</td>
+                                                      {tiers.map((t) => { const v = s.tiers[t]?.[m.key]; return (
+                                                        <td key={t} className={`px-2 py-1 text-[11px] tabular-nums text-right ${v == null ? muted : text} ${shade(v, lo, hi)} ${colHL(t)}`}>{v == null ? "—" : m.fmt(v)}</td>
+                                                      ); })}
+                                                    </tr>
+                                                  );
+                                                })}
+                                                <tr className={lm ? "border-t border-slate-300" : "border-t border-slate-700"}>
+                                                  <td className={`px-2 py-1 text-[11px] font-bold ${text}`}>Total / yr</td>
+                                                  {tiers.map((t) => { const v = s.tiers[t]?.totalCostYr; const isOwn = t === s.bestTier && !flat; return (
+                                                    <td key={t} className={`px-2 py-1 text-[11px] font-bold tabular-nums text-right ${isOwn ? tone(lm, "good") : text} ${colHL(t)}`}>{money(v)}</td>
+                                                  ); })}
+                                                </tr>
+                                              </tbody>
+                                            </table>
+                                          </td>
+                                        </tr>
+                                      )}
+                                    </Fragment>
                                   );
                                 })}
                               </tbody>
@@ -1033,101 +1179,80 @@ Write a short, plain-English read in concise "• " bullet lines (no markdown he
                               ["Optimal service", "The stay-in-stock rate where one more spare unit stops paying for itself, for this product.", "The tier whose achieved rate is nearest this is the right one for it."],
                               ["Cost at its tier", "Yearly lost profit plus buffer cost at that product's own best level.", "Lower is better — it's the floor for this product."],
                               ["Penalty", "Extra yearly cost of holding this product at the catalog-wide level instead of its own.", "Near $0 means one setting for everything is fine. A large total is the case for per-product levels."],
+                              ["“never short”", "This product didn't run short once in any test window, so it forfeits no profit at ANY tier and the cheapest buffer wins by arithmetic rather than by fit. Its best tier is left blank instead of showing a pick this run didn't really make.", "Use its Optimal service figure, which comes from margin rather than from this run."],
                             ]} />
                             <div className={`px-4 py-2 text-[11px] leading-relaxed ${muted}`}>
-                              Each product&apos;s own cheapest tier, from its own margin and demand volatility. The last column is what it costs that product to be held at the catalog-wide {best}% instead — sum it to see the price of a single setting for everything. Products whose margins are similar will mostly agree; a wide spread here is the argument for per-product protection levels.
+                              Click any product for its own numbers at every tier. The last column is what it costs that product to be held at the catalog-wide {best}% instead of its own — sum it to price a single setting for everything. Products with similar margins mostly agree; a wide spread is the argument for per-product levels.
+                              {nUnranked > 0 && <> {nUnranked} product{nUnranked === 1 ? "" : "s"} never ran short in testing, so this run can&apos;t rank tiers for {nUnranked === 1 ? "it" : "them"} — {nUnranked === 1 ? "it's" : "they're"} marked <span className="font-semibold">never short</span>.</>}
                             </div>
+
+                            {/* The raw matrix, one metric at a time. This is the five old
+                                tables, except you choose which one you're looking at instead
+                                of scrolling past four to reach it. */}
+                            {(() => {
+                              const openMatrix = openSections["matrix"] ?? false;
+                              return (
+                                <div className={`border-t ${lm ? "border-slate-200" : "border-slate-800"}`}>
+                                  <button onClick={() => setOpenSections((o) => ({ ...o, matrix: !openMatrix }))}
+                                    className={`w-full px-4 py-2 flex items-center justify-between text-left ${lm ? "hover:bg-slate-50" : "hover:bg-slate-800/40"} transition-colors`}>
+                                    <span className={`text-[11px] uppercase tracking-widest font-bold ${muted}`}>Every product at every tier</span>
+                                    <span className={`text-[11px] font-semibold ${lm ? "text-sky-600" : "text-sky-400"}`}>{openMatrix ? "Hide" : "Show"}</span>
+                                  </button>
+                                  {openMatrix && (
+                                    <div className={`border-t ${lm ? "border-slate-200" : "border-slate-800"}`}>
+                                      <div className="flex flex-wrap gap-1 px-4 py-2.5">
+                                        {METRICS.map((m) => (
+                                          <button key={m.key} onClick={() => setMatrixMetric(m.key)}
+                                            className={`px-2.5 py-1 rounded-full text-[11px] font-semibold transition-colors ${
+                                              m.key === metric.key
+                                                ? (lm ? "bg-slate-800 text-white" : "bg-slate-200 text-slate-900")
+                                                : (lm ? "bg-slate-100 text-slate-600 hover:bg-slate-200" : "bg-slate-800 text-slate-300 hover:bg-slate-700")}`}>
+                                            {m.label}
+                                          </button>
+                                        ))}
+                                      </div>
+                                      <div className="overflow-x-auto">
+                                        <table className="w-full">
+                                          <thead><tr>
+                                            <th className={th} title="The product this row is about."><span className="underline decoration-dotted decoration-slate-500/60 underline-offset-4 cursor-help">Product</span></th>
+                                            {tiers.map((t) => <th key={t} className={`${thc} ${colHL(t)}`} title={`This product if you ran it at the ${t}% protection level.`}><span className="underline decoration-dotted decoration-slate-500/60 underline-offset-4 cursor-help">{t}%</span></th>)}
+                                          </tr></thead>
+                                          <tbody>
+                                            {ta.bySku.map((s) => {
+                                              const [lo, hi] = rowRange(s, metric.key);
+                                              return (
+                                                <tr key={s.sku} className={lm ? "border-t border-slate-100" : "border-t border-slate-800/60"}>
+                                                  <td className={`px-3 py-2 text-sm font-semibold ${text}`}>
+                                                    {s.sku}
+                                                    {!s.costKnown && <span className={`ml-1.5 text-[10px] ${muted}`}>(no cost)</span>}
+                                                    {s.lossMaking && <span className={`ml-1.5 text-[10px] font-semibold ${lm ? "text-amber-600" : "text-amber-400"}`}>≤ cost</span>}
+                                                  </td>
+                                                  {tiers.map((t) => { const v = s.tiers[t]?.[metric.key]; return (
+                                                    <td key={t} className={`px-3 py-2 text-sm tabular-nums text-right ${v == null ? muted : text} ${shade(v, lo, hi)} ${colHL(t)}`}>{v == null ? "—" : metric.fmt(v)}</td>
+                                                  ); })}
+                                                </tr>
+                                              );
+                                            })}
+                                            <tr className={`${lm ? "border-t-2 border-slate-300 bg-slate-50" : "border-t-2 border-slate-700 bg-slate-800/30"}`}>
+                                              <td className={`px-3 py-2.5 text-sm font-bold ${text}`}>Total</td>
+                                              {ta.tiers.map((t) => { const v = metric.total(t); return (
+                                                <td key={t.tier} className={`px-3 py-2.5 text-base font-bold tabular-nums text-right ${text} ${colHL(t.tier)}`}>{v == null ? "—" : metric.fmt(v)}</td>
+                                              ); })}
+                                            </tr>
+                                          </tbody>
+                                        </table>
+                                      </div>
+                                      <div className={`px-4 py-2 text-[11px] ${muted}`}>
+                                        Sorted by exposure. Shading is magnitude within each row, so you can read the shape without reading the digits. The {best ? `${best}%` : "recommended"} column is highlighted. <span className="font-semibold">Lost profit</span> and <span className="font-semibold">Buffer holding</span> totals both match the tier table above, and together they are Total $/yr. <span className="font-semibold">Cash in buffer</span> is one-time working capital, not a yearly cost.
+                                      </div>
+                                    </div>
+                                  )}
+                                </div>
+                              );
+                            })()}
                           </>
                         );
                       })()}
-                      {/* Missed units / yr by product */}
-                      <div className={`px-4 pt-4 pb-1.5 text-xs uppercase tracking-widest font-bold ${text}`}>Missed units / yr</div>
-                      <table className="w-full">
-                        <thead><tr>
-                          <th className={th} title="The product this row is about."><span className="underline decoration-dotted decoration-slate-500/60 underline-offset-4 cursor-help">Product</span></th>
-                          {tiers.map((t) => <th key={t} className={`${thc} ${colHL(t)}`} title={`This product if you ran it at the ${t}% protection level.`}><span className="underline decoration-dotted decoration-slate-500/60 underline-offset-4 cursor-help">{t}%</span></th>)}
-                        </tr></thead>
-                        <tbody>
-                          {ta.bySku.map((s) => (
-                            <tr key={s.sku} className={lm ? "border-t border-slate-100" : "border-t border-slate-800/60"}>
-                              <td className={`px-3 py-2 text-sm font-semibold ${text}`}>{s.sku}{!s.costKnown && <span className={`ml-1.5 text-[10px] ${muted}`}>(no cost)</span>}{s.lossMaking && <span className={`ml-1.5 text-[10px] font-semibold ${lm ? "text-amber-600" : "text-amber-400"}`}>≤ cost</span>}</td>
-                              {tiers.map((t) => { const v = s.tiers[t]?.unitsYr; return (
-                                <td key={t} className={`px-3 py-2 text-sm tabular-nums text-right ${!v ? muted : `font-bold ${text}`} ${colHL(t)}`}>{s.tiers[t] ? v.toLocaleString() : "—"}</td>
-                              ); })}
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                      {/* Buffer units by product — the quantity behind the buffer cost */}
-                      <div className={`px-4 pt-4 pb-1.5 text-xs uppercase tracking-widest font-bold ${text}`}>
-                        Buffer units carried
-                        <span className={`font-normal normal-case tracking-normal ${muted}`}> — spare stock held per product; × unit cost × holding rate = buffer cost</span>
-                      </div>
-                      <table className="w-full">
-                        <thead><tr>
-                          <Th tip="The product this row is about.">Product</Th>
-                          {tiers.map((t) => <th key={t} className={`${thc} ${colHL(t)}`} title={`Buffer units this product would carry at the ${t}% level.`}><span className="underline decoration-dotted decoration-slate-500/60 underline-offset-4 cursor-help">{t}%</span></th>)}
-                        </tr></thead>
-                        <tbody>
-                          {ta.bySku.map((s) => (
-                            <tr key={s.sku} className={lm ? "border-t border-slate-100" : "border-t border-slate-800/60"}>
-                              <td className={`px-3 py-2 text-sm font-semibold ${text}`}>{s.sku}</td>
-                              {tiers.map((t) => { const v = s.tiers[t]?.safetyUnits; return (
-                                <td key={t} className={`px-3 py-2 text-sm tabular-nums text-right ${!v ? muted : `font-bold ${text}`} ${colHL(t)}`}>{v == null ? "—" : Math.round(v).toLocaleString()}</td>
-                              ); })}
-                            </tr>
-                          ))}
-                          <tr className={`${lm ? "border-t-2 border-slate-300 bg-slate-50" : "border-t-2 border-slate-700 bg-slate-800/30"}`}>
-                            <td className={`px-3 py-2.5 text-sm font-bold ${text}`}>Total units</td>
-                            {ta.tiers.map((t) => <td key={t.tier} className={`px-3 py-2.5 text-base font-bold tabular-nums text-right ${text} ${colHL(t.tier)}`}>{t.safetyUnits == null ? "—" : Math.round(t.safetyUnits).toLocaleString()}</td>)}
-                          </tr>
-                        </tbody>
-                      </table>
-                      {/* Lost profit / yr by product + TOTAL */}
-                      <div className={`px-4 pt-4 pb-1.5 text-xs uppercase tracking-widest font-bold ${text}`}>Lost profit / yr</div>
-                      <table className="w-full">
-                        <thead><tr>
-                          <th className={th} title="The product this row is about."><span className="underline decoration-dotted decoration-slate-500/60 underline-offset-4 cursor-help">Product</span></th>
-                          {tiers.map((t) => <th key={t} className={`${thc} ${colHL(t)}`} title={`This product if you ran it at the ${t}% protection level.`}><span className="underline decoration-dotted decoration-slate-500/60 underline-offset-4 cursor-help">{t}%</span></th>)}
-                        </tr></thead>
-                        <tbody>
-                          {ta.bySku.map((s) => (
-                            <tr key={s.sku} className={lm ? "border-t border-slate-100" : "border-t border-slate-800/60"}>
-                              <td className={`px-3 py-2 text-sm font-semibold ${text}`}>{s.sku}{s.lossMaking && <span className={`ml-1.5 text-[10px] font-semibold ${lm ? "text-amber-600" : "text-amber-400"}`}>≤ cost</span>}</td>
-                              {tiers.map((t) => { const v = s.tiers[t]?.profitYr; return (
-                                <td key={t} className={`px-3 py-2 text-sm tabular-nums text-right ${!v ? muted : `font-bold ${text}`} ${colHL(t)}`}>{money(v)}</td>
-                              ); })}
-                            </tr>
-                          ))}
-                          <tr className={`${lm ? "border-t-2 border-slate-300 bg-slate-50" : "border-t-2 border-slate-700 bg-slate-800/30"}`}>
-                            <td className={`px-3 py-2.5 text-sm font-bold ${text}`}>Total / yr</td>
-                            {ta.tiers.map((t) => <td key={t.tier} className={`px-3 py-2.5 text-base font-bold tabular-nums text-right ${t.tier === best ? tone(lm, "good") : text} ${colHL(t.tier)}`}>{money(t.stockoutCost)}</td>)}
-                          </tr>
-                        </tbody>
-                      </table>
-                      {/* Cash in buffer by product + TOTAL */}
-                      <div className={`px-4 pt-4 pb-1.5 text-xs uppercase tracking-widest font-bold ${text}`}>Cash in buffer <span className={`font-normal normal-case tracking-normal ${muted}`}>— one-time working capital, not a yearly cost</span></div>
-                      <table className="w-full">
-                        <thead><tr>
-                          <th className={th} title="The product this row is about."><span className="underline decoration-dotted decoration-slate-500/60 underline-offset-4 cursor-help">Product</span></th>
-                          {tiers.map((t) => <th key={t} className={`${thc} ${colHL(t)}`} title={`This product if you ran it at the ${t}% protection level.`}><span className="underline decoration-dotted decoration-slate-500/60 underline-offset-4 cursor-help">{t}%</span></th>)}
-                        </tr></thead>
-                        <tbody>
-                          {ta.bySku.map((s) => (
-                            <tr key={s.sku} className={lm ? "border-t border-slate-100" : "border-t border-slate-800/60"}>
-                              <td className={`px-3 py-2 text-sm font-semibold ${text}`}>{s.sku}</td>
-                              {tiers.map((t) => { const v = s.tiers[t]?.bufferCash; return (
-                                <td key={t} className={`px-3 py-2 text-sm tabular-nums text-right ${!v ? muted : `font-bold ${text}`} ${colHL(t)}`}>{money(v)}</td>
-                              ); })}
-                            </tr>
-                          ))}
-                          <tr className={`${lm ? "border-t-2 border-slate-300 bg-slate-50" : "border-t-2 border-slate-700 bg-slate-800/30"}`}>
-                            <td className={`px-3 py-2.5 text-sm font-bold ${text}`}>Total</td>
-                            {ta.tiers.map((t) => <td key={t.tier} className={`px-3 py-2.5 text-base font-bold tabular-nums text-right ${text} ${colHL(t.tier)}`}>{money(t.bufferCash)}</td>)}
-                          </tr>
-                        </tbody>
-                      </table>
-                      <div className={`px-4 py-2 text-[11px] ${muted}`}>Sorted by exposure. <span className="font-semibold">Lost profit</span> Total/yr matches the tier table above. <span className="font-semibold">Cash in buffer</span> is the working capital each product ties up at each tier — a one-time amount, not added to the cost; its yearly cost already sits in Buffer cost. The {best ? `${best}%` : "recommended"} column is highlighted.</div>
                     </div>
                   )}
                 </div>
@@ -1136,8 +1261,14 @@ Write a short, plain-English read in concise "• " bullet lines (no markdown he
 
           </Section>
 
-          <Section id="trust" title="Can I trust this run?" summary={trustSummary}
-                   flag={runQualityIssues.length > 0} defaultOpen={runQualityIssues.length > 0}>
+          {/* Caveats, shown ONLY when there are caveats. This used to be a permanent
+              "Can I trust this run?" panel that appeared on every run, including clean ones,
+              where it had nothing to say and read as a lecture. It is not decoration: a
+              product whose test windows fail is excluded from every number on this tab, and
+              this is the only place that says so. Silence here now means genuinely nothing
+              was skipped, capped, thin, or miscalibrated — so when it does appear, read it. */}
+          {runQualityIssues.length > 0 && (
+          <Section id="trust" title="Before you rely on this" summary={trustSummary} flag defaultOpen>
             {/* Failed cutoffs — surfaced, never silently dropped */}
             {res.failedCutoffs > 0 && (() => {
               const errs = (res.skipped || []).filter((s) => s.kind === "error");
@@ -1184,36 +1315,12 @@ Write a short, plain-English read in concise "• " bullet lines (no markdown he
               );
             })()}
 
-            {/* Confidence — how much the headline numbers can actually carry */}
-            {(res.overall?.["service_achieved%_ci"] || res.overall?.MASE_ci) && (() => {
-              const ov = res.overall, target = res.params?.service ?? 95;
-              const svcCI = ov["service_achieved%_ci"], inconclusive = ciCovers(svcCI, target);
-              return (
-                <div className={`${card} border rounded-2xl p-4`}>
-                  <div className={`text-[11px] uppercase tracking-widest font-bold ${muted} mb-2`}>How much these numbers can carry</div>
-                  <div className="flex flex-wrap gap-x-6 gap-y-2">
-                    {[["Stayed in stock", ov["service_achieved%"], svcCI, "%"], ["vs naive forecast", ov.MASE, ov.MASE_ci, ""],
-                      ["Band hit rate", ov["interval_cov%"], ov["interval_cov%_ci"], "%"]].map(([lab, v, ci, sfx]) => (
-                      <div key={lab}>
-                        <div className={`text-[10px] uppercase tracking-widest font-bold ${muted}`}>{lab}</div>
-                        <div className={`text-sm font-bold tabular-nums ${text}`}>{fmt(v, sfx)}</div>
-                        <div className={`text-[11px] ${muted}`} title={TIP.ci}>
-                          <span className="underline decoration-dotted underline-offset-2 cursor-help">95% CI</span> {ciText(ci, sfx) || "—"}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                  <p className={`text-[11px] ${muted} mt-3 leading-relaxed`}>
-                    Intervals come from resampling <span className="font-semibold">products</span>, not windows — test windows overlap in time and repeat per product, so the raw
-                    count of {res.forecasts} forecasts overstates how much independent evidence you have.
-                    {inconclusive
-                      ? <> Your {target}% target sits <span className="font-semibold">inside</span> the service interval, so this run can&apos;t tell you the buffer is mis-sized — you need more history or more products, not a tier change.</>
-                      : <> Your {target}% target sits <span className="font-semibold">outside</span> the service interval, so the gap is real and worth acting on.</>}
-                    {" "}Products from one catalog share seasonality, so even this runs slightly optimistic.
-                  </p>
-                </div>
-              );
-            })()}
+            {/* The "How much these numbers can carry" CI card used to sit here. Removed on
+                request: it restated three headline numbers with confidence intervals and a
+                paragraph about resampling, which read as a statistics lecture rather than a
+                decision. The intervals themselves are NOT gone — they still drive the 95% CI
+                column and the "n/s" marker in the tier table (via ciCovers), and they still
+                reach the AI diagnosis prompt. Only the standalone card is gone. */}
 
             {/* Skipped — short history and hard failures are different things */}
             {res.skipped?.length > 0 && (() => {
@@ -1225,6 +1332,7 @@ Write a short, plain-English read in concise "• " bullet lines (no markdown he
               ) : null;
             })()}
           </Section>
+          )}
 
           <Section id="accuracy" title="How accurate is the forecast?" summary={accuracySummary}>
             <div className={`text-[11px] ${muted} leading-relaxed`}>
@@ -1245,10 +1353,7 @@ Write a short, plain-English read in concise "• " bullet lines (no markdown he
 
             {/* Per-upload sections. One catalog for modelling, separate reporting. */}
           {res.bySource?.length > 1 && (
-            <div className={`${card} border rounded-2xl overflow-hidden`}>
-              <div className={`px-4 py-2 text-[11px] uppercase tracking-widest font-bold ${muted} border-b ${lm ? "border-slate-200" : "border-slate-800"}`}>
-                By uploaded file
-              </div>
+            <Panel id="bysource" title="By uploaded file" note={`${res.bySource.length} files`}>
               <table className="w-full">
                 <thead><tr>
                   <Th tip="The file these products came from. Products are forecast and tested as one catalog — this splits the results back out by upload.">File</Th>
@@ -1275,12 +1380,11 @@ Write a short, plain-English read in concise "• " bullet lines (no markdown he
               <div className={`px-4 py-2 text-[11px] leading-relaxed ${muted} border-t ${lm ? "border-slate-200" : "border-slate-800"}`}>
                 Products from every file are modelled together — a product can borrow seasonal shape from a peer in a different upload, which is usually what you want. This table splits the <span className="font-semibold">results</span> back out so one upload&apos;s performance doesn&apos;t hide inside another&apos;s.
               </div>
-            </div>
+            </Panel>
           )}
 
           {res.bySku?.length > 0 && (
-              <div className={`${card} border rounded-2xl overflow-hidden`}>
-                <div className={`px-4 py-2 text-[11px] uppercase tracking-widest font-bold ${muted} border-b ${lm ? "border-slate-200" : "border-slate-800"}`}>By SKU</div>
+              <Panel id="bysku" title="By SKU" note={`${res.bySku.length} product${res.bySku.length === 1 ? "" : "s"} · worst first`}>
                 <table className="w-full"><Head />
                   <tbody>
                     {(() => {
@@ -1302,15 +1406,12 @@ Write a short, plain-English read in concise "• " bullet lines (no markdown he
                   </tbody>
                 </table>
                 <Guide id="sku" cols={["tests","avgmiss","vsnaive","runs","bandhit","instock","ordersize"]} />
-              </div>
+              </Panel>
             )}
 
             {/* Accuracy by how much history the model actually had */}
             {res.byTrainLength?.length > 1 && (
-              <div className={`${card} border rounded-2xl overflow-hidden`}>
-                <div className={`px-4 py-2 text-[11px] uppercase tracking-widest font-bold ${muted} border-b ${lm ? "border-slate-200" : "border-slate-800"}`}>
-                  Accuracy by history available at forecast time
-                </div>
+              <Panel id="bytrain" title="Accuracy by history available at forecast time">
                 <table className="w-full">
                   <thead><tr>
                     <Th tip={TIP.train}>History</Th><Th tip={TIP.forecasts}>Tests</Th><Th tip={TIP.mase}>vs naive</Th>
@@ -1333,13 +1434,12 @@ Write a short, plain-English read in concise "• " bullet lines (no markdown he
                 <div className={`px-4 py-2 text-[11px] leading-relaxed ${muted} border-t ${lm ? "border-slate-200" : "border-slate-800"}`}>
                   Forecasts made early in a product&apos;s life train a genuinely different model — yearly seasonality is off and the uncertainty bands aren&apos;t yet self-calibrated. If accuracy improves sharply with history, the fix is <span className="font-semibold">time</span>, not tuning: this row tells you how much history a product needs before you should trust its numbers.
                 </div>
-              </div>
+              </Panel>
             )}
 
             {/* Recent vs historic windows */}
             {res.byBlock?.length > 1 && (
-              <div className={`${card} border rounded-2xl overflow-hidden`}>
-                <div className={`px-4 py-2 text-[11px] uppercase tracking-widest font-bold ${muted} border-b ${lm ? "border-slate-200" : "border-slate-800"}`}>Recent vs historic windows</div>
+              <Panel id="byblock" title="Recent vs historic windows">
                 <table className="w-full">
                   <thead><tr>
                     <Th tip={TIP.block}>Window</Th><Th tip={TIP.forecasts}>Tests</Th><Th tip={TIP.mase}>vs naive</Th>
@@ -1361,7 +1461,7 @@ Write a short, plain-English read in concise "• " bullet lines (no markdown he
                 <div className={`px-4 py-2 text-[11px] leading-relaxed ${muted} border-t ${lm ? "border-slate-200" : "border-slate-800"}`}>
                   Tests are spread across your history rather than bunched in recent months, so seasonal patterns get exercised. Historic windows may reflect an older pricing or channel mix — if <span className="font-semibold">recent</span> is much worse than <span className="font-semibold">historic</span>, something about the business changed recently and the model hasn&apos;t caught up.
                 </div>
-              </div>
+              </Panel>
             )}
 
             {/* Does routing beat one engine for everything? */}
@@ -1378,10 +1478,7 @@ Write a short, plain-English read in concise "• " bullet lines (no markdown he
                 : bM < rM - 0.03 ? { t: "bad",  s: `${b.route} on everything beat the router here. Worth asking what routing is buying you.` }
                 : { t: "warn", s: "Too close to call — routing isn't clearly earning its complexity on this data." };
               return (
-                <div className={`${card} border rounded-2xl overflow-hidden`}>
-                  <div className={`px-4 py-2 text-[11px] uppercase tracking-widest font-bold ${muted} border-b ${lm ? "border-slate-200" : "border-slate-800"}`}>
-                    Does per-product routing beat one model for everything?
-                  </div>
+                <Panel id="baseline" title="Does per-product routing beat one model for everything?" note={verdict ? verdict.s : null}>
                   <table className="w-full">
                     <thead><tr>
                       <Th tip={TIP.baseline}>Policy</Th><Th tip={TIP.forecasts}>Tests</Th><Th tip={TIP.mase}>vs naive</Th>
@@ -1410,7 +1507,7 @@ Write a short, plain-English read in concise "• " bullet lines (no markdown he
                       {" "}Check the confidence intervals above before treating a small difference as decisive.
                     </span>
                   </div>
-                </div>
+                </Panel>
               );
             })()}
 

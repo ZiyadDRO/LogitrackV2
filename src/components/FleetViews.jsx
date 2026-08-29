@@ -44,6 +44,12 @@ export function FleetBento({ skuForecasts, getParams, openPOs, onSelectSku, lm, 
         pillRedBg:"rgba(255,91,82,.16)", pillRedFg:"#ff8079", pillAmberBg:"rgba(255,179,64,.15)", pillAmberFg:"#ffc777",
         slow:"#ffb340", sky:"#38bdf8" };
   const fmt = n => "$" + Math.round(n).toLocaleString();
+  /* Projected repeat orders are hatched, not just paler: at a glance the texture says
+     "modelled" where a lighter shade would only read as "less". Works in both themes
+     and doesn't lean on colour alone. */
+  const PROJ_FILL = lm
+    ? "repeating-linear-gradient(135deg,rgba(124,58,237,.30) 0 5px,rgba(124,58,237,.11) 5px 10px)"
+    : "repeating-linear-gradient(135deg,rgba(139,125,255,.42) 0 5px,rgba(139,125,255,.15) 5px 10px)";
   const scoreBySku = Object.fromEntries((scorecardRows || []).map(r => [r.skuId, r]));
   // Lead time travels in, because the reorder bands are a fraction of it — a
   // 60-day sea line and a 3-day air line do not share a "due soon".
@@ -104,31 +110,102 @@ export function FleetBento({ skuForecasts, getParams, openPOs, onSelectSku, lm, 
     && provDays(s) != null && provDays(s) <= 10);
   const newSoon = [...provLow].sort((a,b) => (provDays(a) ?? 99) - (provDays(b) ?? 99));
 
-  let reorderCost = 0, reorderUnits = 0, costKnown = false, invValue = 0, invKnown = false;
-  skuForecasts.forEach(s => {
-    const p = getParams(s.skuId); const c = Number(p.unitCost); const f = Number(p.fees) || 0;
-    const st = Number(p.stock) || 0;
-    if (c > 0) { invValue += st * c; invKnown = true; }
-    // The same set the "To order now" tile names above it — at-risk plus routine
-    // reorders. It used to reach further out than the tile claimed, so the dollar
-    // figure covered a different set of SKUs than the label beneath it.
-    if (["stockout","reorder"].includes(bucket(s)) && !openPOs[s.skuId] && s.orderQty) {
-      reorderUnits += s.orderQty; if (c > 0) { reorderCost += s.orderQty * (c + f); costKnown = true; }
-    }
-  });
+  let costKnown = false, invValue = 0, invKnown = false;
+
   // Upcoming reorders by week — the forecast turned into a purchasing schedule (cash, or
   // units when cost is unknown). This is the tool's unique value: a forward buying plan.
   const WEEKS = 8;
-  const weekly = Array.from({ length:WEEKS }, () => ({ val:0, units:0 }));
+  const weekly = Array.from({ length:WEEKS }, () => ({ next:0, repeat:0, nextUnits:0, repeatUnits:0 }));
+  /* Calendar weeks, Sunday–Saturday, not rolling 7-day blocks counted off today. A buyer
+     plans against the week on the wall: on a Friday, "due in 3 days" is next week's
+     problem, and a rolling window would have filed it under this one.
+     Whole-day integer arithmetic, deliberately — `dow` is how far into the current week
+     today already is, so a reorder `d` days out sits `dow + d` days after Sunday and
+     `floor(/7)` is its week. Dividing millisecond timestamps would put an hour of DST
+     between a date and the week it belongs to. */
+  const today = new Date(); today.setHours(0,0,0,0);
+  const dow = today.getDay();                                   // 0 = Sunday
+  const weekOf = d => Math.floor((dow + Math.round(d)) / 7);     // negative = already past
+  const addDays = n => { const x = new Date(today); x.setDate(x.getDate() + n); return x; };
+  const weekStart = i => addDays(i * 7 - dow);
+  const weekEnd   = i => addDays(i * 7 - dow + 6);
+  const fmtDay = dt => dt.toLocaleDateString(undefined, { month:"short", day:"numeric" });
+  const weekRange = i => `${fmtDay(weekStart(i))} – ${fmtDay(weekEnd(i))}`;
+
+  /* ONE purchasing number on this page, and the chart is it. There used to be a second
+     one — a "To order now" tile — and the two could never agree, because they were not
+     measuring the same thing: the tile counted STATUS (every product the scorecard calls
+     "Stockout risk" or "Reorder due") while the chart is a CALENDAR of reorder dates.
+     The scorecard's bands are fractions of each product's own lead time (risk = lt/2,
+     due = lt × 1.5, see helpers.reorderBands), so a 60-day sea line is "Reorder due"
+     with a reorder date up to 90 days out. Sat next to a bar labelled "now", that reads
+     as a contradiction to anyone looking at the page, and no bucketing rule can fix it —
+     the two numbers answer different questions. So the dollars are stated once, on the
+     calendar, and the status view stays a COUNT of products on the fleet-health card.
+
+     Each bar has two parts, and the difference matters enough to draw:
+
+       `next`   — the product's NEXT reorder, on the date the forecast actually gives it.
+       `repeat` — the same product coming round again, projected at its own cycle length
+                  (one order's quantity ÷ its daily demand = the days of cover it buys).
+
+     Without the second part the chart quietly under-reports the back half of its own
+     horizon. It draws each product once, but the median product here reorders about
+     every 38 days, so inside eight weeks most of them come round again — and the last
+     bars showed a few hundred dollars where the real figure was tens of thousands. It
+     was not a stale number; the second cycle was never drawn at all, and no amount of
+     live sales data would have filled it in.
+
+     Projection stops where it stops being a forecast: overstocked and dead stock are
+     being cleared, not rebought, so they contribute their next order and nothing after
+     it. Everything past the first repeat assumes demand holds at today's average and
+     that the same quantity gets ordered each time, which is why it is drawn as hatching
+     rather than solid — committed and projected should never read as the same money.
+
+     Products with no reorder date can't be placed on a calendar and are left out rather
+     than swept into the first bar to make a total come out even. */
+  const REPEATABLE = s => s !== "overstock" && s !== "dead";
   skuForecasts.forEach(s => {
-    const d = s.daysUntilReorder;
-    if (d == null || openPOs[s.skuId] || !s.orderQty) return;
-    const w = Math.ceil(Math.max(d, 0) / 7); if (w >= WEEKS) return;
-    const p = getParams(s.skuId); const c = Number(p.unitCost); const f = Number(p.fees) || 0;
-    weekly[w].units += s.orderQty; if (c > 0) weekly[w].val += s.orderQty * (c + f);
+    const prm = getParams(s.skuId); const c = Number(prm.unitCost); const f = Number(prm.fees) || 0;
+    const stk = Number(prm.stock) || 0;
+    if (c > 0) { invValue += stk * c; invKnown = true; }
+    if (openPOs[s.skuId] || !s.orderQty) return;
+    /* stateOf, not s.daysUntilReorder — skuState falls back to the scorecard's copy of
+       the date, so reading the raw field made products vanish from the plan. */
+    const state = stateOf(s);
+    const days = state.days;
+    if (days == null) return;
+    const cost = c > 0 ? s.orderQty * (c + f) : 0;
+    if (c > 0) costKnown = true;
+
+    const w = Math.max(weekOf(days), 0);   // anything already late joins the first bar
+    if (w < WEEKS) { weekly[w].nextUnits += s.orderQty; weekly[w].next += cost; }
+
+    // Days of cover one order buys — the product's own reorder rhythm.
+    const rate = Number(s.avgDailyDemand) || 0;
+    const cycle = rate > 0 ? s.orderQty / rate : 0;
+    if (cycle < 1 || !REPEATABLE(state.key)) return;
+    for (let t = days + cycle, guard = 0; guard < 60; t += cycle, guard++) {
+      const wr = weekOf(t);
+      if (wr >= WEEKS) break;
+      // A repeat that would have fallen in a past week is history, not a plan.
+      if (wr >= 0) { weekly[wr].repeatUnits += s.orderQty; weekly[wr].repeat += cost; }
+    }
   });
   const chartVal = costKnown;
-  const maxBar = Math.max(...weekly.map(x => chartVal ? x.val : x.units), 1);
+  // One accessor for "the number this chart is currently drawing", so the bars, the
+  // totals and the tile can't disagree about whether we're in dollars or units.
+  const valOf   = x => chartVal ? x.next   : x.nextUnits;
+  const repOf   = x => chartVal ? x.repeat : x.repeatUnits;
+  const totalOf = x => valOf(x) + repOf(x);
+  const maxBar  = Math.max(...weekly.map(totalOf), 1);
+  const anyRepeat = weekly.some(x => repOf(x) > 0);
+  // Chart row height, and what's left for a bar once the value (14) + label (34) + two
+  // 9px gaps are taken out of it.
+  const horizonTotal  = weekly.reduce((t, x) => t + totalOf(x), 0);
+  const horizonRepeat = weekly.reduce((t, x) => t + repOf(x), 0);
+  const CHART_H = 170, BAR_MAX = CHART_H - 14 - 34 - 18;
+
 
   const seg = (n, color) => n > 0 ? <div style={{ width:(n/total*100)+"%", background:color }} /> : null;
   const card = { background:T.surface, border:`1px solid ${T.line}`, borderRadius:18, padding:"20px 22px", position:"relative", overflow:"hidden", boxShadow: lm ? "0 1px 3px rgba(15,23,42,.06),0 1px 2px rgba(15,23,42,.04)" : "none" };
@@ -236,21 +313,61 @@ export function FleetBento({ skuForecasts, getParams, openPOs, onSelectSku, lm, 
         <div style={{ ...card, gridColumn:"span 4" }}>
           <div style={{ fontSize:13, color:T.faint, fontWeight:500 }}>Upcoming reorders · next {WEEKS} weeks</div>
           <div style={{ fontSize:13.5, color:T.soft, marginTop:2 }}>{chartVal ? "Purchasing cash coming due — plan your POs ahead" : "Units coming due — add unit costs to see it as $"}</div>
-          <div style={{ display:"flex", alignItems:"flex-end", gap:14, height:140, marginTop:18 }}>
-            {weekly.map((wk, i) => { const v = chartVal ? wk.val : wk.units; const h = v > 0 ? Math.max(Math.round(v / maxBar * 100), 4) : 0;
+          {/* Bars are sized in px against BAR_MAX rather than as a % of the row, so the
+              tallest one can't grow past the space left by the value above it and the
+              dated label below — a % height ignored both and overflowed the card. */}
+          <div style={{ display:"flex", alignItems:"flex-end", gap:14, height:CHART_H, marginTop:18 }}>
+            {weekly.map((wk, i) => {
+              const firm = valOf(wk), proj = repOf(wk), v = firm + proj;
+              const h = v > 0 ? Math.max(Math.round(v / maxBar * BAR_MAX), 4) : 0;
+              const hProj = v > 0 ? Math.round(proj / v * h) : 0;
+              const money = n => chartVal ? fmt(n) : n.toLocaleString() + " units";
+              const tip = (i===0 ? `Already overdue, plus everything due by ${fmtDay(weekEnd(0))}` : weekRange(i))
+                + `\n${money(firm)} — next order`
+                + (proj > 0 ? `\n${money(proj)} — projected repeat orders` : "");
               return (
                 <div key={i} style={{ flex:1, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"flex-end", gap:9, height:"100%" }}>
                   <div style={{ fontSize:11.5, color:i===0?T.accentText:T.faint, fontWeight:600, height:14 }}>{v > 0 ? (chartVal ? fmt(v) : v.toLocaleString()) : ""}</div>
-                  <div title={chartVal ? fmt(v) : v.toLocaleString()+" units"} style={{ width:"100%", height:h+"%", borderRadius:"7px 7px 2px 2px", background:i===0?"linear-gradient(180deg,#b9afff,#8b7dff)":"linear-gradient(180deg,#7c6cff,#574acb)" }} />
-                  <div style={{ fontSize:11, color:i===0?T.accentText:T.faint, fontWeight:i===0?600:400 }}>{i===0?"Now":"+"+i+"w"}</div>
+                  {/* Stacked: solid below is the order the forecast actually dates, hatched
+                      above is the same product projected round again at its own cycle. */}
+                  <div title={tip} style={{ width:"100%", height:h, borderRadius:"7px 7px 2px 2px", overflow:"hidden", display:"flex", flexDirection:"column" }}>
+                    <div style={{ height:hProj, background:PROJ_FILL, borderBottom: (hProj > 0 && h - hProj > 0) ? `1px solid ${T.surface}` : "none" }} />
+                    <div style={{ flex:1, background:i===0?"linear-gradient(180deg,#b9afff,#8b7dff)":"linear-gradient(180deg,#7c6cff,#574acb)" }} />
+                  </div>
+                  <div style={{ height:34, textAlign:"center", lineHeight:1.18 }}>
+                    <div style={{ fontSize:10.5, color:i===0?T.accentText:T.faint, fontWeight:i===0?600:400 }}>
+                      {i===0 ? "Overdue + due this week" : weekRange(i)}
+                    </div>
+                    {i===0 && <div style={{ fontSize:9.5, color:T.faint, marginTop:1 }}>through {fmtDay(weekEnd(0))}</div>}
+                  </div>
                 </div>);
             })}
           </div>
+          {anyRepeat && (
+            <div style={{ display:"flex", flexWrap:"wrap", alignItems:"center", gap:"6px 18px", marginTop:14, fontSize:11.5, color:T.soft }}>
+              <span style={{ display:"flex", alignItems:"center", gap:7 }}>
+                <span style={{ width:11, height:11, borderRadius:3, background:"linear-gradient(180deg,#7c6cff,#574acb)", flexShrink:0 }} />
+                Next order · dated by the forecast
+              </span>
+              <span style={{ display:"flex", alignItems:"center", gap:7, cursor:"help" }}
+                title="Projected from each product's own reorder cycle — one order's quantity divided by its daily demand. Assumes demand holds and the same quantity is ordered again. Overstocked and dead stock are left out.">
+                <span style={{ width:11, height:11, borderRadius:3, background:PROJ_FILL, flexShrink:0 }} />
+                Projected repeat · same product coming round again
+              </span>
+            </div>
+          )}
         </div>
 
-        <div style={card}><div style={{ fontSize:13, color:T.faint, fontWeight:500 }}>To order now</div>
-          <div style={{ fontSize:32, fontWeight:700, letterSpacing:"-.04em", marginTop:9, lineHeight:1 }}>{costKnown ? fmt(reorderCost) : reorderUnits.toLocaleString()}</div>
-          <div style={{ fontSize:12.5, marginTop:9, color:costKnown?T.red:T.faint, fontWeight:500 }}>{costKnown ? `across ${toOrder} SKUs` : `units · add cost to see $`}</div></div>
+        {/* Deliberately the first bar of the chart, restated — same variable, so the two
+            can never disagree. The tile above it is the headline; the chart is the detail. */}
+        <div style={card}><div style={{ fontSize:13, color:T.faint, fontWeight:500 }}>Due this week</div>
+          <div style={{ fontSize:32, fontWeight:700, letterSpacing:"-.04em", marginTop:9, lineHeight:1 }}>{chartVal ? fmt(totalOf(weekly[0])) : totalOf(weekly[0]).toLocaleString()}</div>
+          <div style={{ fontSize:12.5, marginTop:9, color:T.soft, fontWeight:500 }}>overdue + due by {fmtDay(weekEnd(0))}</div>
+          <div style={{ fontSize:12, marginTop:3, color:T.faint }}>{chartVal ? `${fmt(horizonTotal)} over the next ${WEEKS} weeks` : "units · add unit costs to see $"}</div>
+          {/* The horizon total counts each product's repeat orders too, which is most of
+              the back half of the chart. Unlabelled, it just looks like the number grew. */}
+          {chartVal && horizonRepeat > 0 &&
+            <div style={{ fontSize:11.5, marginTop:2, color:T.faint }}>incl. {fmt(horizonRepeat)} projected repeats</div>}</div>
 
         <div style={card}><div style={{ fontSize:13, color:T.faint, fontWeight:500 }}>Inventory value</div>
           <div style={{ fontSize:32, fontWeight:700, letterSpacing:"-.04em", marginTop:9, lineHeight:1 }}>{invKnown ? fmt(invValue) : "—"}</div>

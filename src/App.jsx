@@ -28,8 +28,15 @@ export default function App() {
   const [paletteQ,     setPaletteQ]     = useState("");
   // Backtest results live here (not inside BacktestTab) so they survive tab switches
   // and a browser refresh.
-  const [btRes,        setBtRes]        = useState(() => loadStorage("logitrack_backtest_result", null));
-  const [btDiag,       setBtDiag]       = useState(() => loadStorage("logitrack_backtest_diagnosis", null));
+  /* NOT seeded from localStorage any more. The browser used to keep its own copy of the
+     last report, which rendered the instant the page opened — so on startup the Backtest
+     tab was the only populated thing on screen while everything else waited on the
+     server, and neither pull path ever CLEARED it, so a report could outlive the run it
+     described indefinitely. The server persists the backtest itself now (fingerprinted
+     against the data it was measured on), which makes it the single source of truth and
+     makes the browser copy redundant. */
+  const [btRes,        setBtRes]        = useState(null);
+  const [btDiag,       setBtDiag]       = useState(null);
   const [showCategorize, setShowCategorize] = useState(false);
   const [skuForecasts, setSkuForecasts] = useState([]);
   const [scorecardRows, setScorecardRows] = useState([]);
@@ -56,52 +63,19 @@ export default function App() {
   const [confirm,      setConfirm]      = useState(null);   // { title, body, confirmLabel, danger, onConfirm }
   const [pendingArrival, setPendingArrival] = useState(null);  // handed to the supplier tab
 
-  useEffect(() => saveStorage("logitrack_backtest_result", btRes), [btRes]);
-  useEffect(() => saveStorage("logitrack_backtest_diagnosis", btDiag), [btDiag]);
+  // (no localStorage mirror — see the note above where btRes is declared)
 
-  /* Is a backtest in flight right now?
-   *
-   * `btRes` is restored from localStorage, so the fleet header happily reported a
-   * headline accuracy figure from the PREVIOUS run seconds after an upload replaced the
-   * data it was computed on. The Backtest tab already knew — it polls and warns — but it
-   * kept that to itself, and the fleet header is the number people actually read.
-   *
-   * Status only, five seconds apart. The tab still owns fetching results; this exists so
-   * the headline can refuse to state a number that's about to be superseded. */
-  const [btBusy, setBtBusy] = useState(false);
-  useEffect(() => {
-    let stop = false;
-    const tick = async () => {
-      try {
-        const st = await (await fetch(`${API}/api/backtest/status`)).json();
-        if (!stop) setBtBusy(st?.status === "running");
-      } catch { if (!stop) setBtBusy(false); }   // backend down is not "running"
-    };
-    tick();
-    const id = setInterval(tick, 5000);
-    return () => { stop = true; clearInterval(id); };
-  }, []);
+  /* Two pollers used to live here — /api/backtest/status every 5s and /api/livelog every
+     60s — feeding `btBusy` and `liveLog` to a fleet-header accuracy figure. That headline
+     was removed (see the note above FleetBento: a replay-derived number carrying no
+     interval and no label reads as a claim about the business rather than about a
+     replay). The state stayed behind and nothing rendered it, so both intervals kept
+     hitting the backend forever for values nobody could see.
 
-  /* Live scoring, for the fleet headline.
-   *
-   * A backtest is the best evidence available on day one and the weakest by month six —
-   * it replays a history the models were fitted near, and it stops being news. Real
-   * graded weeks are strictly better evidence: those forecasts were sealed before the
-   * week happened. So the headline uses the backtest only until live weeks exist, then
-   * hands over. Cheap poll — the log is small and this is once a minute. */
-  const [liveLog, setLiveLog] = useState(null);
-  useEffect(() => {
-    let stop = false;
-    const pull = async () => {
-      try {
-        const d = await (await fetch(`${API}/api/livelog`)).json();
-        if (!stop) setLiveLog(d && Array.isArray(d.entries) ? d : null);
-      } catch { /* leave whatever we had; a blip shouldn't blank the header */ }
-    };
-    pull();
-    const id = setInterval(pull, 60000);
-    return () => { stop = true; clearInterval(id); };
-  }, []);
+     Deleted rather than rewired. The Backtest tab already polls its own status, and the
+     Live accuracy tab owns the live log and is what drives the hourly tick. If a
+     freshness indicator returns to the fleet page it wants an "as of" on the forecast
+     fetch itself, not a second copy of these. */
 
   // Persist suppliers
   useEffect(() => { saveStorage("logitrack_suppliers", suppliers); }, [suppliers]);
@@ -242,6 +216,41 @@ export default function App() {
   }, [loadSkuList, loadScorecardRows, skuList, skuParams, openPOs]);
 
   useEffect(() => { loadSkuList(skuParams, openPOs); }, []);
+
+  /* The backend restores a saved catalog on boot and re-fits it on a background thread,
+     which takes about a minute. The page asks for the product list ONCE on mount, so
+     opening the app during that window showed an empty sidebar that never filled in —
+     it looked broken while it was working perfectly.
+     /api/health reports {restore:{status}}, so wait for it to leave "restoring" and then
+     ask again. Polling stops as soon as it resolves; it never runs in a steady state. */
+  const [restoring, setRestoring] = useState(false);
+  const [restoreNote, setRestoreNote] = useState(null);
+  useEffect(() => {
+    let stop = false, timer = null, noteTimer = null;
+    const check = async () => {
+      try {
+        const h = await (await fetch(`${API}/api/health`)).json();
+        if (stop) return;
+        const busy = h?.restore?.status === "restoring";
+        setRestoring(busy);
+        if (busy) { timer = setTimeout(check, 2000); return; }
+        // Finished (or there was nothing to restore). Pick up whatever landed, and say
+        // what came back: a silent restore is indistinguishable from a fresh empty app,
+        // and the difference matters when the numbers on screen are a week old.
+        if (h?.skus) {
+          loadSkuList(skuParams, openPOs);
+          if (h?.restore?.status === "ready") {
+            const n = h.skus, m = Number(h.measured || 0);
+            setRestoreNote(`${n} product${n === 1 ? "" : "s"} restored from your last session.`
+              + (m ? ` ${m} with measured protection levels.` : " Protection levels are estimates until a test runs."));
+            noteTimer = setTimeout(() => setRestoreNote(null), 12000);
+          }
+        }
+      } catch { if (!stop) setRestoring(false); }
+    };
+    check();
+    return () => { stop = true; clearTimeout(timer); clearTimeout(noteTimer); };
+  }, []);   // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => { skuList.forEach(s => refreshSkuSummary(s.id, getParams(s.id))); }, [openPOs]);
   useEffect(() => { loadScorecardRows(skuList, skuParams, openPOs); }, [skuList, skuParams, openPOs, loadScorecardRows]);
 
@@ -607,12 +616,30 @@ export default function App() {
     });
   };
 
-  const handleReset = async () => {
-    await fetchJson(`${API}/api/reset`, { method: "POST" }, "Reset");
-    setUploadInfo(null); setUploadError(null); setActiveSku(null);
-    setSkuParams({}); setOpenPOs({});
-    saveStorage("logitrack_params", {}); saveStorage("logitrack_pos", {});
-    await loadSkuList({}, {});
+  /* Wipe the app back to first-run — BOTH halves of it.
+   *
+   * The old "Clear all data" only ever cleared the server plus two localStorage keys, so
+   * it looked like it did nothing: the catalog vanished but your costs, suppliers,
+   * purchase orders, folders and the cached backtest report were all still sitting in the
+   * browser, and the sidebar repopulated from them. Half the app's state has always lived
+   * on this machine, so a reset that doesn't clear localStorage isn't a reset.
+   *
+   * Every logitrack_* key goes, rather than a hand-written list — a list would silently
+   * miss whichever key gets added next. Then a hard reload, because React state is the
+   * third place data lives and re-deriving it by hand is how a stale value survives. */
+  const handleResetEverything = async () => {
+    try {
+      await fetch(`${API}/api/reset`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ scope: "everything" }),
+      });
+    } catch { /* the browser half still gets cleared even if the backend is down */ }
+    try {
+      Object.keys(localStorage)
+        .filter(k => k.startsWith("logitrack_"))
+        .forEach(k => localStorage.removeItem(k));
+    } catch { /* private mode / storage disabled — nothing to clear */ }
+    window.location.reload();
   };
 
   // ── Excel exports ──
@@ -655,7 +682,6 @@ export default function App() {
   const exportSuppliers = () => downloadExport("suppliers", "/api/export/suppliers", { suppliers }, `logitrack_suppliers_${_today()}.xlsx`);
   const exportAll = () => downloadExport("all", "/api/export/all", { skus: buildExportSkus(), folders, suppliers }, `logitrack_full_report_${_today()}.xlsx`);
 
-  const hasUploaded    = skuList.some(s => s.mode === "uploaded");
   const ungroupedSkus  = skuList.filter(s => !Object.values(folders).some(f => f.skuIds.includes(s.id)));
   const scoreBySkuApp  = Object.fromEntries((scorecardRows || []).map(r => [r.skuId, r]));
 
@@ -853,6 +879,24 @@ export default function App() {
           {uploadError && (
             <div className={`text-[11px] rounded-lg p-2 leading-relaxed border ${lm ? "text-red-700 bg-red-50 border-red-200" : "text-rose-400 bg-rose-950/20 border-rose-900/30"}`}>{uploadError}</div>
           )}
+          {/* Products the upload REFUSED. /api/upload has always returned a reason per
+              dropped SKU in `errors` — "fewer than 2 rows", "could not be modeled
+              (...)" — and nothing rendered it, so the same spreadsheet could load 30
+              products on one machine and 28 on another while both showed a green
+              "✓ Loaded" and no hint that anything was missing. Shown before the success
+              banner: what was dropped matters more than what worked. */}
+          {uploadInfo?.errors?.length > 0 && (
+            <div className={`text-[11px] rounded-lg border overflow-hidden ${lm ? "text-amber-800 bg-amber-50 border-amber-300" : "text-amber-300 bg-amber-950/20 border-amber-900/40"}`}>
+              <div className="p-2 font-semibold">
+                ⚠️ {uploadInfo.errors.length} product{uploadInfo.errors.length !== 1 ? "s" : ""} skipped — not in your catalogue
+              </div>
+              <ul className={`px-2 pb-2 space-y-0.5 border-t pt-1.5 ${lm ? "border-amber-300" : "border-amber-900/40"}`}>
+                {uploadInfo.errors.map((e, i) => (
+                  <li key={i} className="font-mono text-[10.5px] leading-relaxed break-words">{e}</li>
+                ))}
+              </ul>
+            </div>
+          )}
           {/* Large date re-anchoring shifts move sales into different calendar months and
               can distort learned seasonality — the user must know this happened. */}
           {uploadInfo && Math.abs(uploadInfo.dateShiftDays || 0) > 21 && (
@@ -902,14 +946,18 @@ export default function App() {
             </div>
           )}
         </div>
-        {hasUploaded && (
-          <div className={`px-4 py-3 border-t ${divider} shrink-0`}>
-            <button onClick={() => setConfirm({ title: "Clear all data?", body: "This removes every loaded product, forecast and test result. It can't be undone — you'd need to upload your file again.", confirmLabel: "Clear everything", danger: true, onConfirm: handleReset })}
-              className={`w-full text-[11px] py-1.5 rounded-lg transition-colors border ${resetBtn}`}>
-              Clear all data
-            </button>
-          </div>
-        )}
+        {/* Always available, not just after a file upload: with a live source there is no
+            "uploaded" product, and that condition hid the reset exactly when a clean slate
+            matters most — before pointing the tool at a real store. */}
+        <div className={`px-4 py-3 border-t ${divider} shrink-0`}>
+          <button onClick={() => setConfirm({
+              title: "Reset everything?",
+              body: "Wipes the whole tool back to first run: every product and forecast, your stock levels, unit costs, suppliers, purchase orders and folders, the last test result, and the accuracy and inventory history. Nothing is kept, on this computer or on the server. This can't be undone.",
+              confirmLabel: "Wipe everything", danger: true, onConfirm: handleResetEverything })}
+            className={`w-full text-[11px] py-1.5 rounded-lg transition-colors border ${resetBtn}`}>
+            Reset everything
+          </button>
+        </div>
         <div onMouseDown={startResizeWidth} title="Drag to resize sidebar"
           className={`absolute top-0 right-0 h-full w-1.5 cursor-col-resize z-30 ${lm ? "hover:bg-violet-300" : "hover:bg-violet-600/50"}`} />
       </div>
@@ -996,13 +1044,24 @@ export default function App() {
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M7 16a4 4 0 01-.88-7.9A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
                 </svg>
               </div>
-              <h2 className={`text-lg font-bold ${lm ? "text-slate-900" : "text-white"}`}>No products loaded</h2>
-              <p className={`text-sm mt-2 max-w-md ${lm ? "text-slate-500" : "text-slate-400"}`}>
-                Upload a sales file following the format to get started. Your file needs <span className="font-semibold">Date</span> and <span className="font-semibold">Units_Sold</span> columns — optional: SKU, Category, Price, On_Promotion, Units_In_Stock.
-              </p>
-              <p className={`text-xs mt-3 ${lm ? "text-slate-400" : "text-slate-500"}`}>
-                Click <span className="font-semibold">Products</span> in the top bar to import a file or download the template.
-              </p>
+              {restoring ? (
+                <>
+                  <h2 className={`text-lg font-bold ${lm ? "text-slate-900" : "text-white"}`}>Restoring your products…</h2>
+                  <p className={`text-sm mt-2 max-w-md ${lm ? "text-slate-500" : "text-slate-400"}`}>
+                    Your data is saved. The forecasts are being rebuilt from it, which takes about a minute. This page fills in on its own when it's done.
+                  </p>
+                </>
+              ) : (
+                <>
+                  <h2 className={`text-lg font-bold ${lm ? "text-slate-900" : "text-white"}`}>No products loaded</h2>
+                  <p className={`text-sm mt-2 max-w-md ${lm ? "text-slate-500" : "text-slate-400"}`}>
+                    Upload a sales file following the format to get started. Your file needs <span className="font-semibold">Date</span> and <span className="font-semibold">Units_Sold</span> columns — optional: SKU, Category, Price, On_Promotion, Units_In_Stock.
+                  </p>
+                  <p className={`text-xs mt-3 ${lm ? "text-slate-400" : "text-slate-500"}`}>
+                    Click <span className="font-semibold">Products</span> in the top bar to import a file or download the template.
+                  </p>
+                </>
+              )}
             </div>
           ) : activeSku ? (
             <SkuDetailPanel skuId={activeSku} skuList={skuList} params={getParams(activeSku)}
@@ -1036,6 +1095,16 @@ export default function App() {
             <CategorizePanel embedded api={API} skuList={skuList} apiKey={GROQ_API_KEY} lm={lm} onApplied={onCatalogChanged} scorecardRows={scorecardRows} />
           ) : (
             <div className="flex-1 overflow-y-auto">
+              {restoreNote && (
+                <div className="px-4 sm:px-6 pt-4 sm:pt-6">
+                  <div className={`flex items-start gap-2.5 rounded-xl border px-4 py-2.5 text-xs leading-relaxed ${lm ? "bg-emerald-50 border-emerald-200 text-emerald-800" : "bg-emerald-950/30 border-emerald-900/50 text-emerald-300"}`}>
+                    <span className="shrink-0 mt-0.5">✓</span>
+                    <span className="flex-1">{restoreNote}</span>
+                    <button onClick={() => setRestoreNote(null)}
+                      className={`shrink-0 ${lm ? "text-emerald-500 hover:text-emerald-700" : "text-emerald-600 hover:text-emerald-400"}`}>✕</button>
+                  </div>
+                </div>
+              )}
               {arrivals.length > 0 && (
                 <div className="px-4 sm:px-6 pt-4 sm:pt-6">
                   <ArrivalPromptList found={arrivals} skuList={skuList} lm={lm}

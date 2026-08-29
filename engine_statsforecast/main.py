@@ -33,6 +33,8 @@ import uplift as _UP
 import seasonality as _SEAS
 import bundles as _BUN
 import arrivals as _ARR
+import catalog_store as _STORE
+import backtest_store as _BTSTORE
 
 # Bundle component map, {bundle_sku: {component_sku: qty}}. Session state like the rest of
 # the catalogue — the real product reads this from Shopify's bundle definitions.
@@ -61,21 +63,39 @@ app = FastAPI(lifespan=_lifespan)
 # requests can interleave (or two tabs can race an upload against a re-categorize);
 # an RLock keeps rebuilds atomic without restructuring the app.
 _state_lock = threading.RLock()
+# Allow the local app on any port (vite dev 5173, the packaged http.server build,
+# preview servers, etc.) so the browser→backend save isn't blocked by CORS just
+# because the page is served on a different localhost port than expected.
+#
+# LOGITRACK_ORIGINS widens this for a hosted deployment WITHOUT loosening the local
+# default: set it to a comma-separated list of exact origins the browser will be served
+# from, e.g. LOGITRACK_ORIGINS="https://app.example.com". Localhost keeps working either
+# way, so a dev machine pointed at a hosted backend still connects. Deliberately a list
+# of origins and not a wildcard — allow_credentials with "*" is rejected by browsers,
+# and an open CORS policy on an API holding a store's sales data is not a default worth
+# shipping.
+_LOCAL_ORIGIN_RE = r"https?://(localhost|127\.0\.0\.1)(:\d+)?"
+_extra_origins = [o.strip() for o in os.environ.get("LOGITRACK_ORIGINS", "").split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    # Allow the local app on any port (vite dev 5173, the packaged http.server build,
-    # preview servers, etc.) so the browser→backend save isn't blocked by CORS just
-    # because the page is served on a different localhost port than expected.
-    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
+    allow_origin_regex=_LOCAL_ORIGIN_RE,
+    allow_origins=_extra_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+if _extra_origins:
+    print(f"CORS: also allowing {', '.join(_extra_origins)}")
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True}
+    # `restoring` lets a caller tell "no data yet" apart from "data is on its way back".
+    # `measured` is how many products came back with a measured protection level rather
+    # than an estimate, so the UI can report what was actually recovered.
+    return {"ok": True, "restore": dict(_restore_state), "skus": len(_sku_cache),
+            "measured": len({k.split("|")[0] for k in _backtest_tier_cache})}
 
 # ─── State ───────────────────────────────────────────────────────────────────
 _sku_cache: dict[str, dict] = {}          # sku_id → forecast cache entry (frontend reads this)
@@ -92,6 +112,74 @@ _last_backtest_rows = None                  # scored windows, so cost edits re-p
 _last_backtest_combos: list = []
 _backtest_exclusions: dict[str, str] = {}   # sku_id → why it has no measured tier
 _last_backtest: dict | None = None          # full report from this session's last run
+
+# ── Catalog persistence ──────────────────────────────────────────────────────
+# The ingested data is written to disk after every change, and restored on boot. Only the
+# DATA is saved; fitted models are re-built from it (see catalog_store for why). This is
+# what makes a restart survivable: a release, a crash or a machine reboot no longer costs
+# a full re-sync from Shopify.
+_restore_state: dict = {"status": "idle", "skus": 0, "error": None}
+
+
+def _persist_catalog():
+    """Snapshot the catalog. Best-effort by design — a disk problem must never turn a
+    successful upload into a failed one, so this reports and moves on."""
+    try:
+        extras = {"sheet_costs": {k: float(v) for k, v in _sheet_costs.items()},
+                  "holding_pct": int(_session_holding_pct)}
+        _STORE.save(_catalog, extras)
+    except Exception as e:                                   # noqa: BLE001
+        print(f"[catalog_store] snapshot skipped: {e}")
+
+
+# Fingerprint of the catalog the in-memory backtest was measured against. Without it,
+# a sync that does NOT auto-run a new test would leave measured tiers in memory that were
+# measured on data no longer loaded — the exact contamination the on-disk fingerprint
+# prevents, happening one level up.
+_backtest_fingerprint: str | None = None
+
+
+def _persist_backtest():
+    """Snapshot the completed run, stamped with the data it was measured against."""
+    try:
+        globals()["_backtest_fingerprint"] = _BTSTORE.fingerprint(_catalog)
+        _BTSTORE.save({"report": _last_backtest, "rows": _last_backtest_rows,
+                       "combos": _last_backtest_combos, "tiers": _backtest_tier_cache,
+                       "exclusions": _backtest_exclusions, "inputs": _backtest_inputs},
+                      _catalog)
+    except Exception as e:                                   # noqa: BLE001
+        print(f"[backtest_store] snapshot skipped: {e}")
+
+
+def _restore_backtest():
+    """Bring back the last run IF it still describes the catalog we just restored.
+    A mismatch is not an error — it means the data moved on, and an estimate is the
+    honest answer until a fresh test runs."""
+    saved = _BTSTORE.load(_catalog)
+    if not saved:
+        return False
+    globals()["_last_backtest"] = saved.get("report")
+    globals()["_last_backtest_rows"] = saved.get("rows")
+    globals()["_last_backtest_combos"] = saved.get("combos") or []
+    globals()["_backtest_tier_cache"] = saved.get("tiers") or {}
+    globals()["_backtest_exclusions"] = saved.get("exclusions") or {}
+    _backtest_inputs.clear(); _backtest_inputs.update(saved.get("inputs") or {})
+    globals()["_backtest_fingerprint"] = _BTSTORE.fingerprint(_catalog)
+    return True
+
+
+def _drop_backtest_state(why: str) -> None:
+    """Forget the measured run. Called when the data it described is gone."""
+    globals()["_last_backtest"] = None
+    globals()["_last_backtest_rows"] = None
+    globals()["_last_backtest_combos"] = []
+    globals()["_backtest_tier_cache"] = {}
+    globals()["_backtest_exclusions"] = {}
+    globals()["_backtest_fingerprint"] = None
+    _backtest_inputs.clear()
+    _BTSTORE.clear()
+    print(f"Measured protection levels dropped — {why}. Estimates apply until a new test runs.")
+
 
 # Model-switch history, persisted to disk so the overview banner survives restarts.
 # Shape: {"events": [ {skuId, skuName, fromRoute, toRoute, fromLabel, toLabel,
@@ -644,7 +732,48 @@ def warmup():
     globals()["_last_backtest_combos"] = []
     with _state_lock:
         _catalog.clear(); _sku_cache.clear()
-    print("Ready — no data loaded yet. Upload a sales file or connect Shopify.")
+
+    saved, extras = _STORE.load()
+    restored_tiers = 0
+    if not saved:
+        _restore_state.update({"status": "empty", "skus": 0, "error": None})
+        print("Ready — no data loaded yet. Upload a sales file or connect Shopify.")
+        return
+
+    # Re-fit on a background thread rather than inside startup. A hosted deployment's
+    # health check should not wait minutes for a model fit, and a slow boot is the
+    # difference between a rolling deploy and a failed one. /api/health reports progress;
+    # until it finishes the app behaves exactly as it does before any data is loaded.
+    with _state_lock:
+        _catalog.update(saved)
+        _sheet_costs.update({k: float(v) for k, v in (extras.get("sheet_costs") or {}).items()})
+        if extras.get("holding_pct") is not None:
+            globals()["_session_holding_pct"] = int(extras["holding_pct"])
+    # Before the refit, not after: the tier cache is keyed to the DATA, not to the fitted
+    # models, so it is valid the moment the catalog is back.
+    if _restore_backtest():
+        restored_tiers = len({k.split("|")[0] for k in _backtest_tier_cache})
+        print(f"Measured protection levels restored for {restored_tiers} products.")
+    _restore_state.update({"status": "restoring", "skus": len(saved), "error": None})
+    print(f"Restoring {len(saved)} products from the last session. Re-fitting in the background...")
+
+    def _refit():
+        try:
+            with _state_lock:
+                _rebuild(today())
+            _restore_state.update({"status": "ready", "skus": len(_sku_cache)})
+            # Say which it actually is. The old wording claimed estimates unconditionally,
+            # including right after a run had just been restored — which read as though
+            # the restore hadn't worked.
+            note = (f"{restored_tiers} with measured protection levels."
+                    if restored_tiers else
+                    "Protection levels are estimates until a backtest runs.")
+            print(f"Ready. {len(_sku_cache)} products restored. {note}")
+        except Exception as e:                               # noqa: BLE001
+            _restore_state.update({"status": "failed", "error": str(e)})
+            print(f"Restore failed ({e}). Upload a sales file or connect Shopify.")
+
+    threading.Thread(target=_refit, name="restore-refit", daemon=True).start()
 
 
 # ─── SKU list / delete / events ──────────────────────────────────────────────
@@ -739,6 +868,7 @@ def delete_sku(sku_id: str):
         except Exception as ex:
             import traceback; traceback.print_exc()
             print(f"[delete] rebuild after deleting {sku_id} failed: {ex}")
+        _persist_catalog()
     return {"success": True, "deleted": sku_id}
 
 
@@ -808,6 +938,9 @@ def save_events(sku_id: str, events: list = Body(...)):
             except Exception:
                 pass
             raise HTTPException(400, f"Events could not be applied ({err}); previous events kept.")
+        # Only reached when the events applied cleanly — the rollback path raises above,
+        # and what it rolls back to is already what's on disk.
+        _persist_catalog()
     return {"success": True, "eventsApplied": len(events)}
 
 
@@ -884,6 +1017,16 @@ def _reanchor_catalog() -> int:
     """Re-apply ONE shared offset across the whole catalog so the newest row anywhere
     lands on yesterday. Shared, not per-SKU: relative spacing between SKUs is what the
     pooling and seasonal comparison rely on, so they must all move together."""
+    # Once a live source is in the catalog, its dates ARE the calendar — there is nothing
+    # to anchor to and shifting would only introduce error. A mixed catalog (an old sheet
+    # sitting alongside a Shopify feed) is left on true dates for the same reason: the
+    # live feed is the one that knows what today is.
+    if any(e.get("live_source") for e in _catalog.values()):
+        for e in _catalog.values():
+            e["date_shift_days"] = 0
+        print("Re-anchor skipped — catalog contains live data, which keeps its real dates.")
+        return 0
+
     trues = []
     for e in _catalog.values():
         d = _true_dates(e)
@@ -933,12 +1076,16 @@ def _merge_sku_history(sid: str, new_df: pd.DataFrame, new_shift: int) -> tuple[
 
 def _ingest(df_raw, filename: str, stock_override: dict | None = None,
             cost_override: dict | None = None, append: bool = False,
-            auto_backtest: bool = True):
+            auto_backtest: bool = True, reanchor: bool = True):
     """Shared ingestion for ANY raw sales DataFrame — an uploaded file OR a live source
-    like Shopify. Normalizes/dedups/re-anchors, builds the per-SKU catalog, refits, and
-    returns the same payload the upload endpoint always has. `stock_override` /
+    like Shopify. Normalizes/dedups, optionally re-anchors, builds the per-SKU catalog,
+    refits, and returns the same payload the upload endpoint always has. `stock_override` /
     `cost_override` (e.g. live Shopify inventory + unit costs) supply current values per
-    SKU when the data carries no stock/cost columns — used only to prefill the dashboard."""
+    SKU when the data carries no stock/cost columns — used only to prefill the dashboard.
+
+    `reanchor` — TRUE for uploaded files, FALSE for a live source. See the block below;
+    the short version is that a spreadsheet has an unknown vintage and a live feed does
+    not, so shifting the one is a fix and shifting the other is corruption."""
     df_raw.columns = [c.strip().lower().replace(" ", "_") for c in df_raw.columns]
     if not {"date", "units_sold"}.issubset(df_raw.columns):
         raise HTTPException(400, "Missing required columns 'Date' and 'Units_Sold'. "
@@ -1005,7 +1152,7 @@ def _ingest(df_raw, filename: str, stock_override: dict | None = None,
         "duplicateRowsMerged": int(max(duplicate_rows_merged, 0)),
     }
 
-    # ── Re-anchor the sheet's timeline to "yesterday" ────────────────────────
+    # ── Re-anchor the sheet's timeline to "yesterday" — UPLOADS ONLY ─────────
     # Treat the most recent row in the upload as if it were yesterday, regardless
     # of its actual calendar date. This shifts every row by one shared offset so
     # the forecast starts cleanly from today with no dead gap between the last
@@ -1013,8 +1160,17 @@ def _ingest(df_raw, filename: str, stock_override: dict | None = None,
     # sheet days later leaves a growing stretch the tool reads as "nothing sold."
     # A single global offset (from the whole sheet's max date) preserves the
     # relative spacing between rows and between SKUs, which the pooling relies on.
+    #
+    # A LIVE SOURCE IS THE OPPOSITE CASE and must never be shifted. A spreadsheet has
+    # an unknown vintage — exported last Tuesday, uploaded today — so anchoring it is a
+    # repair. Shopify's dates are the real ones, and a gap since the last order is a
+    # fact about the store worth seeing, not an artefact to paper over. Worse, the
+    # offset is recomputed on every ingest, so a live feed would have its whole calendar
+    # nudged on each sync, by a different amount each time, while the forecast log went
+    # on labelling its weeks with the true clock. The two records would slowly disagree
+    # about what day it is.
     date_shift_days = 0
-    if len(df_raw):
+    if reanchor and len(df_raw):
         latest = df_raw["date"].max().normalize()
         offset = (today() - pd.Timedelta(days=1)) - latest
         date_shift_days = int(offset.days)
@@ -1102,7 +1258,11 @@ def _ingest(df_raw, filename: str, stock_override: dict | None = None,
                 added_skus.append(sid)
             _catalog[sid] = {"df": dfc, "attrs": attrs, "sku_name": sname,
                              "mode": "uploaded", "filename": filename, "events": [],
-                             "sources": [filename], "date_shift_days": date_shift_days}
+                             "sources": [filename], "date_shift_days": date_shift_days,
+                             # Kept separate from `mode`, which the dashboard reads to decide
+                             # whether "Clear all data" is offered. This flag is only about
+                             # whether the dates may be moved.
+                             "live_source": (not reanchor)}
 
     if stock_override:                       # live inventory (Shopify) → prefill current stock
         for sid in groups_iter:
@@ -1122,7 +1282,7 @@ def _ingest(df_raw, filename: str, stock_override: dict | None = None,
     # shared offset — otherwise SKUs the new file didn't touch drift relative to the
     # ones it did, and the pooled seasonal comparison silently compares misaligned dates.
     if append:
-        date_shift_days = _reanchor_catalog()
+        date_shift_days = _reanchor_catalog()   # no-op once anything in the catalog is live
         data_quality["rowsAppended"] = int(rows_appended)
         data_quality["overlapRowsReplaced"] = int(overlap_rows)
         data_quality["skusAdded"] = added_skus
@@ -1167,8 +1327,22 @@ def _ingest(df_raw, filename: str, stock_override: dict | None = None,
     # with Scorecard costs if the user enters better ones.
     _sheet_costs.update({str(sid): float(c) for sid, c in last_cost.items()})
 
+    # A live feed syncs constantly, and a full replay per sync is both untenable and
+    # almost always pointless: cutoffs sit `step` days apart, so on 27 days out of 28 no
+    # new window has matured and the run is guaranteed to reach the same answer it
+    # reached yesterday. Uploads keep the original behaviour — a sheet arrives once, and
+    # nobody should have to know the Backtest tab exists to get a measured protection
+    # level. A live source gets one cold-start run when nothing has been measured yet,
+    # and after that waits for a review to be triggered deliberately.
+    live_source = not reanchor
     backtest_started = False
-    if auto_backtest and _catalog:
+    if live_source and _backtest_tier_cache:
+        # Skipping the run is only safe while the measurements still describe THIS data.
+        if _backtest_fingerprint and _BTSTORE.fingerprint(_catalog) == _backtest_fingerprint:
+            print("Live sync — data unchanged for testing purposes; automatic backtest skipped.")
+        else:
+            _drop_backtest_state("the sync changed the sales history they were measured on")
+    elif auto_backtest and _catalog:
         backtest_started = _run_backtest_job(
             {"horizon": 44, "n_cutoffs": "auto", "step": 28, "lead": 14, "coverage": 30,
              # Honour the rate the user set BEFORE uploading — this used to hardcode 25%,
@@ -1178,6 +1352,7 @@ def _ingest(df_raw, filename: str, stock_override: dict | None = None,
             _effective_sku_costs(None) or {},
             "upload")
 
+    _persist_catalog()      # the data is now the app's; a restart re-fits it rather than asking for it again
     return {"success": True, "filename": filename, "loadedSkus": loaded, "appended": bool(append),
             "backtestStarted": backtest_started,
             "errors": errors, "dateShiftDays": date_shift_days, "dataQuality": data_quality}
@@ -1209,18 +1384,45 @@ def upload_shopify(payload: dict = Body(default={})):
         pass
     shop = (payload.get("shop") or "store").replace(".myshopify.com", "").strip()
     with _state_lock:
-        return _ingest(raw, f"Shopify · {shop}", stock_override=stock_map, cost_override=cost_map)
+        return _ingest(raw, f"Shopify · {shop}", stock_override=stock_map, cost_override=cost_map,
+                       reanchor=False)   # live dates are the real dates
 
 
 @app.post("/api/reset")
-def reset_all():
-    """Clear everything back to an empty app."""
+def reset_all(payload: dict = Body(default=None)):
+    """Clear everything back to an empty app.
+
+    `{"scope": "everything"}` additionally purges the two records that outlive a
+    catalog on purpose: the forecast log (weekly sealed predictions and their grades)
+    and the stock log (hourly inventory readings). Those normally survive a re-upload
+    BECAUSE they are a record of what was predicted and what was on the shelf at the
+    time — history the catalog can't reconstruct. Wiping them is the right thing before
+    a clean run against a real store, and the wrong thing by accident, so it is opt-in.
+
+    NOTE: the server is only half the app. Stock levels, unit costs, suppliers, purchase
+    orders and folders live in the browser, and the caller has to clear those itself —
+    see handleResetEverything in App.jsx."""
+    scope = (payload or {}).get("scope")
+    everything = scope == "everything"
     global _switch_state
     with _state_lock:
         _switch_state = {"lastRoute": {}, "events": []}   # clean slate for the switch banner
         _save_switches(_switch_state)
+        _STORE.clear()      # before warmup(), which would otherwise restore what we just cleared
+        _BTSTORE.clear()
+        globals()["_backtest_fingerprint"] = None
+        purged = {}
+        if everything:
+            try:
+                _flog.purge(); purged["forecastLog"] = True
+            except Exception as e:                           # noqa: BLE001
+                purged["forecastLog"] = f"failed: {e}"
+            try:
+                _slog.purge(); purged["stockLog"] = True
+            except Exception as e:                           # noqa: BLE001
+                purged["stockLog"] = f"failed: {e}"
         warmup()
-    return {"success": True, "cleared": True}
+    return {"success": True, "cleared": True, "scope": scope or "catalog", "purged": purged}
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1427,6 +1629,7 @@ def _set_attributes_locked(skus, updated):
                 updated += 1
     regroup_error = None
     if updated:
+        _persist_catalog()      # attributes live in the catalog, so they belong in the snapshot
         try:
             _rebuild(today())   # relatedness/routing may change for the whole catalog
         except Exception as ex:
@@ -1471,13 +1674,63 @@ def get_demand_volatility(cv):
 # forfeits, the more it's worth holding extra to avoid one. Sales velocity is left
 # to flow through σ (a faster seller already gets a bigger buffer in units).
 PROTECTION_TIERS = [
-    {"key": "light",    "label": "Light",    "pct": 90, "z": 1.282},
-    {"key": "standard", "label": "Standard", "pct": 95, "z": 1.645},
-    {"key": "high",     "label": "High",     "pct": 98, "z": 2.054},
-    {"key": "max",      "label": "Maximum",  "pct": 99, "z": 2.326},
+    {"key": "light",    "label": "Light",     "pct": 90,   "z": 1.282},
+    {"key": "standard", "label": "Standard",  "pct": 95,   "z": 1.645},
+    {"key": "high",     "label": "High",      "pct": 98,   "z": 2.054},
+    # `key` is PERSISTED — src/App.jsx writes skuParams[sku].protection to localStorage
+    # and replays it on every forecast fetch. So "max" must keep meaning 99, forever.
+    # Only its LABEL moved (it is no longer the maximum). Repointing this key at 99.5
+    # would silently re-protect every user who had already chosen Maximum.
+    {"key": "max",      "label": "Very high", "pct": 99,   "z": 2.326},
+    {"key": "ultra",    "label": "Maximum",   "pct": 99.5, "z": 2.576},
 ]
 _TIER_BY_KEY = {t["key"]: t for t in PROTECTION_TIERS}
 _TIER_KEY_BY_PCT = {t["pct"]: t["key"] for t in PROTECTION_TIERS}
+_TIER_PCTS = [t["pct"] for t in PROTECTION_TIERS]
+
+
+def _svc(v, default=95):
+    """A service level as a float, snapped to a tier we actually have a z for.
+
+    Tiers are no longer all integers. The request handlers used to coerce `service`
+    with int(), which turned 99.5 into 99 — running the whole backtest at the wrong
+    buffer and filing the result under the wrong tier. Snapping also closes an older
+    hole: an unrecognised value reached backtest.Z.get(pct, 1.6449) and quietly got
+    the 95% z while still being labelled whatever was asked for.
+    """
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return default
+    return min(_TIER_PCTS, key=lambda p: abs(p - f))
+
+
+_BT_TIERS_CHECKED = False
+
+
+def _bt():
+    """Import the backtest module, verifying its tier table still matches ours.
+
+    backtest.Z and PROTECTION_TIERS are two hand-kept copies of the same ladder, in
+    two files, and nothing links them. Adding a level to one and not the other does
+    not crash: you get a tier the UI can't offer, or a tier with no z that silently
+    falls back to 1.6449. Check once per process and fail loudly instead of serving a
+    run computed at the wrong buffer.
+    """
+    global _BT_TIERS_CHECKED
+    import backtest as BT       # the one real import; every caller goes through here
+    if not _BT_TIERS_CHECKED:
+        ours   = {t["pct"]: round(float(t["z"]), 3) for t in PROTECTION_TIERS}
+        theirs = {p: round(float(z), 3) for p, z in BT.Z.items()}
+        if ours != theirs:
+            raise RuntimeError(
+                "Protection tier tables disagree. main.PROTECTION_TIERS says "
+                f"{sorted(ours.items())}, backtest.Z says {sorted(theirs.items())}. "
+                "Both must list the same levels with the same z.")
+        _BT_TIERS_CHECKED = True
+    return BT
+
+
 DEFAULT_HOLDING_ANNUAL = 0.25
 ECONOMIC_TIER_MIN_DAYS = 180
 ECONOMIC_TIER_MIN_SALES = 100
@@ -1717,7 +1970,10 @@ def get_price_change_warning(entry, events):
     return None, None
 
 
-STRATEGY_LABEL = {"lean": 70, "balanced": 80, "conservative": 90}
+# Every forecast band is the 80% the models are fitted with. This used to map a
+# per-product "strategy" onto 70/80/90; see the note in get_forecast for why that
+# stopped. Kept as a single constant so the number lives in one place.
+FORECAST_BAND_PCT = 80
 
 # Order guardrail: below this much history, flag the order and suggest a cap.
 GUARDRAIL_NEW_DAYS   = 90   # "thin history" threshold (≈ 3 months)
@@ -1744,11 +2000,23 @@ def get_forecast(sku_id: str = Query(...), stock: int = Query(default=500, ge=0)
     # therefore the stockout/reorder math) is an assumed default, not real data.
     stock_data_available = "units_in_stock" in df_train.columns
 
-    interval_width = STRATEGY_LABEL.get(strategy, 80)
-    ci_scale = {"lean": 0.7 / 0.8, "balanced": 1.0, "conservative": 0.9 / 0.8}.get(strategy, 1.0)
-    forecast = forecast.copy(); mid = forecast["yhat"]
-    hb = (forecast["yhat_upper"] - forecast["yhat_lower"]) / 2 * ci_scale
-    forecast["yhat_lower"] = (mid - hb).clip(lower=0); forecast["yhat_upper"] = (mid + hb).clip(lower=0)
+    # ── One confidence level for every product ───────────────────────────────
+    # The band used to move with demand volatility: steady products were shown a 70%
+    # interval, volatile ones a 90%. That applied the same adjustment twice, because the
+    # width ALREADY varies with volatility through sigma, and it made two products'
+    # bands incomparable — they were drawn to different promises. Worse, it inverted the
+    # reading: a steady product's tight-looking 70% band is a WEAKER claim (reality lands
+    # outside it 3 weeks in 10) than a volatile product's wide 90% one.
+    #
+    # So the level is fixed at the 80% the models are actually fitted with, and the width
+    # is left to sigma alone. A stable product gets a narrow band because its demand is
+    # narrow, which is the whole of the story and the only part worth drawing.
+    #
+    # `strategy` is still accepted so older clients don't 422, but it no longer changes
+    # the interval. How hard to protect against a stockout is a separate decision, made
+    # from unit economics in PROTECTION_TIERS, and that one still varies per product.
+    interval_width = FORECAST_BAND_PCT
+    forecast = forecast.copy()
     last_actual = df_train["ds"].max()   # forecast region begins the day AFTER this
     future_fc = forecast[forecast["ds"] > last_actual].copy().reset_index(drop=True)
 
@@ -1928,6 +2196,10 @@ def get_forecast(sku_id: str = Query(...), stock: int = Query(default=500, ge=0)
         "priceKnown": bool(price) and float(price or 0) > 0,
         "servicePct": tier["pct"], "label": tier["label"],
         "source": rec_source, "economics": rec_economics,
+        # When the measurement behind this recommendation was actually taken. "Measured"
+        # and "measured four months ago" are different claims, and the UI had no way to
+        # tell them apart.
+        "measuredAt": (_bt_cached or {}).get("measuredAt"),
         "status": _status,
         # The buffer math needs a level at ALL times — safety stock feeds the order
         # quantity — so a figure always exists. `provisional` says whether it has
@@ -2607,7 +2879,8 @@ def _bt_params(d):
     g = lambda k, dv: int(d.get(k, dv)) if str(d.get(k, dv)).strip() != "" else dv
     return dict(horizon=g("horizon", 44), n_cutoffs=g("cutoffs", 8), step=g("step", 28),
                 lead=g("lead", 14), coverage=g("coverage", 30),
-                service_pct=g("service", 95), min_train=g("minTrain", 120),
+                # NOT g(): service is the one param that can be fractional (99.5).
+                service_pct=_svc(d.get("service", 95)), min_train=g("minTrain", 120),
                 holding_pct=g("holding", 25))
 
 
@@ -2697,7 +2970,7 @@ def _run_backtest_job(params: dict, sku_costs: dict, trigger: str) -> bool:
                         "params": dict(params), "error": None, "trigger": trigger, "queued": False})
 
     def work():
-        import backtest as BT
+        BT = _bt()          # checked import: verifies Z matches PROTECTION_TIERS
         try:
             df = None
             with _state_lock:            # snapshot the catalog under the lock…
@@ -2719,6 +2992,7 @@ def _run_backtest_job(params: dict, sku_costs: dict, trigger: str) -> bool:
                 _cache_backtest_tiers(res)
                 _record_backtest_inputs(_eff, params.get("holding_pct"))
                 _store_backtest_result(res, trigger)
+                _persist_backtest()
             with _bt_job_lock:
                 _bt_job.update({"status": "done", "finishedAt": time.time(), "error": None,
                                 "summary": {"tested": res.get("tested"), "forecasts": res.get("forecasts"),
@@ -2770,7 +3044,7 @@ def backtest_partial(payload: dict = Body(default={})):
     measured windows are still exactly right. This refits just the affected products and
     merges their fresh rows over the stale ones, so a single-product edit costs a
     single product's fits instead of the whole catalog's."""
-    import backtest as BT
+    BT = _bt()          # checked import: verifies Z matches PROTECTION_TIERS
     p = payload or {}
     skus = [str(x) for x in (p.get("skus") or []) if str(x)]
     if not skus:
@@ -2783,7 +3057,7 @@ def backtest_partial(payload: dict = Body(default={})):
         except Exception: return d
     params = {"horizon": g("horizon", 44), "n_cutoffs": p.get("cutoffs") or "auto",
               "step": g("step", 28), "lead": g("lead", 14), "coverage": g("coverage", 30),
-              "service_pct": g("service", 95), "min_train": g("minTrain", 120)}
+              "service_pct": _svc(p.get("service", 95)), "min_train": g("minTrain", 120)}
     combos = _parse_combos(p.get("combos"))
     costs = _effective_sku_costs(_parse_sku_costs(p.get("costs"))) or {}
     started = _run_partial_job(skus, params, combos, costs, int(p.get("holding", _session_holding_pct)))
@@ -2809,7 +3083,7 @@ def _run_partial_job(skus: list, params: dict, combos: list, sku_costs: dict, ho
                         "queued": False})
 
     def work():
-        import backtest as BT
+        BT = _bt()          # checked import: verifies Z matches PROTECTION_TIERS
         global _last_backtest_rows, _last_backtest_combos, _session_holding_pct
         try:
             with _state_lock:
@@ -2873,7 +3147,7 @@ def backtest_status():
 def backtest_catalog(payload: dict = Body(default={})):
     """Backtest the LOADED FLEET. Synchronous, because the Backtest tab wants the full
     report back; the dashboard uses /api/backtest/refresh for the background version."""
-    import backtest as BT
+    BT = _bt()          # checked import: verifies Z matches PROTECTION_TIERS
     p = payload or {}
     def g(k, d):
         try: return int(p.get(k, d))
@@ -2882,7 +3156,7 @@ def backtest_catalog(payload: dict = Body(default={})):
         df = catalog_to_frame()
     _sink = []
     res = BT.run_for_api(df, g("horizon", 44), p.get("cutoffs") or "auto", g("step", 28), g("lead", 14),
-                         g("coverage", 30), g("service", 95), g("minTrain", 120), g("holding", 25),
+                         g("coverage", 30), _svc(p.get("service", 95)), g("minTrain", 120), g("holding", 25),
                          _eff_costs := _effective_sku_costs(_parse_sku_costs(p.get("costs"))),
                          combos=_parse_combos(p.get("combos")),
                          sku_sources=catalog_sources(), rows_sink=_sink)
@@ -2903,7 +3177,7 @@ def backtest_recost(payload: dict = Body(default={})):
     Adding a unit cost doesn't change a single forecast, so there is nothing to refit;
     only what the already-measured units are worth. Falls back to `started: False` if
     there's no run to re-price, so the caller can trigger a full one instead."""
-    import backtest as BT
+    BT = _bt()          # checked import: verifies Z matches PROTECTION_TIERS
     p = payload or {}
     with _state_lock:
         if _last_backtest_rows is None or not _last_backtest:
@@ -2932,7 +3206,7 @@ def backtest_refresh(payload: dict = Body(default={})):
         except Exception: return d
     params = {"horizon": g("horizon", 44), "n_cutoffs": p.get("cutoffs") or "auto", "step": g("step", 28),
               "lead": g("lead", 14), "coverage": g("coverage", 30),
-              "service_pct": g("service", 95), "min_train": g("minTrain", 120),
+              "service_pct": _svc(p.get("service", 95)), "min_train": g("minTrain", 120),
               "holding_pct": g("holding", 25), "combos": _parse_combos(p.get("combos"))}
     global _session_holding_pct
     _session_holding_pct = int(params["holding_pct"])
@@ -3028,7 +3302,7 @@ def _why_provisional(sku_id: str, status: str, days_hist: int,
             "Backtest tab, will pick it up.")
 
 
-def _combo_policy(analysis: dict) -> tuple[str, int | None]:
+def _combo_policy(analysis: dict) -> tuple[str, float | None]:
     """Did per-product tuning actually EARN its keep in this combo's test?
 
     The per-product picks are only deployed if the mixed policy beat the best single
@@ -3046,7 +3320,10 @@ def _combo_policy(analysis: dict) -> tuple[str, int | None]:
     rk = (analysis or {}).get("ranking") or {}
     nearest, best = (analysis or {}).get("nearestTier"), (analysis or {}).get("bestTier")
     pick = nearest if (rk and not rk.get("decisive") and nearest) else (best or nearest)
-    return "uniform", (int(pick) if pick else None)
+    # float(), NOT int(): tier percentages are no longer all whole numbers, and int()
+    # here silently turned a 99.5 pick into 99 — a real tier, so nothing downstream
+    # could tell it had been rewritten.
+    return "uniform", (float(pick) if pick else None)
 
 
 def _record_backtest_inputs(sku_costs: dict | None, holding_pct) -> None:
@@ -3099,6 +3376,8 @@ def _cache_backtest_tiers(res: dict) -> None:
     global _backtest_tier_cache
     params = res.get("params") or {}
     next_cache = {}
+    measured_at = res.get("ranAt")
+
     by_combo = res.get("tierAnalysisByCombo") or {}
     for combo_key, analysis in (by_combo or {}).items():
         try:
@@ -3112,13 +3391,17 @@ def _cache_backtest_tiers(res: dict) -> None:
             windows = int(row.get("windows") or 0)
             if windows < BACKTEST_TIER_MIN_WINDOWS:
                 continue
-            pct = int(row["bestTier"]) if policy == "mixed" else int(uniform_pct or row["bestTier"])
+            # _svc(), not int(): it snaps to the exact value in PROTECTION_TIERS and
+            # keeps its type, so str(pct) below still produces the payload's own key
+            # ("99" for the int, "99.5" for the float). int() merged 99.5 into 99;
+            # float() would render "99.0" and miss the lookup entirely.
+            pct = _svc(row["bestTier"], None) if policy == "mixed" else _svc(uniform_pct or row["bestTier"], None)
             key = _TIER_KEY_BY_PCT.get(pct)
             if not key:
                 continue
             tier = (row.get("tiers") or {}).get(str(pct)) or {}
             next_cache[_tier_cache_key(str(row["sku"]), c_lead, c_cov)] = {
-                "key": key, "pct": pct, "windows": windows,
+                "key": key, "pct": pct, "windows": windows, "measuredAt": measured_at,
                 "lead": c_lead, "coverage": c_cov, "policy": policy,
                 "holdingPct": (analysis.get("assumptions") or {}).get("holdingPct"),
                 "unitsYr": tier.get("unitsYr"), "profitYr": tier.get("profitYr"),
@@ -3132,8 +3415,8 @@ def _cache_backtest_tiers(res: dict) -> None:
         windows = int(row.get("windows") or 0)
         if windows < BACKTEST_TIER_MIN_WINDOWS:
             continue
-        pct = (int(row["bestTier"]) if _legacy_policy == "mixed"
-               else int(_legacy_uniform or row["bestTier"]))
+        pct = (_svc(row["bestTier"], None) if _legacy_policy == "mixed"
+               else _svc(_legacy_uniform or row["bestTier"], None))
         key = _TIER_KEY_BY_PCT.get(pct)
         if not key:
             continue
@@ -3141,6 +3424,7 @@ def _cache_backtest_tiers(res: dict) -> None:
         next_cache.setdefault(_tier_cache_key(str(row["sku"]), params.get("lead") or 14,
                                               params.get("coverage") or 30), {
             "key": key, "pct": pct, "windows": windows, "policy": _legacy_policy,
+            "measuredAt": measured_at,
             "lead": params.get("lead"), "coverage": params.get("coverage"),
             "holdingPct": (res.get("tierAnalysis") or {}).get("assumptions", {}).get("holdingPct"),
             "unitsYr": tier.get("unitsYr"), "profitYr": tier.get("profitYr"),
@@ -3240,7 +3524,9 @@ def livelog_snapshot(payload: dict = Body(default={})):
                 continue
             rows.append({"sku": sid, "skuName": name, "horizonDays": int(h),
                          "predicted": pred["predicted"], "lo": pred["lo"], "hi": pred["hi"],
-                         "band": 80, "model": (e.get("details") or {}).get("route")})
+                         # The same constant the chart is drawn to, so what the log grades
+                         # and what the user sees can never diverge.
+                         "band": FORECAST_BAND_PCT, "model": (e.get("details") or {}).get("route")})
     res = _flog.snapshot(rows, cadence=cadence)
     return {**res, "skipped": len(skipped), "candidates": len(rows),
             "nextOrigin": _FL.next_origin(cadence=cadence).isoformat(),

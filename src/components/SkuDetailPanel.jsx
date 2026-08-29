@@ -934,7 +934,10 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
                       </div>
                     </div>
                   ) : (
-                  <div className="grid grid-cols-4 gap-1 p-1.5">
+                  <div className="grid grid-cols-[repeat(auto-fit,minmax(64px,1fr))] gap-1 p-1.5">
+                    {/* auto-fit, not a fixed column count: the tier list comes from the
+                        backend and grew from 4 to 5. A hardcoded grid-cols-4 left the
+                        fifth option stranded on its own row at quarter width. */}
                     {p.options.map((t) => {
                       const active = t.key === p.chosen;
                       const isRec  = t.key === p.recommended;

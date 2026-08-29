@@ -67,7 +67,11 @@ MIN_WINDOWS_REPORTABLE = 4
 TRAIN_BUCKETS = [(0, 180, "<180d"), (180, 365, "180-365d"), (365, 10**6, ">365d")]
 
 # z-scores for the service-level buffer check (matches the app's protection tiers)
-Z = {90: 1.2816, 95: 1.6449, 98: 2.0537, 99: 2.3263}
+# Service level -> z. MUST stay in step with PROTECTION_TIERS in main.py; main._bt()
+# checks them on import and refuses to run if they disagree. Keys are the literal
+# tier values and their str() form is the payload key, so 99 stays an int ("99")
+# while 99.5 is a float ("99.5").
+Z = {90: 1.2816, 95: 1.6449, 98: 2.0537, 99: 2.3263, 99.5: 2.5758}
 RESERVED = {"sku", "sku_name", "date", "ds", "units_sold", "y", "price", "on_promotion",
             "units_in_stock", "cost", "unit_cost"}
 
@@ -694,7 +698,7 @@ def _bootstrap_tier_ranking(costed, tiers, cycles_per_year, holding_annual, n_bo
 def _mixed_policy(costed, tiers, cycles_per_year, holding_annual):
     """What per-product protection levels would actually cost — measured honestly.
 
-    The four tier columns each assume ONE level for the whole catalog, but the app
+    The tier columns each assume ONE level for the whole catalog, but the app
     recommends a level per product, so none of those columns is the policy you'd deploy.
     This adds that fifth policy.
 
@@ -775,7 +779,7 @@ def _mixed_policy(costed, tiers, cycles_per_year, holding_annual):
 
 def _critical_ratio(frame, coverage=30, holding_annual=0.25):
     """The service level that MINIMISES cost under this tool's own economics — a
-    continuous answer instead of ranking four guesses.
+    continuous answer instead of ranking a handful of fixed guesses.
 
     One more unit of safety stock is worth carrying while the expected margin it saves
     exceeds what it costs to hold. At the margin:
@@ -1296,7 +1300,7 @@ def main():
     ap.add_argument("--step", type=int, default=28, help="days between cutoffs")
     ap.add_argument("--lead", type=int, default=14)
     ap.add_argument("--coverage", type=int, default=30)
-    ap.add_argument("--service", type=int, default=95, choices=[90, 95, 98, 99])
+    ap.add_argument("--service", type=float, default=95, choices=sorted(Z.keys()))
     ap.add_argument("--min-train", type=int, default=120, help="min days of history before a cutoff")
     ap.add_argument("--holding", type=int, default=25, help="annual inventory holding cost %% (storage+capital+obsolescence) for the tier cost comparison. Per-unit cost comes from a Cost column in the data; SKUs without one are skipped.")
     ap.add_argument("--engine", choices=["router", "prophet", "global", "croston", "abstain"], default="router",
