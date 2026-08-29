@@ -305,111 +305,10 @@ def _conformal_text(q_lo, q_hi, calibrated):
             f"(±{q_hi:.1f} units around the line).")
 
 
-# ── How steady demand is, judged against what is achievable at this sales volume ──
-#
-# This signal used to be the residual CV: forecast error / average daily units, graded
-# at fixed cuts of 0.30 and 0.60. That reads sensibly and is almost entirely a measure
-# of sales VOLUME. Unit sales are counts, and counts carry irreducible randomness — a
-# product averaging n a day swings by roughly √n even when underlying demand is
-# perfectly steady — so the ratio has a hard floor of 1/√n. Inverting the cuts:
-# "highly variable" began at 0.60, i.e. anything selling under ~2.8 a day, and "very
-# consistent" needed 0.30, i.e. ~11+ a day. Over the catalogue this was built against,
-# 26 of 30 scored products read "highly variable" and NOT ONE could ever have reached
-# "very consistent" however regular its sales were. A bar that says the same thing
-# about nearly every product is not telling anyone anything.
-#
-# Dividing by √mean instead of mean removes exactly that floor. What is left is the
-# index of dispersion (σ/√μ, the square root of the variance-to-mean ratio):
-#
-#     1.0   as steady as a product selling this much can possibly be
-#     1.5   swinging half again wider than the floor
-#     2.0   variance four times the mean, the conventional marker for real overdispersion
-#
-# so a half-a-day line and a fifty-a-day line are finally judged on the same footing.
-# The cuts below are points on that scale, not a fit to any one catalogue.
-#
-# residual_cv is untouched and still reported: it is the right shape for the backtest's
-# diagnostics, and σ (which sizes every safety buffer) never went through this at all.
-DISPERSION_STEADY   = 1.25   # at or under: as steady as this volume allows
-DISPERSION_VARIABLE = 2.00   # over: genuinely erratic, beyond counting noise
-DISPERSION_FLOOR    = 3.50   # where the bar bottoms out
-DISPERSION_MIN_UNITS = 20    # under this many units in the window, decline to judge
-
-
-def demand_dispersion(residual_std, ref_mean, ref_units):
-    """σ/√μ, or None when there is too little selling to say anything honest.
-
-    A product that sold nine units all year has no measurable steadiness; forcing a
-    verdict out of it would be inventing one. The scorecard shows those as "n/a"."""
-    try:
-        sd = float(residual_std); mu = float(ref_mean)
-    except (TypeError, ValueError):
-        return None
-    if not (sd >= 0) or mu <= 0 or float(ref_units or 0) < DISPERSION_MIN_UNITS:
-        return None
-    return round(sd / (mu ** 0.5), 4)
-
-
-def dispersion_label(d):
-    if d is None: return "n/a"
-    if d <= DISPERSION_STEADY:   return "very consistent"
-    if d < DISPERSION_VARIABLE:  return "moderately consistent"
-    return "highly variable"
-
-
-def volatility_label(d):
-    """Same cuts, said in the direction the bar is named for. A row called volatility
-    whose values read "very consistent" makes the reader work out which end is bad."""
-    if d is None: return "not enough sales to say"
-    if d <= DISPERSION_STEADY:   return "steady"
-    if d < DISPERSION_VARIABLE:  return "somewhat volatile"
-    return "highly volatile"
-
-
-def _volatility_tip(d, rate):
-    base = ("Swing in daily sales, measured against the randomness any product this size "
-            "carries anyway. 1.0x is as steady as that sales volume permits; past 2.0x it "
-            "moves more than its size explains. Shown this way because a raw percentage "
-            "mostly tracks how few units a day something sells, not how erratic it is.")
-    if d is None:
-        return "Too few sales in the measured window to judge volatility. " + base
-    return f"This one swings {d:.1f}x that floor{'' if not rate else f', on about {rate:.1f} a day'}. " + base
-
-
-def _consistency_tip(dispersion, ref_mean):
-    """Hover text on the Sales consistency bar. Short, and it names the yardstick —
-    a number with no yardstick is what made the old bar unreadable."""
-    base = ("How much day-to-day swing is left once you allow for the randomness any product "
-            "this size carries. 1.0x is as steady as that sales volume permits; past 2.0x it "
-            "moves more than its size explains.")
-    if dispersion is None:
-        return "Too few sales in the measured window to judge steadiness. " + base
-    rate = "" if not ref_mean else f", on about {ref_mean:.1f} a day"
-    return f"This one swings {dispersion:.1f}x the floor{rate}. " + base
-
-
-def _consistency_text(label, dispersion, ref_mean):
-    """Say what the verdict rests on. Selling three a day and swinging by two is not
-    erratic, it is what selling three a day looks like; the old wording quoted a raw
-    ratio that made every small product sound out of control."""
-    tail = ("The safety buffer is sized from how far the forecast actually misses over a full "
-            "lead-time window, which captures clumpy stretches, not just this day-to-day swing.")
-    if dispersion is None:
-        return "There have been too few sales in the measured window to judge how steady demand is. " + tail
-    rate = "" if not ref_mean else f" (about {ref_mean:.1f} a day)"
-    if dispersion <= DISPERSION_STEADY:
-        return (f"Day-to-day demand is {label}. Its swing is {dispersion:.1f}x the smallest possible at "
-                f"this sales volume{rate}, so most of the movement is ordinary counting noise rather "
-                f"than real unpredictability. " + tail)
-    return (f"Day-to-day demand is {label}. Its swing is {dispersion:.1f}x the smallest possible at this "
-            f"sales volume{rate}, so it moves more than its size alone explains. " + tail)
-
-
-def _make_details(method, reason, model_label, demand_class, residual_cv, q_lo, q_hi, bits, n_obs,
-                  dispersion=None, ref_mean=None):
+def _make_details(method, reason, model_label, demand_class, residual_cv, q_lo, q_hi, bits, n_obs):
     d_label, d_desc = DEMAND_LABELS.get(demand_class, (demand_class, ""))
     cv = float(residual_cv)
-    cons = dispersion_label(dispersion)
+    cons = "very consistent" if cv <= 0.30 else "moderately consistent" if cv < 0.60 else "highly variable"
     calibrated = method in ("prophet", "global", "croston")
     details = {
         "model": {"name": method, "label": model_label, "summary": f"{model_label} — {d_label.lower()}"},
@@ -417,8 +316,10 @@ def _make_details(method, reason, model_label, demand_class, residual_cv, q_lo, 
         "route": method, "routeLabel": R.ROUTE_LABELS.get(method, method),
         "whyChosen": reason,
         "consistency": {"residualCv": round(cv, 3), "label": cons,
-                        "dispersion": dispersion,
-                        "text": _consistency_text(cons, dispersion, ref_mean)},
+                        "text": (f"Day-to-day demand is {cons} (backtest variability {cv:.2f}). "
+                                 f"The safety buffer is sized from how far the forecast actually misses "
+                                 f"over a full lead-time window — which captures clumpy stretches, not "
+                                 f"just this day-to-day swing.")},
         "interval": {"level": 80, "method": ("conformal" if calibrated else "normal-approx"),
                      "lowOffset": round(q_lo, 1), "highOffset": round(q_hi, 1),
                      "text": _conformal_text(q_lo, q_hi, calibrated)},
@@ -651,17 +552,12 @@ def build_entry(sku_id, sku_name, df_clean, mode, filename, today, events, relat
     # a live forecast). Skipped on the recursive holdout pass (calibrate=False).
     oos_resid = None   # list of per-window out-of-sample residual arrays (lead-window buffer)
     calib_ran = False  # True once a holdout window was actually scored (validated σ)
-    # Demand level over the SAME windows the residuals were measured on. The steadiness
-    # signal divides error by demand, and dividing a recent error by a lifetime average
-    # compares two different periods — on a seasonal line that alone moved the verdict
-    # depending on which season the holdout windows happened to land in.
-    ref_mean = None; ref_units = 0.0
     n_calib_windows = int(calib_windows) if calib_windows else CALIB_WINDOWS
     if calibrate and days >= 120:
         try:
             in_sample = float(eng.residual_std)
             first_day = df["ds"].min(); WIN = 45
-            wins = []; win_actuals = []
+            wins = []
             # Roll several NON-overlapping 45-day holdout windows back in time, refitting
             # before each, so the error estimate isn't hostage to one possibly-quiet stretch.
             # As many windows as history allows, up to n_calib_windows (short SKUs use fewer;
@@ -678,11 +574,8 @@ def build_entry(sku_id, sku_name, df_clean, mode, filename, today, events, relat
                         .merge(cal["forecast"][["ds", "yhat"]], on="ds", how="inner"))
                 if len(hold) >= 7:
                     wins.append((hold["y"] - hold["yhat"]).to_numpy(float))
-                    win_actuals.append(hold["y"].to_numpy(float))
             if wins:
                 calib_ran = True
-                _ref = np.concatenate(win_actuals)
-                ref_mean = float(_ref.mean()); ref_units = float(_ref.sum())
                 oos_resid = wins                                 # kept per-window for the buffer
                 oos = float(np.std(np.concatenate(wins), ddof=1))  # pooled daily error → σ / bands
                 if np.isfinite(oos) and in_sample > 0 and oos > in_sample:
@@ -710,10 +603,6 @@ def build_entry(sku_id, sku_name, df_clean, mode, filename, today, events, relat
     # don't ship optimistic bands and thin safety buffers. Only Prophet needs
     # this: the pooled/croston/MA engines already size σ from pooled or CV
     # residuals rather than a fit the model has seen.
-    # σ as MEASURED, before the deliberate widening below. The widening exists to keep a
-    # young product's safety buffer from being thin; describing that product's demand as
-    # 30% more erratic than it is would be a different claim, and a wrong one.
-    sigma_observed = float(eng.residual_std)
     UNCALIBRATED_WIDEN = 1.30
     if calibrate and not calib_ran and method == "prophet":
         try:
@@ -731,17 +620,8 @@ def build_entry(sku_id, sku_name, df_clean, mode, filename, today, events, relat
         except Exception:
             pass
 
-    # No holdout ran (short history, or no scoreable window): fall back to the recent
-    # demand level rather than the lifetime one, for the same reason as above.
-    if ref_mean is None and len(df):
-        _tail = df[df["ds"] > df["ds"].max() - pd.Timedelta(days=180)]["y"]
-        if len(_tail):
-            ref_mean = float(_tail.mean()); ref_units = float(_tail.sum())
-    eng.residual_dispersion = demand_dispersion(sigma_observed, ref_mean, ref_units)
-
     details = _make_details(method, reason, eng.model_label, demand_class, eng.residual_cv,
-                            eng._q_lo, eng._q_hi, eng.explain_bits(), len(df),
-                            dispersion=eng.residual_dispersion, ref_mean=ref_mean)
+                            eng._q_lo, eng._q_hi, eng.explain_bits(), len(df))
     details["relatives"] = int(n_relatives)
 
     return {
@@ -757,8 +637,6 @@ def build_entry(sku_id, sku_name, df_clean, mode, filename, today, events, relat
         "promo_handling": promo_report, "uplift": uplift_report,
         "seasonality_applied": season_report,
         "residual_cv": eng.residual_cv, "residual_std": eng.residual_std, "oos_residuals": oos_resid,
-        "residual_dispersion": eng.residual_dispersion, "residual_ref_mean": ref_mean,
-        "residual_sigma_observed": sigma_observed,
         "sigma_calibrated": calib_ran, "events": events,
         "winning_model": eng.model_label, "demand_class": demand_class,
         "route": method, "route_reason": reason, "explain": details,
@@ -1783,15 +1661,10 @@ def get_reliability_flag(fd, hd):
                    f"These estimates are highly speculative.")
 
 
-def get_demand_volatility(d):
-    """Same scale as the scorecard's steadiness bar, so the noise badge here and the
-    Sales consistency row there can never disagree about a product."""
-    if d is None: return "YELLOW", "balanced", "not enough sales to judge steadiness", 1.645
-    if d <= DISPERSION_STEADY:
-        return "GREEN", "lean", f"steady for its sales volume ({d:.1f}x the floor)", 1.282
-    if d < DISPERSION_VARIABLE:
-        return "YELLOW", "balanced", f"moderately variable ({d:.1f}x the floor)", 1.645
-    return "ORANGE", "conservative", f"genuinely erratic ({d:.1f}x the floor)", 2.326
+def get_demand_volatility(cv):
+    if cv < 0.30: return "GREEN", "lean", f"stable demand (CV {cv:.2f})", 1.282
+    if cv < 0.60: return "YELLOW", "balanced", f"variable demand (CV {cv:.2f})", 1.645
+    return "ORANGE", "conservative", f"volatile demand (CV {cv:.2f})", 2.326
 
 
 # ── Protection level (service level) ─────────────────────────────────────────
@@ -2263,9 +2136,9 @@ def get_forecast(sku_id: str = Query(...), stock: int = Query(default=500, ge=0)
         so_ts = ro_ts = None; d_so = d_ro = -1
 
     cv = e.get("residual_cv", 0.4); rstd = e.get("residual_std", 0.0)
-    # Demand volatility is still surfaced for context, but it no longer picks the
-    # service level — that now comes from the protection tier below.
-    vcolor, vstrat, vdesc, _z_from_cv = get_demand_volatility(e.get("residual_dispersion"))
+    # Demand volatility (σ proxy) is still surfaced for context, but it no longer
+    # picks the service level — that now comes from the protection tier below.
+    vcolor, vstrat, vdesc, _z_from_cv = get_demand_volatility(cv)
 
     # Protection level: recommend from the item's economics when supported, otherwise
     # fall back to the margin/default heuristic. Manual override still wins.
@@ -2475,9 +2348,6 @@ def get_forecast(sku_id: str = Query(...), stock: int = Query(default=500, ge=0)
         "reliabilityColor": rel_color, "reliabilityMessage": rel_msg, "intervalWidth": interval_width,
         "demandVolatilityColor": vcolor, "demandVolatilityStrategy": vstrat, "demandVolatilityDesc": vdesc,
         "residualCv": round(cv, 3), "zScore": round(z, 3), "residualStd": round(float(rstd), 2),
-        "residualDispersion": e.get("residual_dispersion"), "demandRefMean": e.get("residual_ref_mean"),
-        "demandSigmaObserved": e.get("residual_sigma_observed"),
-        "demandVolatilityLabel": volatility_label(e.get("residual_dispersion")),
         "hasPrice": e["has_price"], "hasPromotion": e["has_promo"], "priceVaried": e["price_varied"],
         "priceWellSampled": e["price_well_sampled"], "lastPrice": e["last_price"],
         "priceModeled": e.get("price_modeled", False), "currentPrice": e.get("effective_price"),
@@ -2562,75 +2432,26 @@ def sc_baseline_future_fc(entry, regular_price):
         print(f"[scorecard] baseline failed: {ex}"); return entry.get("future_fc")
 
 
-def _first_arr(f, stock, arrived):
-    hit = f[f["cum"] >= (stock + arrived)]
+def sc_days_of_cover(fc, stock):
+    if fc is None or fc.empty: return None
+    f = fc.copy(); f["cum"] = f["yhat"].clip(lower=0).cumsum(); hit = f[f["cum"] >= stock]
     return None if hit.empty else max(int((hit.iloc[0]["ds"] - today()).days), 0)
 
 
-def sc_days_of_cover(fc, stock, on_order=0, eta_days=None):
-    """Days until projected demand exhausts the stock available.
-
-    With `on_order` the units are counted only from the day they ARRIVE, which is the
-    same rule /api/forecast uses for its stockout date. Called twice per product: once
-    bare, for the "Days of Stock Remaining" column, which must keep meaning what is on
-    the shelf today, and once with the inbound PO, for the health bar — a product with
-    a container landing on Tuesday is not in the same position as one with nothing
-    coming, and the bar was reading them identically."""
-    if fc is None or fc.empty: return None
-    f = fc.copy(); f["cum"] = f["yhat"].clip(lower=0).cumsum()
-
-    def _first(avail):
-        hit = f[f["cum"] >= avail]
-        return None if hit.empty else max(int((hit.iloc[0]["ds"] - today()).days), 0)
-
-    bare = _first(float(stock))
-    qty = float(on_order or 0)
-    if qty <= 0:
-        return bare
-    if eta_days is None:                      # no date given: available now, as /api/forecast assumes
-        return _first(float(stock) + qty)
-    eta = max(0, int(eta_days))
-    # A delivery cannot cover demand that happened before it landed. Without this the
-    # cumulative walk stepped straight over an in-progress stockout: nothing on the
-    # shelf today plus a container due tomorrow came back as a month of cover.
-    if bare is not None and bare < eta:
-        return bare
-    arrived = ((f["ds"] - today()).dt.days >= eta).astype(float) * qty
-    return _first_arr(f, float(stock), arrived)
+def sc_cover_score(c, lt, cov):
+    c = 365 if c is None else c; lo = lt * 1.2; hi = lt + cov; dead = max(hi * 4.0, hi + 120.0)
+    if lo <= c <= hi: return 1.0
+    if c < lo: return max(0.0, c / lo)
+    if c >= dead: return 0.0
+    return max(0.0, 1.0 - (c - hi) / (dead - hi))
 
 
-# sc_cover_score is gone with the "Stock coverage" bar it fed — see the note above the
-# `breakdown` list in sc_score_one for why a point-in-time reading of a sawtooth made a
-# poor health signal. sc_cover_direction below SURVIVES: it feeds the status and the
-# recommendation wording, which read it alongside days-until-reorder rather than alone.
-
-
-# The bar's colour cuts, as ScorecardTab implements them: >= .66 green, >= .33 amber,
-# below that red. Named here because the score below is built to land on them.
-BAR_GREEN, BAR_AMBER = 0.66, 0.33
-
-
-def sc_volatility_score(d):
-    """Bar length. Green means good, so the score runs opposite to the name: more
-    volatile gives a shorter bar.
-
-    The ramp is piecewise so that each colour band lines up exactly with the label
-    beside it. A first cut used one smooth slope and put 25 of 26 products on a green
-    bar, including ones the label called volatile — a row reading "somewhat volatile"
-    next to a full green bar makes the reader decide which half to believe, and it was
-    the same everything-in-one-bucket failure the old CV had, moved from the words to
-    the colour."""
-    if d is None: return 0.6
-    d = float(d)
-    if d <= 1.0: return 1.0
-    if d <= DISPERSION_STEADY:                                   # steady -> green
-        return 1.0 - (d - 1.0) / (DISPERSION_STEADY - 1.0) * (1.0 - BAR_GREEN - 0.01)
-    if d < DISPERSION_VARIABLE:                                  # somewhat -> amber
-        span = DISPERSION_VARIABLE - DISPERSION_STEADY
-        return (BAR_GREEN - 0.01) - (d - DISPERSION_STEADY) / span * (BAR_GREEN - 0.01 - BAR_AMBER)
-    if d >= DISPERSION_FLOOR: return 0.10                        # highly -> red
-    span = DISPERSION_FLOOR - DISPERSION_VARIABLE
-    return max(0.10, (BAR_AMBER - 0.01) - (d - DISPERSION_VARIABLE) / span * (BAR_AMBER - 0.11))
+def sc_reliability_score(cv):
+    if cv is None: return 0.6
+    cv = float(cv)
+    if cv <= 0.30: return 1.0
+    if cv >= 0.90: return 0.10
+    return 1.0 - (cv - 0.30) / 0.60 * 0.90
 
 
 # sc_trend_score is gone with the "Sales trend" signal it fed. The bar needed more
@@ -2769,73 +2590,50 @@ def sc_recommendation(direction, tier, st, c, lt, on_promo, po, cost_known, dur,
     return base
 
 
-def sc_score_one(entry, fc, stock, unit_cost, fees, reg_price, td, lt, cov, po, on_promo,
-                 on_order=0, on_order_eta=None):
+def sc_score_one(entry, fc, stock, unit_cost, fees, reg_price, td, lt, cov, po, on_promo):
     df = entry["df_train"]; cutoff = today() - pd.Timedelta(days=td)
     tr = df[df["ds"] > cutoff]; tu = int(tr["y"].sum()) if len(tr) else 0; ta = tu / max(td, 1)
     n30 = fc.head(30) if fc is not None else None
     fa = float(n30["yhat"].clip(lower=0).mean()) if n30 is not None and len(n30) else None
     trend = (fa / ta) if (fa is not None and ta > 0) else None
     cover = sc_days_of_cover(fc, stock); direction = sc_cover_direction(cover, lt, cov)
-    # On-hand, and the same figure once stock already on its way is counted. `cover`
-    # stays on-hand-only because that is what "Days of Stock Remaining" claims to be;
-    # the detail panel's stockout date counts the PO, so both are reported rather than
-    # one screen quietly disagreeing with the other.
-    inbound = int(on_order or 0)
-    cover_pos = (sc_days_of_cover(fc, stock, inbound, on_order_eta) if inbound > 0 else cover)
     dur = None if cover is None else (cover - lt)
     denom = tu + max(stock, 0); st = (tu / denom) if denom > 0 else None
-    svol = sc_volatility_score(entry.get("residual_dispersion"))
+    scov = sc_cover_score(cover, lt, cov); srel = sc_reliability_score(entry.get("residual_cv"))
     days_hist = int((df["ds"].max() - df["ds"].min()).days) if len(df) > 1 else 0
     is_new = days_hist < SC_PROVISIONAL_DAYS
     rising = trend is not None and trend > 1.05
     status = sc_status(cover, dur, st, lt, cov, po, is_new)
-    _disp = entry.get("residual_dispersion")
-    # ONE signal. Each of the other three was a restatement of something already on
-    # screen, and each was deleted once that was demonstrated.
+    cover_txt = "beyond a year" if cover is None else f"{cover} days"
+    _cv = entry.get("residual_cv")
+    relw = "n/a" if _cv is None else ("very consistent" if _cv <= 0.30 else "moderately consistent" if _cv < 0.60 else "highly variable")
+    # Two signals, and they are genuinely independent: one is stock POSITION, the
+    # other is demand NOISE. Neither can be derived from the other.
     #
-    # "Sales trend" went first: a forecast-vs-run-rate ratio needing more nuance than a
-    # bar can carry (see the note by the deleted sc_trend_score).
+    # "Sales trend" went first — a forecast-vs-run-rate ratio needing more nuance
+    # than a bar can carry (see the note by the deleted sc_trend_score).
     #
-    # "Sales velocity" went next. Sell-through is
+    # "Sales velocity" went next, for a sharper reason. Sell-through is
     #     st = units_sold / (units_sold + stock) = W / (W + days_of_cover)
-    # so it is days-of-cover in different units. Checked over 19,152 lead-time x
-    # coverage x days-of-cover combinations, a per-SKU velocity bar and the Stock
-    # coverage bar disagreed zero times. It was a second rendering of that row.
+    # so it is days-of-cover in different units. Its fixed band put "under-stocked"
+    # at cover under 13 days and "slow mover" at cover over 56 — fleet-wide
+    # constants, which meant a healthy air line (3-day lead) always read
+    # under-stocked and a healthy sea line (60-day lead) always read slow mover.
+    # Scaling those thresholds per-product fixes that and lands exactly on
+    # sc_cover_direction: checked over 19,152 lead-time x coverage x days-of-cover
+    # combinations, a per-SKU velocity bar and the Stock coverage bar above it
+    # disagree zero times. It was a second rendering of the first row.
     #
-    # "Stock coverage" has now gone too, and for a reason worth writing down because it
-    # is not obvious. Days of cover is a SAWTOOTH: it peaks the day a delivery lands and
-    # falls to the safety buffer just before the next one, so reading it against a fixed
-    # band scores where a product sits in its reorder cycle as much as whether anything
-    # is wrong. Simulated against this tool's OWN reorder policy, with a perfect forecast
-    # and no stockout ever occurring, a correctly-run product read "short" on 24% of days
-    # at a 14-day lead time and 39% at 60 days. Worse, the bar barely separated the case
-    # it existed to catch: a product bought four months at a time scored 0.71 average
-    # against 0.82 for the same product ordered properly, while the order size itself
-    # separated them 133 days to 34. A snapshot of a cycling number dilutes a structural
-    # fact into noise.
-    #
-    # Nothing actionable was lost. The bottom of the cycle is already said, and said
-    # better, by the STATUS, which keys off days-until-reorder and therefore does not
-    # cycle: "Reorder due", "Covered — reorder in transit", "Stockout risk". The top is
-    # already caught by the overstock ceiling and the dead-stock test. `cover`,
-    # `cover_pos`, `direction` and `st` all survive because those rules, the table
-    # column, the scatter and the recommendation wording still read them.
-    _sig = entry.get("residual_sigma_observed")
-    _rate = entry.get("residual_ref_mean")
+    # `st` itself stays — it does independent work where actuals and forecast
+    # diverge (a product that genuinely stopped selling collapses st while its
+    # forecast-derived cover does not), which is what the dead-stock test and the
+    # slow/fast recommendation wording use it for. It is still reported as
+    # `sellThrough` for the table column.
     breakdown = [
-        {"key": "volatility", "label": "Sales volatility", "raw": volatility_label(_disp),
-         "score": round(svol, 2),
-         # The plain version of the same fact, in units rather than a ratio. A percentage
-         # invites the reader to compare products of different sizes on it, which is the
-         # trap that made the old CV figure unreadable; units per day do not.
-         # Only when there IS a verdict. sigma and the rate exist even when the window
-         # held too few units to judge dispersion, so this line was rendering
-         # "about ±1.3 a day on 1.8 a day" directly under "not enough sales to say" —
-         # the row contradicting itself in two lines.
-         "note": (f"about ±{_sig:.1f} a day on {_rate:.1f} a day"
-                  if (_disp is not None and _sig is not None and _rate) else None),
-         "explanation": _volatility_tip(_disp, _rate)},
+        {"key": "cover", "label": "Stock coverage", "raw": cover_txt, "score": round(scov, 2),
+         "explanation": f"Stock projected to last {cover_txt}. Healthy is ~{round(lt*1.2)}–{lt+cov} days."},
+        {"key": "reliability", "label": "Sales consistency", "raw": relw, "score": round(srel, 2),
+         "explanation": "How consistent day-to-day demand is."},
     ]
     flags = []
     if st is not None and st < 0.05 and (cover is None or cover > (lt + cov)):
@@ -2852,8 +2650,7 @@ def sc_score_one(entry, fc, stock, unit_cost, fees, reg_price, td, lt, cov, po, 
     tier = sc_return_tier(margin)
     action, reason = sc_recommendation(direction, tier, st, cover, lt, on_promo, po, ck, dur,
                                        is_new=is_new, rising=rising, days_hist=days_hist, cov=cov)
-    return {"daysOfCover": cover, "daysOfCoverWithInbound": cover_pos, "unitsOnOrder": inbound,
-            "coverDirection": direction, "daysUntilReorder": dur,
+    return {"daysOfCover": cover, "coverDirection": direction, "daysUntilReorder": dur,
             "sellThrough": round(st, 3) if st is not None else None, "trailingUnits": tu,
             "status": status, "statusRank": STATUS_RANK.get(status, 9), "signals": breakdown,
             "flags": flags, "marginPct": margin, "returnTier": tier,
@@ -2870,23 +2667,10 @@ def get_scorecard(payload: dict = Body(default={})):
         stock = int(cfg.get("stock", 500)); uc = cfg.get("unitCost", None); uc = float(uc) if uc not in (None, "") else None
         fees = cfg.get("fees", None); fees = float(fees) if fees not in (None, "") else 0.0
         lt = int(cfg.get("leadTime", 14)); cov = int(cfg.get("coverage", 30)); po = bool(cfg.get("hasOpenPo", False))
-        # Quantity and arrival date of an open PO. Only the boolean used to come across,
-        # so the coverage bar judged a product with a container inbound exactly as it
-        # judged one with nothing coming. Absent or malformed values fall back to 0/None,
-        # which reproduces the previous behaviour rather than guessing.
-        try:
-            ooq = max(0, int(cfg.get("unitsOnOrder") or 0))
-        except (TypeError, ValueError):
-            ooq = 0
-        _eta = cfg.get("onOrderEtaDays")
-        try:
-            eta = None if _eta in (None, "") else max(0, int(_eta))
-        except (TypeError, ValueError):
-            eta = None
         events = e.get("events", []) or []
         reg = sc_effective_price_today(e, events); on_promo, disc = sc_on_promo_today(e, events)
         pp = round(reg * (1 - float(disc) / 100), 2) if (on_promo and disc and reg is not None) else None
-        live = sc_score_one(e, e["future_fc"], stock, uc, fees, reg, td, lt, cov, po, on_promo, ooq, eta)
+        live = sc_score_one(e, e["future_fc"], stock, uc, fees, reg, td, lt, cov, po, on_promo)
         row = {"skuId": sku_id, "skuName": e.get("sku_name") or sku_id, "mode": e.get("mode"),
                "stock": stock, "unitCost": uc, "fees": fees, "costKnown": uc is not None and uc > 0,
                "regularPrice": reg, "onPromoToday": on_promo, "promoPrice": pp,
@@ -2895,8 +2679,7 @@ def get_scorecard(payload: dict = Body(default={})):
                "winningModel": e.get("winning_model"), "demandClass": e.get("demand_class"), "route": e.get("route"),
                **live}
         if on_promo:
-            row["baselineView"] = sc_score_one(e, sc_baseline_future_fc(e, reg), stock, uc, fees, reg,
-                                               td, lt, cov, po, False, ooq, eta)
+            row["baselineView"] = sc_score_one(e, sc_baseline_future_fc(e, reg), stock, uc, fees, reg, td, lt, cov, po, False)
         rows.append(row)
     dist = {k: 0 for k in STATUS_RANK}
     for r in rows: dist[r["status"]] = dist.get(r["status"], 0) + 1

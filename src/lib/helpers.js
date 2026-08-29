@@ -112,13 +112,20 @@ export function buildScorecardBody(skuList, skuParams, openPOs, suppliers, trail
   const skus = {};
   (skuList || []).forEach((s) => {
     const p = sanitizeParams({ ...DEFAULT_PARAMS, ...(skuParams?.[s.id] || {}) });
+    const po = openPOs?.[s.id];
     skus[s.id] = {
       stock: p.stock,
       leadTime: planningLeadTime(s.id, p, suppliers, { ignoreOneOff: true }).days,
       coverage: p.coverage,
       unitCost: p.unitCost ?? null,
       fees: p.fees ?? 0,
-      hasOpenPo: !!openPOs?.[s.id],
+      hasOpenPo: !!po,
+      // The PO's SIZE and ARRIVAL, not just that one exists. Without these the
+      // scorecard scored a product with a container inbound exactly as it scored one
+      // with nothing coming, so its coverage bar contradicted the stockout date on the
+      // detail panel, which has always counted the PO.
+      unitsOnOrder: po ? (Number(po.qty) || 0) : 0,
+      onOrderEtaDays: po ? poEtaDays(po) : null,
     };
   });
   return { trailingDays, skus };

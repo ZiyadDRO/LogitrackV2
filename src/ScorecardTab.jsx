@@ -103,6 +103,10 @@ function Signals({ view, lm }) {
       <div>
         <div className={`text-[11px] uppercase tracking-widest font-bold ${head}`}>Signals behind this status</div>
         <div className={`text-[11px] ${muted} mt-0.5`}>Green is strong, amber is mixed, red is weak.</div>
+        {/* Stock coverage used to sit here. It was a point-in-time reading of a number
+            that rises and falls with every reorder cycle, so it scored where a product
+            was in that cycle as much as whether anything was wrong; the status says the
+            same thing without cycling. See sc_score_one in main.py for the full note. */}
       </div>
       {/* The special "Sales velocity" renderer that used to sit here is gone with the
           signal it drew. Sell-through is days-of-cover in other units, so its band
@@ -117,6 +121,9 @@ function Signals({ view, lm }) {
                 <span className={`text-[11px] font-semibold ${label}`}>{c.label}</span>
               </Tip>
               <div className={`text-[10px] ${muted}`}>{c.raw}</div>
+              {/* The same fact in units rather than a ratio, for anyone who wants to
+                  sanity-check the bar against what they know about the product. */}
+              {c.note && <div className={`text-[10px] ${muted} leading-snug`}>{c.note}</div>}
             </div>
             <div className="flex-1">
               <div className={`h-2 ${barBg} rounded-full overflow-hidden`}>
@@ -525,7 +532,7 @@ export default function ScorecardTab({ api = "http://localhost:8000", skuList = 
             <thead>
               <tr className={`border-b ${rowBorder}`}>
                 <th className={thCls} onClick={() => toggleSort("skuName")}>
-                  <Tip text="Click any row to see the signals behind its status.">SKU</Tip>
+                  <Tip text="Click any row to see the detail behind its status.">SKU</Tip>
                 </th>
                 <th className={thCls} onClick={() => toggleSort("status")}><Tip text={HELP.status}>Status{arrow(sortKey, sortDir, "status")}</Tip></th>
                 <th className={thCls} onClick={() => toggleSort("daysOfCover")}><Tip text={HELP.cover}>Days of Stock Remaining{arrow(sortKey, sortDir, "daysOfCover")}</Tip></th>
@@ -641,7 +648,7 @@ export default function ScorecardTab({ api = "http://localhost:8000", skuList = 
       </div>
 
       <p className={`text-[11px] ${muted} leading-relaxed`}>
-        The status describes each item's current inventory situation and what to do about it; the profit grade (A/B/C) reflects how profitable each sale is. A reorder coming due is treated as a routine action ("Reorder due"), not a health problem — only a missed window or a position you can't recover from reads as "Stockout risk." Select any row for the signals behind its status.
+        The status describes each item's current inventory situation and what to do about it; the profit grade (A/B/C) reflects how profitable each sale is. A reorder coming due is treated as a routine action ("Reorder due"), not a health problem — only a missed window or a position you can't recover from reads as "Stockout risk." Select any row for the detail behind its status.
       </p>
     </div>
   );

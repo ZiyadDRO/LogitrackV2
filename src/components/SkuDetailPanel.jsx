@@ -27,31 +27,36 @@ export function OrderMathCard({ data, leadTime, coverageDays, unitsOnOrder, lm, 
   const usingAvg = skuSt?.avg !== null && leadTime === skuSt?.avg;
   const daysEarlier = skuSt?.p80 && skuSt?.avg ? skuSt.p80 - skuSt.avg : null;
 
-  // Protection level drives the buffer; picked from economics when supported,
-  // otherwise from the margin/default fallback.
+  // Protection level is the MULTIPLIER on the demand spread: buffer = z x spread, where
+  // the spread is how far the forecast misses over a whole lead time, in units. It is
+  // picked from economics when supported, otherwise from the margin/default fallback.
   const prot = data.protection;
 
   return (
-    <div className={`${bg} border rounded-xl`} style={{overflow: "clip"}}>
+    // Two columns on a wide panel. As one full-width strip the rows are label-left /
+    // number-right, so every pair was separated by the entire screen and the card ran
+    // twice as tall as its content needed. The split is weighted rather than even: the
+    // left side is short labels and numbers, the right side is sentences.
+    <div className={`${bg} border rounded-xl grid md:grid-cols-[minmax(0,1fr)_minmax(0,1.45fr)]`} style={{overflow: "clip"}}>
       {/* ── Quantity math ── */}
-      <div className="p-4 font-mono text-xs space-y-2">
-        <div className={`text-[11px] uppercase tracking-widest font-bold pb-1.5 border-b ${head}`}>Order qty breakdown</div>
+      <div className="p-3.5 font-mono text-xs space-y-1.5">
+        <div className={`text-[11px] uppercase tracking-widest font-bold pb-1.5 mb-0.5 border-b ${head}`}>Order qty breakdown</div>
         <div className={`flex justify-between ${label}`}><span>Demand after delivery ({coverageDays}d)</span><span className={`${val} tabular-nums`}>{data.coverageQty.toLocaleString()}</span></div>
         <div className={`flex justify-between ${label}`}><span>Demand buffer</span><span className="text-violet-500 tabular-nums">+ {data.safetyStock.toLocaleString()}</span></div>
-        <div className={`flex justify-between ${sub} border-t pt-1.5`}><span>Target stock level</span><span className="font-bold tabular-nums">{data.targetInventory.toLocaleString()}</span></div>
+        <div className={`flex justify-between ${sub} border-t pt-1.5 mt-0.5`}><span>Target stock level</span><span className="font-bold tabular-nums">{data.targetInventory.toLocaleString()}</span></div>
         <div className={`flex justify-between text-[11px] ${label}`}><span>Est. stock at delivery</span><span className="text-rose-500 tabular-nums">− {(data.stockAtDelivery ?? data.projectedStockReorder).toLocaleString()}</span></div>
         {unitsOnOrder > 0 && (
           <div className={`flex justify-between text-[11px] ${label}`}><span>Open PO in transit</span><span className="text-violet-500 tabular-nums">− {unitsOnOrder.toLocaleString()}</span></div>
         )}
-        <div className={`flex justify-between font-bold border-t ${divider} pt-1.5 text-sm ${lm ? "text-violet-700" : "text-violet-400"}`}><span>Units to order</span><span className="tabular-nums">= {data.orderQty.toLocaleString()}</span></div>
+        <div className={`flex justify-between font-bold border-t ${divider} pt-1.5 mt-0.5 text-sm ${lm ? "text-violet-700" : "text-violet-400"}`}><span>Units to order</span><span className="tabular-nums">= {data.orderQty.toLocaleString()}</span></div>
       </div>
 
       {/* ── Protection summary ── */}
-      <div className={`border-t ${divider} divide-y ${divider}`}>
-        <div className={`text-[10px] uppercase tracking-widest font-bold px-4 pt-3 pb-1.5 ${lm ? "text-slate-400" : "text-slate-600"}`}>Protection breakdown</div>
+      <div className={`border-t md:border-t-0 md:border-l ${divider} divide-y ${divider}`}>
+        <div className={`text-[10px] uppercase tracking-widest font-bold px-3.5 pt-3.5 pb-1.5 ${lm ? "text-slate-400" : "text-slate-600"}`}>Protection breakdown</div>
 
         {/* Demand buffer row */}
-        <div className={`flex items-start gap-3 px-4 py-2.5 ${lm ? "bg-white" : "bg-transparent"}`}>
+        <div className={`flex items-start gap-2.5 px-3.5 py-2 ${lm ? "bg-white" : "bg-transparent"}`}>
           <div className={`mt-0.5 h-4 w-4 rounded-full flex items-center justify-center shrink-0 ${lm ? "bg-emerald-100" : "bg-emerald-950/40"}`}>
             <svg className={`h-2.5 w-2.5 ${lm ? "text-emerald-600" : "text-emerald-400"}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7"/></svg>
           </div>
@@ -88,7 +93,7 @@ export function OrderMathCard({ data, leadTime, coverageDays, unitsOnOrder, lm, 
         </div>
 
         {/* Delivery timing row */}
-        <div className={`flex items-start gap-3 px-4 py-2.5 ${lm ? "bg-white" : "bg-transparent"}`}>
+        <div className={`flex items-start gap-2.5 px-3.5 py-2 ${lm ? "bg-white" : "bg-transparent"}`}>
           {usingP80 ? (
             <div className={`mt-0.5 h-4 w-4 rounded-full flex items-center justify-center shrink-0 ${lm ? "bg-violet-100" : "bg-violet-950/40"}`}>
               <svg className={`h-2.5 w-2.5 ${lm ? "text-violet-600" : "text-violet-400"}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7"/></svg>
@@ -905,8 +910,15 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
           {/* ── Stockout Protection ── */}
           {mlData?.protection && (() => {
             const p       = mlData.protection;
-            const cv      = mlData.residualCv;
-            const cvPct   = cv != null ? Math.round(cv * 100) : null;
+            // Volume-adjusted, not the raw CV. CV is error divided by daily units, so
+            // across this catalogue it correlates 0.85 with 1/sqrt(units per day): it
+            // mostly reported how few a day something sold. A perfectly steady product
+            // selling 1.1 a day showed 97%, which read as alarming and was not. This is
+            // the same figure the scorecard's Sales volatility bar uses, so the two
+            // screens now report one number instead of two that disagree.
+            const disp    = mlData.residualDispersion;
+            const sigObs  = mlData.demandSigmaObserved;
+            const refRate = mlData.demandRefMean;
             const zScore  = mlData.zScore;
             const setProt = (key) => updateDraft("protection", key === p.recommended ? undefined : key);
             return (
@@ -984,13 +996,13 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
                   </div>
                   )}
                   {/* Stats footer */}
-                  {p.status !== "calculating" && cvPct != null && (
+                  {p.status !== "calculating" && disp != null && (
                     <div className={`divide-y ${lm ? "divide-slate-100 border-t border-slate-200" : "divide-slate-700/30 border-t border-slate-700/40"}`}>
                       <div className={`flex items-center justify-between px-3 py-1.5 text-[11px] ${lm ? "bg-white" : "bg-slate-900/20"}`}>
-                        <Tip text="Residual noise in daily demand after trend and seasonality are removed. This sets the SIZE of the buffer (a noisier item needs more); it's separate from the protection level above.">
-                          <span className={lm ? "text-slate-400" : "text-slate-600"}>Demand noise (CV)</span>
+                        <Tip text={`Swing in daily sales after trend and seasonality are removed, measured against the randomness any product this size carries anyway. 1.0x is as steady as that sales volume permits; past 2.0x it moves more than its size explains.${sigObs != null && refRate ? ` Here that is about ±${sigObs.toFixed(1)} a day on ${refRate.toFixed(1)} a day.` : ""} The buffer is sized from that raw swing in units, accumulated over a lead time — not from this ratio, which divides the swing by product size so that two products of different sizes can be compared. Bigger swing means a bigger buffer; a higher ratio does not, on its own.`}>
+                          <span className={lm ? "text-slate-400" : "text-slate-600"}>Sales volatility</span>
                         </Tip>
-                        <span className={`font-mono font-bold ${lm ? "text-slate-600" : "text-slate-300"}`}>{cvPct}%</span>
+                        <span className={`font-mono font-bold ${lm ? "text-slate-600" : "text-slate-300"}`}>{disp.toFixed(1)}x{mlData.demandVolatilityLabel ? ` · ${mlData.demandVolatilityLabel}` : ""}</span>
                       </div>
                       <div className={`flex items-center justify-between px-3 py-1.5 text-[11px] ${lm ? "bg-white" : "bg-slate-900/20"}`}>
                         <Tip text={`Protection level: the probability of not stocking out during a replenishment cycle. z=${zScore?.toFixed(3)} is the standard normal score for ${p.servicePct}%.`}>
@@ -1498,7 +1510,7 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
           </div>
         </div>
 
-        {/* Order Math — full-width row below chart */}
+        {/* Order Math — two columns on a wide panel, stacked on a narrow one */}
         <OrderMathCard data={mlData} leadTime={params.leadTime} coverageDays={params.coverage} unitsOnOrder={onOrderQty} lm={lm} skuSt={skuSt} demandVolatilityColor={mlData?.demandVolatilityColor} />
 
         <div>

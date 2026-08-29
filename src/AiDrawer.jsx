@@ -1,13 +1,108 @@
 import { posInt, namedSuppliers, buildScorecardBody } from './lib/helpers';
 import { useState, useRef, useEffect } from "react";
 import { loadStorage, saveStorage } from "./lib/storage";
-import { GROQ_URL, GROQ_MODEL } from "./lib/ai";
+import { GROQ_URL, GROQ_MODEL_CHAT, GROQ_NO_TOOLS, groqToolsRan } from "./lib/ai";
 
 // ─────────────────────────────────────────────
 // FULL CONTEXT BUILDER  (folder + supplier aware)
 // ─────────────────────────────────────────────
-function buildFleetContext(skuForecasts, openPOs, skuParams, skuList, folders, suppliers, scorecard, groups, history) {
+/** One line per product, for EVERY product, always sent.
+ *
+ *  The fleet used to be described only by the full 14-section block below, for all 32
+ *  products, on every message: roughly 10,000 tokens a question against a free-tier
+ *  budget of 8,000 a minute. Most of it is drill-down — which engine the router picked
+ *  and why, how the conformal band was built, the protection cost curve — which matters
+ *  when someone asks about ONE product and is dead weight when they ask what to order.
+ *
+ *  So: a roster line for everything, full detail only where it is needed. The roster is
+ *  what stops that from becoming a blind spot; a product the question did not name is
+ *  still visible, with the facts that decide whether it belongs in an answer at all. */
+function rosterLine(s, sc, po, params) {
+  const cover = !sc ? "?" : sc.daysOfCover == null ? "365+" : `${sc.daysOfCover}d`;
+  const ro = s.daysUntilReorder === -1 ? "n/a" : s.daysUntilReorder <= 0 ? "OVERDUE" : `${s.daysUntilReorder}d`;
+  return [
+    `${s.skuName} (${s.skuId})`,
+    sc ? sc.status : "unrated",
+    `stock ${params.stock?.toLocaleString?.() ?? params.stock}`,
+    `cover ${cover}`,
+    `reorder ${ro}`,
+    `order ${s.orderQty?.toLocaleString() ?? "?"}`,
+    `${s.avgDailyDemand ?? "?"}/day`,
+    s.demandVolatilityLabel || "volatility n/a",
+    po ? `PO ${po.qty?.toLocaleString()} due ${po.delivery ?? "?"}` : "no PO",
+    sc?.returnTier && sc.returnTier !== "—" ? `grade ${sc.returnTier}` : "",
+  ].filter(Boolean).join(" | ");
+}
+
+
+/** Which products deserve the full 14-section block for THIS question.
+ *
+ *  Three sources, deliberately generous, because the cost of including a product that
+ *  turns out to be irrelevant is a few hundred tokens, while the cost of omitting one
+ *  the user asked about is a confidently thin answer:
+ *    1. anything the question names, by product name or SKU id
+ *    2. anything not Healthy, so "what needs attention" works without naming anything
+ *    3. the most urgent by reorder date, to fill up to the cap when the first two are thin
+ *
+ *  Matching is loose on purpose: lowercase, and a product counts as named if the
+ *  question contains its id or any word of its name four characters or longer. "Harlow"
+ *  pulls in every Harlow product, which is the behaviour someone typing that expects. */
+function pickDetailSkus(question, skuForecasts, scorecard, cap = 6) {
+  // 6, not a rounder 10, because a rendered detail block is about 2,900 characters.
+  // Roster (~130 chars x every product) + 6 blocks lands near 21,000 characters, which
+  // clears the budget below with room for the preamble, the chat turns and the reply.
+  // Ten blocks came to 34,000 and would have tripped the very truncation this exists to
+  // avoid. If the blocks are ever slimmed, this can rise.
+  const q = (question || "").toLowerCase();
+  const scMap = {};
+  (scorecard?.rows || []).forEach(r => { scMap[r.skuId] = r; });
+
+  // Score rather than a yes/no match. A flat "any word of 4+ letters" test pulled 14 of
+  // 32 products for "why is the Harlow 24in Vanity forecast so low", because in this
+  // catalogue "vanity" is a category word that half the products share. Counting HOW
+  // MANY of the question's words a product matches ranks the one actually asked about
+  // above its siblings, and a word shared by most of the catalogue stops being evidence.
+  const common = new Map();
+  skuForecasts.forEach(s => {
+    new Set(String(s.skuName || "").toLowerCase().split(/[^a-z0-9]+/).filter(w => w.length >= 4))
+      .forEach(w => common.set(w, (common.get(w) || 0) + 1));
+  });
+  const tooCommon = Math.max(2, Math.ceil(skuForecasts.length * 0.25));
+
+  const scored = [];
+  const needy = [];
+  const rest  = [];
+  skuForecasts.forEach(s => {
+    const id = String(s.skuId || "");
+    let score = 0;
+    if (id && q.includes(id.toLowerCase())) score += 100;          // an id is unambiguous
+    new Set(String(s.skuName || "").toLowerCase().split(/[^a-z0-9]+/).filter(w => w.length >= 4))
+      .forEach(w => { if (q.includes(w)) score += (common.get(w) >= tooCommon ? 1 : 5); });
+    if (score > 0) { scored.push([score, s]); return; }
+    const st = scMap[id]?.status;
+    if (st && st !== "Healthy") needy.push(s); else rest.push(s);
+  });
+  const named = new Set(
+    scored.sort((a, b) => b[0] - a[0]).slice(0, cap).map(([, s]) => String(s.skuId)));
+
+  // Soonest reorder first; -1 means "no reorder needed", so it sorts last.
+  const byUrgency = (a, b) => {
+    const x = a.daysUntilReorder === -1 ? 1e9 : a.daysUntilReorder;
+    const y = b.daysUntilReorder === -1 ? 1e9 : b.daysUntilReorder;
+    return x - y;
+  };
+  const out = new Set(named);
+  [...needy.sort(byUrgency), ...rest.sort(byUrgency)].forEach(s => {
+    if (out.size < cap) out.add(String(s.skuId));
+  });
+  return out;
+}
+
+
+function buildFleetContext(skuForecasts, openPOs, skuParams, skuList, folders, suppliers, scorecard, groups, history, detailFor = null) {
   if (!skuForecasts || skuForecasts.length === 0) return "No SKU data loaded yet.";
+  // null = every product in full, which is what the reorder brief still wants.
+  const wantsDetail = (id) => detailFor === null || detailFor.has(id);
 
   const DEFAULT_PARAMS = { stock: 500, leadTime: 14, coverage: 30, strategy: "balanced", months: 1 };
 
@@ -42,7 +137,18 @@ function buildFleetContext(skuForecasts, openPOs, skuParams, skuList, folders, s
   }
 
   // ── 2. Per-SKU data ──
+  // Every product, one line each. Built before the detail blocks so that the roster is
+  // never the thing that gets dropped when something has to give.
+  const roster = [
+    "=== FLEET ROSTER (every product) ===",
+    "name (id) | status | stock | days of cover | reorder in | order qty | rate | volatility | open PO | profit grade",
+    ...skuForecasts.map(s => rosterLine(
+      s, scMap[s.skuId], openPOs?.[s.skuId], skuParams?.[s.skuId] ?? DEFAULT_PARAMS)),
+    "=== END FLEET ROSTER ===\n",
+  ].join("\n");
+
   const skus = skuForecasts.map(s => {
+    if (!wantsDetail(s.skuId)) return "";
     const po     = openPOs?.[s.skuId];
     const params = skuParams?.[s.skuId] ?? DEFAULT_PARAMS;
     const meta   = skuList?.find(x => x.id === s.skuId);
@@ -94,9 +200,14 @@ function buildFleetContext(skuForecasts, openPOs, skuParams, skuList, folders, s
 
       // Demand volatility (under-the-hood residual analysis)
       `\n[Demand Volatility — Residual Analysis]`,
-      `  Residual CV (coefficient of variation): ${s.residualCv != null ? (s.residualCv * 100).toFixed(1) + "%" : "N/A"}`,
       `  Daily demand swing (σ, residual std): ${s.residualStd != null ? "±" + s.residualStd + " units/day" : "N/A"}`,
+      // Dispersion, not the raw CV. CV is error divided by daily units, so it mostly
+      // reports how few units a day something sells: below ~2.8/day it is always
+      // "volatile" and below ~11/day it can never be "stable". Dividing by sqrt(units)
+      // takes out that floor, so 1.0 means "as steady as this sales volume permits".
+      `  Sales volatility (swing vs the minimum unavoidable at this volume): ${s.residualDispersion != null ? s.residualDispersion.toFixed(2) + "x" : "N/A"}${s.demandVolatilityLabel ? ` — ${s.demandVolatilityLabel}` : ""}${s.demandRefMean != null ? ` on ~${s.demandRefMean.toFixed(1)} units/day` : ""}`,
       `  Volatility classification: ${s.demandVolatilityColor ?? "N/A"} — ${s.demandVolatilityDesc ?? "N/A"}`,
+      `  (Residual CV, engine diagnostic only — do NOT judge volatility from it, it mostly tracks how few units a day a product sells: ${s.residualCv != null ? (s.residualCv * 100).toFixed(1) + "%" : "N/A"})`,
 
       // Protection level (service level) — cost-driven when supported, margin/default fallback otherwise
       `\n[Protection Level — service level for the safety buffer]`,
@@ -183,10 +294,15 @@ function buildFleetContext(skuForecasts, openPOs, skuParams, skuList, folders, s
         if (!sc) return "";
         const view = sc; // live view (promo-adjusted if on promo)
         const cov  = view.daysOfCover == null ? "365+ (no depletion within a year)" : `${view.daysOfCover} days`;
+        // On-hand and full position are different facts. Handing over only the first
+        // let the assistant call a product short while a PO was days from landing.
+        const inb  = view.unitsOnOrder > 0
+          ? ` (on hand; ${view.unitsOnOrder.toLocaleString()} more on order, ${view.daysOfCoverWithInbound == null ? "365+" : view.daysOfCoverWithInbound + " days"} in total)`
+          : "";
         const st   = view.sellThrough == null ? "N/A" : `${Math.round(view.sellThrough * 100)}%`;
         const out = [
           `\n[Inventory Scorecard]`,
-          `  Status: ${view.status}; days of stock: ${cov}; sell-through: ${st}`,
+          `  Status: ${view.status}; days of stock: ${cov}${inb}; sell-through: ${st}`,
           `  Profit grade: ${view.returnTier}${view.marginPct != null ? ` (margin ${view.marginPct}%)` : " (no cost)"}; cash tied up: ${sc.carryingValue != null ? "$" + Math.round(sc.carryingValue).toLocaleString() : "N/A"}`,
           `  Recommended action: ${view.recommendation.action} — ${view.recommendation.reason}`,
         ];
@@ -309,7 +425,17 @@ function buildFleetContext(skuForecasts, openPOs, skuParams, skuList, folders, s
     historySection = lines.join("\n");
   }
 
-  return folderSection + scorecardSection + classificationSection + skus.join("\n\n") + supplierSection + historySection;
+  const detail = skus.filter(Boolean);
+  const detailHeader = detail.length
+    ? `\n=== FULL DETAIL for ${detail.length} of ${skuForecasts.length} products ===\n`
+      + "Every other product appears in the roster above with its headline numbers only. If a\n"
+      + "question needs engine internals, protection reasoning, monthly projections or event\n"
+      + "history for a product NOT detailed here, say which product you need and stop — do not\n"
+      + "infer those from the roster line.\n"
+    : "";
+
+  return folderSection + roster + scorecardSection + classificationSection
+       + detailHeader + detail.join("\n\n") + supplierSection + historySection;
 }
 
 // Was a third private copy of this, and the most wrong: it sent the raw
@@ -368,14 +494,18 @@ ${skuLines}`;
         method: "POST",
         headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
         body: JSON.stringify({
-          model: GROQ_MODEL,
+          model: GROQ_MODEL_CHAT,
+          ...GROQ_NO_TOOLS,
           messages: [{ role: "user", content: prompt }],
           max_tokens: 600,
           temperature: 0.3,
         }),
       });
       const data = await res.json();
-      setBrief(data?.choices?.[0]?.message?.content || "Could not generate brief.");
+      const ran = groqToolsRan(data);
+      if (ran) console.warn(`[ai] built-in tools ran despite being disabled: ${ran}`);
+      setBrief((ran ? `[warning: the model ran ${ran} — external content may have influenced this brief]\n\n` : "")
+        + (data?.choices?.[0]?.message?.content || "Could not generate brief."));
     } catch {
       setBrief("Failed to generate brief. Check your API key.");
     } finally {
@@ -499,10 +629,25 @@ export default function AiDrawer({ skuForecasts, openPOs, skuParams, skuList, fo
   const inputRef  = useRef(null);
 
   // ── Draggable button state ──
-  const [btnY, setBtnY] = useState(() => {
-    const v = loadStorage("logitrack_ai_btn_y", null);
-    return v != null ? parseInt(v, 10) : null; // null = CSS bottom-6
-  });
+  //
+  // null means "no saved position", which renders from the CSS bottom instead. Anything
+  // that is not a finite number MUST collapse back to null, because `top: NaNpx` is an
+  // invalid declaration: the browser drops it, `bottom` is already "auto", and the
+  // button lands at viewport y=0 with no way to move it. `NaN ?? fallback` returns NaN
+  // rather than the fallback, so every later drag computed NaN too and the button was
+  // stuck at the top of the screen permanently.
+  //
+  // It got there from a plain CLICK. mouseup fired without any movement and saved
+  // String(btnYRef.current) while btnY was still null, writing the literal "null", which
+  // parseInt turned into NaN on the next load. So opening the drawer once and reloading
+  // was enough to break it.
+  const readBtnY = () => {
+    const n = parseInt(loadStorage("logitrack_ai_btn_y", null), 10);
+    return Number.isFinite(n) ? n : null;
+  };
+  const clampBtnY = (n) =>
+    (Number.isFinite(n) ? Math.max(8, Math.min(window.innerHeight - 60, n)) : null);
+  const [btnY, setBtnY] = useState(() => clampBtnY(readBtnY()));
   const btnYRef      = useRef(btnY);
   const hasMoved     = useRef(false);
   const dragStartY   = useRef(0);
@@ -510,12 +655,24 @@ export default function AiDrawer({ skuForecasts, openPOs, skuParams, skuList, fo
 
   useEffect(() => { btnYRef.current = btnY; }, [btnY]);
 
+  // A position saved on a tall window is off-screen on a short one. The clamp only ever
+  // ran mid-drag, so a smaller window left the button below the fold with no way to
+  // reach it — the same class of bug as the NaN, just at the other end.
+  useEffect(() => {
+    const onResize = () => setBtnY(prev => (prev === null ? null : clampBtnY(prev)));
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
   const handleMouseDown = (e) => {
     if (e.button !== 0) return;
     e.preventDefault();
     hasMoved.current     = false;
     dragStartY.current   = e.clientY;
-    dragStartTop.current = btnYRef.current ?? (window.innerHeight - 24 - 44);
+    // Number.isFinite, not ??, so a bad stored value can't poison the drag.
+    dragStartTop.current = Number.isFinite(btnYRef.current)
+      ? btnYRef.current
+      : (window.innerHeight - 24 - 44);
 
     const onMove = (ev) => {
       const delta = ev.clientY - dragStartY.current;
@@ -527,7 +684,11 @@ export default function AiDrawer({ skuForecasts, openPOs, skuParams, skuList, fo
     const onUp = () => {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
-      saveStorage("logitrack_ai_btn_y", String(btnYRef.current));
+      // Only persist an actual drag, and only a real number. Saving on every click is
+      // what wrote "null" into storage in the first place.
+      if (hasMoved.current && Number.isFinite(btnYRef.current)) {
+        saveStorage("logitrack_ai_btn_y", String(btnYRef.current));
+      }
     };
 
     window.addEventListener("mousemove", onMove);
@@ -586,15 +747,31 @@ export default function AiDrawer({ skuForecasts, openPOs, skuParams, skuList, fo
       includeHistory ? fetchJsonSafe(`${api}/api/history?recent_days=90`) : Promise.resolve(null),
     ]);
 
-    let fleetCtx = buildFleetContext(skuForecasts, openPOs, skuParams, skuList, folders, suppliers, scorecard, groups, history);
-    // Safety net: keep the request under Groq's free-tier token budget (~12k/min).
-    // ~4 chars/token, and we must leave room for the system preamble, the chat
-    // turns, and the model's reply. If the fleet context is too big, trim it and
-    // tell the model so it can ask the user to narrow down (or enable a higher tier).
-    const FLEET_CHAR_BUDGET = includeHistory ? 200000 : 28000; // ~7k tokens when history is off
+    // Which products get the full block. Everything else still appears in the roster.
+    const detailFor = pickDetailSkus(text, skuForecasts, scorecard);
+    let fleetCtx = buildFleetContext(skuForecasts, openPOs, skuParams, skuList, folders,
+                                     suppliers, scorecard, groups, history, detailFor);
+
+    // Last-resort cap. This used to be fleetCtx.slice(0, 28000), a blind cut through
+    // whatever text happened to be at character 28,000: it sliced mid-product and
+    // silently dropped every product after the cut, so on a 32-product catalogue the
+    // assistant was briefed on roughly the first two thirds and had no idea the rest
+    // existed. Which products vanished depended only on sort order. Now the roster is
+    // built first and always survives, and if the total is still too long the detail
+    // blocks are dropped from the end — losing depth on some products, never their
+    // existence. (The old comment also cited a 12k/min budget, which was the retired
+    // model's; see GROQ_MODEL_CHAT in lib/ai.js for the current one.)
+    // 90k with history, not the 200k it was. 200,000 characters is ~50,000 tokens for a
+    // SINGLE message, which is most of compound-mini's 70,000-per-minute allowance in one
+    // go and guarantees a 429 on the follow-up question. 90k is ~22,500 tokens, so three
+    // history-backed questions fit inside a minute. Without history the roster keeps the
+    // whole thing near 22,000 characters and this never fires at all.
+    const FLEET_CHAR_BUDGET = includeHistory ? 90000 : 28000;
     if (fleetCtx.length > FLEET_CHAR_BUDGET) {
-      fleetCtx = fleetCtx.slice(0, FLEET_CHAR_BUDGET) +
-        "\n\n[...fleet context truncated to fit the token limit. Ask about specific SKUs or folders for full detail, or enable a higher Groq tier.]";
+      const cut = fleetCtx.lastIndexOf("\n\n━━━ SKU:", FLEET_CHAR_BUDGET);
+      fleetCtx = (cut > 0 ? fleetCtx.slice(0, cut) : fleetCtx.slice(0, FLEET_CHAR_BUDGET)) +
+        "\n\n[Detail for the remaining products was dropped to fit the token limit. They are all\n" +
+        "still listed in the fleet roster above. Ask about one by name for its full detail.]";
     }
 
     // Build folder summary for system prompt preamble
@@ -613,7 +790,7 @@ You have complete, real-time data for every SKU including 3-month forecasts, mod
   : "You do NOT currently have full historical sales data loaded — the manager has 'Full sales history' turned off (it's large and needs a higher Groq tier). You still have recent-month actuals and the 3-month forecast per SKU. If asked about detailed past sales beyond those, say the full history isn't loaded right now and can be enabled with the 'Full sales history' toggle."} You also have full supplier reliability data including each supplier's order history, average lead time, on-time rate, delivery variance, and any orders currently in transit.
 You also have full visibility into how the manager has organised SKUs into folders.${folderSummary}
 You also know HOW EACH SKU IS FORECAST: this app routes every product to the best method — Prophet (established, regular demand), a pooled GLOBAL model (new or sparse products that borrow seasonal shape and volume from related/similar products), Croston/TSB (intermittent demand), or a last-resort moving-average placeholder (too little data and no relatives). Each SKU lists its chosen engine, why, and — under "Product Classification & Similar Products" — its extracted attributes (category, brand, size, etc.), its group, and which products it is similar to. Do NOT assume Prophet for every SKU; use the named engine. When asked about categorization, similar products, or why a product is or isn't pooling, use the classification data provided.
-You also have each SKU's INVENTORY SCORECARD: a named STATUS describing its current situation (Healthy, Reorder due, Overstocked, Stockout risk, or Dead stock), the signals behind it (stock coverage, sales consistency, sales trend, sales velocity), days of stock remaining, sell-through, a profit grade A/B/C/F based on margin after cost and fees (A 40%+, B 20%+, C slim under 20%, F a loss at 0% or negative), cash tied up, flags, and a recommended action. Status and profitability are SEPARATE axes. Reorder urgency is kept out of "health": a reorder coming due is a routine action ("Reorder due"), NOT a problem — only a missed window or an unrecoverable position is "Stockout risk." A slow-moving SKU with an A/B profit grade is profitable and should be right-sized, NOT liquidated — only low-selling, overstocked, low-margin (C) items are dead-stock/markdown candidates. An F-grade item loses money on every sale regardless of how it sells — flag it for a price increase, cost renegotiation, or discontinuation. A NEW product (flagged "health read is provisional", under ~90 days of history) is NEVER dead stock and should not be marked down or discontinued even when overstocked — it hasn't had time to establish; recommend holding and pausing/trimming reorders until it builds history. When a promotion is active, the status shown is the on-sale view; a normal (no-promo) status is also provided for post-promotion planning.
+You also have each SKU's INVENTORY SCORECARD: a named STATUS describing its current situation (Healthy, Reorder due, Overstocked, Stockout risk, or Dead stock), the signal behind it (sales volatility), days of stock remaining (on hand, plus the position once any inbound PO lands), sell-through, a profit grade A/B/C/F based on margin after cost and fees (A 40%+, B 20%+, C slim under 20%, F a loss at 0% or negative), cash tied up, flags, and a recommended action. Status and profitability are SEPARATE axes. Reorder urgency is kept out of "health": a reorder coming due is a routine action ("Reorder due"), NOT a problem — only a missed window or an unrecoverable position is "Stockout risk." A slow-moving SKU with an A/B profit grade is profitable and should be right-sized, NOT liquidated — only low-selling, overstocked, low-margin (C) items are dead-stock/markdown candidates. An F-grade item loses money on every sale regardless of how it sells — flag it for a price increase, cost renegotiation, or discontinuation. A NEW product (flagged "health read is provisional", under ~90 days of history) is NEVER dead stock and should not be marked down or discontinued even when overstocked — it hasn't had time to establish; recommend holding and pausing/trimming reorders until it builds history. When a promotion is active, the status shown is the on-sale view; a normal (no-promo) status is also provided for post-promotion planning.
 
 KEY MECHANICS you must reason with correctly:
 • PROTECTION LEVEL (safety buffer service level): after a backtest runs, mature costed SKUs use their per-SKU cheapest backtest tier when the live lead time and coverage match the backtest settings. Otherwise, when a SKU has enough regular history and a real unit cost, the recommendation comes from its expected cost curve: lost profit from stockouts versus yearly holding cost for the safety buffer. Remaining SKUs fall back to the margin heuristic (Light 90% / Standard 95% / High 98% / Very high 99% / Maximum 99.5%), and if no unit cost is entered they default to Standard (95%). The manager can override it. Demand volatility (CV/σ) sizes the buffer; it does NOT directly choose the service level.
@@ -649,7 +826,8 @@ ${fleetCtx}
           "Authorization": `Bearer ${apiKey}`,
         },
         body: JSON.stringify({
-          model: GROQ_MODEL,
+          model: GROQ_MODEL_CHAT,
+          ...GROQ_NO_TOOLS,
           messages: chatMessages,
           max_tokens: 700,
           temperature: 0.3,
@@ -659,18 +837,38 @@ ${fleetCtx}
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
         const msg = err?.error?.message || `API error ${res.status}`;
-        if (/too large|tokens per minute|TPM|context length|reduce your message/i.test(msg)) {
+        // Two different failures used to share one message, and it named the wrong fix
+        // for one of them. Running out of the MINUTE'S allowance (429) means the request
+        // was fine and you need to wait; a request too big for the model means it will
+        // never succeed no matter how long you wait. Telling someone to "ask about fewer
+        // SKUs" when they simply need to pause sixty seconds sends them rewriting a
+        // question that was never the problem.
+        const retry = Number(res.headers.get("retry-after")) || null;
+        if (res.status === 429 || /rate limit|tokens per minute|TPM|requests per/i.test(msg)) {
           throw new Error(
-            (includeHistory
-              ? "That request was too large for the current Groq tier — most likely the full sales history. Turn off \"Full sales history\" below to shrink it, or upgrade your Groq plan to keep it on."
-              : "That request was too large for the current Groq tier. Try asking about fewer SKUs at once, or upgrade your Groq plan.")
+            `Used up this minute's allowance on ${GROQ_MODEL_CHAT}. `
+            + (retry ? `Try again in about ${Math.ceil(retry)}s. ` : "Try again in a minute. ")
+            + (includeHistory
+                ? "Turning off \"Full sales history\" below makes each question far cheaper."
+                : "Each question sends your fleet summary, so a few in quick succession add up.")
+          );
+        }
+        if (/too large|context length|reduce your message|maximum context/i.test(msg)) {
+          throw new Error(
+            "That request is too big for one call"
+            + (includeHistory ? ", almost certainly the full sales history. Turn off \"Full sales history\" below." : ". Ask about fewer products at once.")
           );
         }
         throw new Error(msg);
       }
 
       const data = await res.json();
-      const reply = data?.choices?.[0]?.message?.content || "No response received.";
+      // Tools are meant to be off. If one ran anyway, external content reached the same
+      // context as the catalogue, and the reader has to know that before trusting it.
+      const ran = groqToolsRan(data);
+      if (ran) console.warn(`[ai] built-in tools ran despite being disabled: ${ran}`);
+      const reply = (ran ? `[warning: the model ran ${ran} — this answer may include content from outside your data]\n\n` : "")
+        + (data?.choices?.[0]?.message?.content || "No response received.");
       setMessages(prev => [...prev, { role: "assistant", content: reply }]);
     } catch (err) {
       setError(err.message);
@@ -740,9 +938,9 @@ ${fleetCtx}
             <div className="text-[10px] text-slate-500 font-mono">
               {skuForecasts?.length ?? 0} SKU{skuForecasts?.length !== 1 ? "s" : ""}
               {folderCount > 0 ? ` · ${folderCount} folder${folderCount !== 1 ? "s" : ""}` : ""}
-              {/* Derived from GROQ_MODEL rather than typed, so the label can't outlive
+              {/* Derived from GROQ_MODEL_CHAT rather than typed, so the label can't outlive
                   the model it names the next time Groq retires one. */}
-              {` · full context · ${GROQ_MODEL.split("/").pop()}`}
+              {` · full context · ${GROQ_MODEL_CHAT.split("/").pop()}`}
             </div>
           </div>
           <button onClick={() => setOpen(false)}

@@ -229,13 +229,29 @@ Today is ${todayStr()}. Convert any relative dates (e.g. "next week", "July 1") 
 Return ONLY the JSON object.
 
 User input: "${nlText.trim()}"`;
+    // An API failure is not a user mistake. A retired model, a missing key or no network
+    // all used to surface as "couldn't parse that", which sends the user off rewording a
+    // sentence that was never the problem. Errors carrying `shown` say what really broke.
+    const apiFail = (m) => Object.assign(new Error(m), { shown: m });
     try {
-      const res = await fetch(GROQ_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${GROQ_API_KEY}` },
-        body: JSON.stringify({ model: GROQ_MODEL, messages: [{ role: "user", content: prompt }], max_tokens: 200, temperature: 0.1 }),
-      });
-      const data = await res.json();
+      if (!GROQ_API_KEY) {
+        throw apiFail("No API key is set, so plain-English entry is off. Use the form below.");
+      }
+      let res;
+      try {
+        res = await fetch(GROQ_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Authorization": `Bearer ${GROQ_API_KEY}` },
+          body: JSON.stringify({ model: GROQ_MODEL, messages: [{ role: "user", content: prompt }], max_tokens: 200, temperature: 0.1 }),
+        });
+      } catch {
+        throw apiFail("Couldn't reach the language model. Check your connection, or use the form below.");
+      }
+      const data = await res.json().catch(() => null);
+      if (!res.ok) {
+        const why = data?.error?.message || `${res.status} ${res.statusText}`;
+        throw apiFail(`The language model rejected the request: ${why}. This is not a problem with your wording. The form below still works.`);
+      }
       const raw = data?.choices?.[0]?.message?.content?.trim() || "";
       const match = raw.match(/\{[\s\S]*\}/);
       if (!match) throw new Error("Could not parse response");
@@ -243,7 +259,7 @@ User input: "${nlText.trim()}"`;
       if (!parsed.type || !parsed.date) throw new Error("Missing required fields");
       setNlParsed(parsed);
     } catch (e) {
-      setNlError("Couldn't parse that. Try being more specific, e.g. 'Price drops to $12.99 on Jan 15'.");
+      setNlError(e?.shown || "Couldn't parse that. Try being more specific, e.g. 'Price drops to $12.99 on Jan 15'.");
     } finally {
       setNlLoading(false);
     }

@@ -40,3 +40,40 @@ export const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
 //
 // Check https://console.groq.com/docs/deprecations before changing this again.
 export const GROQ_MODEL = "openai/gpt-oss-120b";
+
+// ── The fleet chat needs a different model, for THROUGHPUT rather than quality ──
+//
+// Picking gpt-oss-120b above, I checked context length and production status and not
+// rate limits. On Groq's free tier it allows 8,000 tokens per MINUTE and 200,000 per
+// DAY. The Ask AI drawer sends the whole catalogue as a system prompt on every message,
+// which for 32 products is roughly 7,000-11,000 tokens, so a single question could
+// exhaust the minute's allowance and the day capped out at about twenty questions.
+//
+// groq/compound-mini allows 70,000 tokens per minute with no daily token cap, carries
+// the same 131k context, and is powered by Llama 3.3 70B and GPT-OSS 120B, so answer
+// quality should not regress. Its cost is that it is an agentic SYSTEM: left alone it
+// decides for itself when to run a web search, visit a site, execute code, or call
+// Wolfram Alpha. For a tool reasoning over a client's private sales data an unprompted
+// web search is both noise and an injection surface, since fetched page content would
+// land in the same context as the catalogue.
+//
+// So tools are switched off explicitly. Groq documents `enabled_tools` as a way to
+// narrow the set; it does NOT document what an empty array does, so the drawer also
+// checks `message.executed_tools` on every reply and says so loudly if anything ran.
+// Treat a warning there as "this is not safe for client data yet", not a cosmetic bug.
+//
+// The small structured calls (the natural-language event parser) stay on GROQ_MODEL:
+// they are a few hundred tokens, have no throughput problem, and strict JSON extraction
+// is not something to hand to an agent that might decide to search the web mid-parse.
+export const GROQ_MODEL_CHAT = "groq/compound-mini";
+
+// Spread into the request body for GROQ_MODEL_CHAT. Harmless for a plain model, which
+// ignores unknown fields, so it does not need removing if the model changes back.
+export const GROQ_NO_TOOLS = { compound_custom: { tools: { enabled_tools: [] } } };
+
+/** Names any built-in tool a compound reply actually ran, or null. See GROQ_MODEL_CHAT. */
+export function groqToolsRan(data) {
+  const t = data?.choices?.[0]?.message?.executed_tools;
+  if (!Array.isArray(t) || t.length === 0) return null;
+  return t.map(x => x?.type || x?.name || "unknown").join(", ");
+}
