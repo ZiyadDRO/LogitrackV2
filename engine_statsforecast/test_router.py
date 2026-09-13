@@ -7,6 +7,11 @@ engines.py and main.py's orchestration is real; only the heavy libraries are fak
 Run locally (with the real libs installed) to exercise the true numerics:
     python test_router.py
 """
+import os
+# Tests must never touch a real data store. Both stores honour this flag and it makes the
+# run fully in-memory, so a suite run inside engine_statsforecast/ can no longer overwrite
+# a live catalog — and every "fresh start" assertion below means what it says.
+os.environ["LOGITRACK_PERSIST"] = "0"
 import sys, types, datetime
 import numpy as np
 import pandas as pd
@@ -207,7 +212,10 @@ check("usesGlobal flag false for established intermittent (uses Croston)", srow[
 print("\n7) Scorecard recommendation (velocity-aware)")
 a_6pct = M.sc_recommendation("long", "A", 0.06, 400, 14, False, False, True, 380)  # the reported bug
 a_mod  = M.sc_recommendation("long", "A", 0.30, 400, 14, False, False, True, 380)
-a_fast = M.sc_recommendation("healthy", "A", 0.70, 30, 14, False, False, True, 16)
+# dur must sit OUTSIDE the reorder window or the reorder message correctly wins first.
+# sc_bands(14) = (risk 7d, due 21d) since the bands became a fraction of each product's
+# own lead time; this probe used 16, which is inside it. 30 tests the intended branch.
+a_fast = M.sc_recommendation("healthy", "A", 0.70, 30, 14, False, False, True, 30)
 check("6% velocity + profitable → barely-selling (NOT 'profitable')", "barely selling" in a_6pct[0].lower(), a_6pct[0])
 check("moderate velocity + profitable + overstocked → 'profitable' message", "profitable" in a_mod[0].lower(), a_mod[0])
 check("very high velocity + profitable → under-stocking warning", "under-stock" in a_fast[0].lower(), a_fast[0])
@@ -494,7 +502,9 @@ check("ranking None with a single SKU",
 
 # — end to end through _tier_summary —
 _full = _mk_tier_frame({90: 6.0, 95: 3.0, 98: 1.0, 99: 0.5})
-for pct in BT.Z:
+# Only for the tiers the frame actually carries. Adding cov_ for a tier with no
+# lost_/safety_ behind it is not a state the production pipeline can produce.
+for pct in [p for p in BT.Z if f"lost_{p}" in _full.columns]:
     _full[f"cov_{pct}"] = 1.0 if pct >= 98 else 0.0
 _full["price"] = 150.0
 _ts2 = BT._tier_summary(_full, coverage=30, holding_annual=0.25)
@@ -530,8 +540,8 @@ for i, (vol, marg) in enumerate([(0.2, 300), (2.5, 300), (1.0, 80)]):
 _mixts = BT._tier_summary(pd.DataFrame(_mixf), coverage=30, holding_annual=0.25)
 _mp = _mixts["mixedPolicy"]
 check("a per-product mix policy is reported", _mp is not None)
-check("the mix beats the best single level", _mp["totalCost"] < min(t["totalCost"] for t in _mixts["tiers"]),
-      f'{_mp["totalCost"]} vs {min(t["totalCost"] for t in _mixts["tiers"])}')
+check("the mix beats the best single level", _mp["inSampleTotal"] < min(t["totalCost"] for t in _mixts["tiers"]),
+      f'{_mp["inSampleTotal"]} vs {min(t["totalCost"] for t in _mixts["tiers"])}')
 check("products genuinely pick different levels", len([k for k, v in _mp["tierCounts"].items() if v]) > 1,
       str(_mp["tierCounts"]))
 check("the headline figure is out-of-sample, not hindsight",
@@ -1055,8 +1065,8 @@ for i in range(6):
         _r = {"sku": f"IV{i}", "price": 500.0, "unitCost": 200.0, "costKnown": True,
               "marginUnit": 300.0, "lead": 14, "coverage": 30}
         for _pct, _z in BT.Z.items():
-            _r[f"cov_{_pct}"] = float(w < {90: 6, 95: 7, 98: 8, 99: 8}[_pct])
-            _r[f"lost_{_pct}"] = {90: 5.0, 95: 3.0, 98: 1.0, 99: 0.5}[_pct]
+            _r[f"cov_{_pct}"] = float(w < {90: 6, 95: 7, 98: 8, 99: 8, 99.5: 8}[_pct])
+            _r[f"lost_{_pct}"] = {90: 5.0, 95: 3.0, 98: 1.0, 99: 0.5, 99.5: 0.25}[_pct]
             _r[f"safety_{_pct}"] = _z * 12
         _inv.append(_r)
 _invf = pd.DataFrame(_inv)

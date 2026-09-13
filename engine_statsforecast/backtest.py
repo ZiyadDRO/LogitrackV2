@@ -130,22 +130,31 @@ def _pool_state_as_of(df: pd.DataFrame, cutoff: pd.Timestamp):
             catalog[s] = entry
     base_cols = R.detect_group_columns(catalog)
     groups, _meta = R.adaptive_group_catalog(catalog, base_cols)
-    clusters = R.cluster_catalog(groups, catalog)
-    return catalog, groups, clusters
+    # Same baseline discipline as production: similarity is measured with the
+    # catalog-wide rhythm removed, so a replay pools exactly what live routing would.
+    baseline = R.catalog_baseline(catalog)
+    clusters = R.cluster_catalog(groups, catalog, baseline=baseline)
+    return catalog, groups, clusters, baseline
 
 
 def _relatives_as_of(df: pd.DataFrame, sku: str, cutoff: pd.Timestamp, pool_cache: dict | None = None):
     key = pd.Timestamp(cutoff).normalize()
     if pool_cache is not None and key in pool_cache:
-        catalog, groups, clusters = pool_cache[key]
+        catalog, groups, clusters, baseline = pool_cache[key]
     else:
-        catalog, groups, clusters = _pool_state_as_of(df, cutoff)
+        catalog, groups, clusters, baseline = _pool_state_as_of(df, cutoff)
         if pool_cache is not None:
-            pool_cache[key] = (catalog, groups, clusters)
+            pool_cache[key] = (catalog, groups, clusters, baseline)
     if sku not in catalog:
-        return [], 0
-    rels, n_rel, _info = R.behavioral_relatives(sku, groups, catalog, clusters)
-    return rels, n_rel
+        return [], 0, None
+    rels, n_rel, _info = R.behavioral_relatives(sku, groups, catalog, clusters, baseline=baseline)
+    # Cohesion travels with the pool so the backtest routes exactly as production does.
+    # Without it the replay would keep pooling across incoherent clusters that live
+    # routing now declines, and the measured protection levels it produces would be
+    # calibrated against a model the app no longer runs.
+    coh = (R._cohesion_for_ids(_info["chosen"], catalog, baseline)
+           if _info and len(_info.get("chosen") or []) >= 2 else None)
+    return rels, n_rel, coh
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -216,9 +225,10 @@ def _run_cutoff(df, sku, sku_df, cutoff, horizon, combos, service_pct,
     nearly free. This exists because a single global pair meant a product whose lead time
     you'd changed could never be re-tested: the catalog-wide run used the most common
     values, so that product stayed permanently 'stale'. Returns one row per pair."""
-    rels, n_rel = _relatives_as_of(df, sku, cutoff, pool_cache)
+    rels, n_rel, pool_coh = _relatives_as_of(df, sku, cutoff, pool_cache)
     # build_entry strips to ds <= cutoff internally → no lookahead.
     entry = build_entry(sku, sku, sku_df, "uploaded", "backtest", cutoff, [], rels, n_rel,
+                        pool_cohesion=pool_coh,
                         calib_windows=BT_CALIB_WINDOWS, force_route=force_route)
     fc = entry["forecast"]
     end = cutoff + pd.Timedelta(days=horizon)
@@ -670,12 +680,23 @@ def _bootstrap_tier_ranking(costed, tiers, cycles_per_year, holding_annual, n_bo
     keys = list(per_sku)
     if len(keys) < 2:
         return None
+    # Only rank tiers every SKU actually has a measurement for. The resample below used
+    # `.get(pct, 0.0)`, so a tier with no data contributed a cost of ZERO — which made it
+    # the cheapest in every single resample and came back as "99.5%, 100% confidence,
+    # decisive". That is not a hypothetical: `Z` gained the 99.5 tier, and a backtest
+    # stored before that change restores against the catalog fingerprint alone (nothing
+    # checks the tier set), so the new tier arrives with no columns behind it. The
+    # recommendation it produced was the MOST expensive protection level, argued for on a
+    # fabricated cost of nothing. A tier we did not measure is unknown, not free.
+    pcts = [p for p in pcts if all(p in row for row in per_sku.values())]
+    if len(pcts) < 2:
+        return None
     rng = np.random.default_rng(seed)
     wins = {p: 0 for p in pcts}
     margins_over_runner_up = []
     for _ in range(n_boot):
         pick = rng.choice(len(keys), len(keys), replace=True)
-        tot = {p: sum(per_sku[keys[i]].get(p, 0.0) for i in pick) for p in pcts}
+        tot = {p: sum(per_sku[keys[i]][p] for i in pick) for p in pcts}
         order = sorted(tot, key=lambda p: tot[p])
         wins[order[0]] += 1
         if len(order) > 1 and tot[order[1]] > 0:
@@ -861,7 +882,10 @@ def _tier_summary(frame, coverage=30, holding_annual=0.25):
     out = []
     for pct in sorted(Z.keys()):
         cov_c, lost_c, saf_c = f"cov_{pct}", f"lost_{pct}", f"safety_{pct}"
-        if cov_c not in frame.columns:
+        # All three, not just cov_. The other four call sites in this file already check
+        # lost_/safety_ together; this one checked cov_ and then indexed the other two,
+        # which is what crashed the test suite outright once Z gained a tier.
+        if cov_c not in frame.columns or lost_c not in frame.columns or saf_c not in frame.columns:
             continue
         # Calibration, averaged PER SKU FIRST then across SKUs. Pooling raw windows let a
         # long-history SKU (8 cutoffs) outvote a short one (1 cutoff) eight to one — and

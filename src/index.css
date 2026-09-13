@@ -10,3 +10,20 @@ html, body {
   background-color: #070b10;
   overscroll-behavior: none;
 }
+/* BORDER WEIGHT — one step heavier, everywhere, in one place.
+ *
+ * Tailwind's `border` is 1px, and it is written 615 times across the JSX. Rewriting
+ * those by hand would be 615 chances to mangle a class string like
+ * `border-[var(--t-line)]`, which is a different thing that happens to start with the
+ * same six letters. These rules sit AFTER `@tailwind utilities`, match the same
+ * specificity, and win on source order — so all 615 thicken without a component being
+ * touched. Verified in the built CSS: only one `.border{}` survives and it is this one.
+ *
+ * The inline `1px solid` / `1.5px solid` styles were moved to 2px in the source
+ * instead, since those are unambiguous literals with no such hazard. */
+.border   { border-width: 2px }
+.border-t { border-top-width: 2px }
+.border-b { border-bottom-width: 2px }
+.border-l { border-left-width: 2px }
+.border-r { border-right-width: 2px }
+.divide-y > :not([hidden]) ~ :not([hidden]) { border-top-width: 2px }

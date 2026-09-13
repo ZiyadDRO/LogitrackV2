@@ -518,6 +518,27 @@ class IntermittentEngine:
         self.residual_cv = self.residual_std / max(float(df["y"].mean()), 1.0)
         self._q_lo, self._q_hi = conformal_offsets(best_resid, self.residual_std)
 
+        # ── Band widening for intermittent demand ────────────────────────────────
+        # Measured, not guessed. A backtest over 147 Croston forecasts on the real
+        # catalogue put interval coverage at 65.4% against an 80% band — the spiky
+        # upside of intermittent demand is exactly what conformal offsets taken from
+        # in-sample residuals under-estimate. Under a normal, 65.4% is +/-0.945 sigma
+        # and 80% is +/-1.282, so 1.282/0.945 = 1.36 closes it; heavy tails mean that
+        # is a floor rather than an over-correction.
+        #
+        # This scales the BAND ONLY. `residual_std` above is untouched, and that is
+        # deliberate: residual_std is what feeds lead_window_sigma and therefore the
+        # safety buffer, and the same backtest shows Croston products already ordering
+        # 43.8% too big while achieving 93.2% service. Widening their buffer would add
+        # cash to products that are over-stocked already. The band was lying about how
+        # uncertain the forecast is; the order quantity was not the thing at fault.
+        #
+        # Re-derive this from interval_cov% per engine after a backtest rather than
+        # carrying it forward on faith.
+        INTERMITTENT_BAND_WIDEN = 1.36
+        self._q_lo *= INTERMITTENT_BAND_WIDEN
+        self._q_hi *= INTERMITTENT_BAND_WIDEN
+
         sf2 = StatsForecast(models=[cands[best]], freq="D", n_jobs=1); sf2.fit(df=base)
         raw = sf2.predict(h=self.horizon)
         raw = raw.reset_index() if "ds" not in raw.columns else raw

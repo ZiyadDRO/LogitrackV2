@@ -22,10 +22,10 @@ export default function HoldingWizard({ lm = false, onApply, onClose }) {
   const [knownRate, setKnownRate] = useState("");
   const [override, setOverride] = useState({});
 
-  const card = lm ? "bg-white border-slate-200" : "bg-[#0d1117] border-slate-800";
-  const text_ = lm ? "text-slate-900" : "text-white";
-  const muted = "text-slate-500";
-  const inp = lm ? "bg-white border-slate-300 text-slate-900" : "bg-slate-900 border-slate-700 text-slate-200";
+  const card = "bg-[var(--t-panel)] border-[var(--t-line)]";
+  const text_ = "text-[var(--t-ink)]";
+  const muted = "text-[var(--t-dim)]";
+  const inp = "bg-[var(--t-panel)] border-[var(--t-line2)] text-[var(--t-ink)]";
 
   const presets = useMemo(() => defaultsForIndustry(industry || "general", ownsSpace),
                           [industry, ownsSpace]);
@@ -46,9 +46,9 @@ export default function HoldingWizard({ lm = false, onApply, onClose }) {
 
   const Row = ({ label, value, onChange, options }) => (
     <label className="block">
-      <span className={`block text-[10px] uppercase tracking-widest font-bold ${muted} mb-1`}>{label}</span>
+      <span className={`block text-[13px] uppercase tracking-widest font-bold ${muted} mb-1`}>{label}</span>
       <select value={value} onChange={(e) => onChange(e.target.value)}
-        className={`w-full rounded-lg border px-2 py-1.5 text-xs ${inp}`}>
+        className={`w-full rounded-lg border px-2 py-1.5 text-[15px] ${inp}`}>
         {Object.entries(options).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
       </select>
     </label>
@@ -57,32 +57,32 @@ export default function HoldingWizard({ lm = false, onApply, onClose }) {
   return (
     <div className={`${card} border rounded-2xl p-4 space-y-4`}>
       <div>
-        <h3 className={`text-sm font-bold ${text_}`}>Work out your holding cost</h3>
-        <p className={`text-[11px] ${muted} mt-1 leading-relaxed`}>
+        <h3 className={`text-[16.5px] font-bold ${text_}`}>Work out your holding cost</h3>
+        <p className={`text-[14px] ${muted} mt-1 leading-relaxed`}>
           Five questions. The rate is calculated from your answers — the same answers always give
           the same number, and you can see every part of it below.
         </p>
       </div>
 
       <div>
-        <span className={`block text-[10px] uppercase tracking-widest font-bold ${muted} mb-1`}>1 · What do you sell?</span>
+        <span className={`block text-[13px] uppercase tracking-widest font-bold ${muted} mb-1`}>1 · What do you sell?</span>
         <div className="flex gap-2">
           <input value={text} onChange={(e) => setText(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && identify()}
             placeholder="e.g. bathroom vanities and mirrors, sold online"
-            className={`flex-1 rounded-lg border px-2 py-1.5 text-xs ${inp}`} />
+            className={`flex-1 rounded-lg border px-2 py-1.5 text-[15px] ${inp}`} />
           <button onClick={identify} disabled={thinking || !text.trim()}
-            className="px-3 py-1.5 rounded-lg text-xs font-bold bg-violet-600 hover:bg-violet-500 disabled:opacity-50 text-white">
+            className="px-3 py-1.5 rounded-lg text-[15px] font-bold bg-[var(--t-accent-soft)] hover:bg-[var(--t-accent-soft)] disabled:opacity-50 text-[var(--t-ink)]">
             {thinking ? "…" : "Identify"}
           </button>
         </div>
         <select value={industry} onChange={(e) => { setIndustry(e.target.value); setHow("manual"); }}
-          className={`mt-2 w-full rounded-lg border px-2 py-1.5 text-xs ${inp}`}>
+          className={`mt-2 w-full rounded-lg border px-2 py-1.5 text-[15px] ${inp}`}>
           <option value="">— or pick your industry —</option>
           {Object.entries(INDUSTRY).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
         </select>
         {industry && (
-          <p className={`text-[11px] mt-1 ${muted}`}>
+          <p className={`text-[14px] mt-1 ${muted}`}>
             Using <span className="font-semibold">{INDUSTRY[industry].label}</span>
             {how === "keyword" ? " (matched from your description)"
               : how === "ai" ? " (identified by AI)"
@@ -96,7 +96,7 @@ export default function HoldingWizard({ lm = false, onApply, onClose }) {
         <div>
           <Row label="2 · How is stock paid for?" value={capital} onChange={setCapital} options={CAPITAL} />
           <input value={knownRate} onChange={(e) => setKnownRate(e.target.value)} placeholder="know your rate? e.g. 9"
-            className={`mt-1.5 w-full rounded-lg border px-2 py-1 text-[11px] ${inp}`} />
+            className={`mt-1.5 w-full rounded-lg border px-2 py-1 text-[14px] ${inp}`} />
         </div>
         <Row label="3 · Where does it sit?" value={dropship ? "dropship" : answers.storageBulk}
           onChange={(v) => { setDropship(v === "dropship"); if (v !== "dropship") setOverride((o) => ({ ...o, storageBulk: v })); }}
@@ -107,18 +107,18 @@ export default function HoldingWizard({ lm = false, onApply, onClose }) {
           onChange={(v) => setOverride((o) => ({ ...o, risk: v }))} options={RISK} />
       </div>
 
-      <div className={`rounded-xl border p-3 ${lm ? "bg-emerald-50 border-emerald-200" : "bg-emerald-950/20 border-emerald-900/40"}`}>
+      <div className={`rounded-xl border p-3 ${"bg-[var(--t-good-soft)] border-[var(--t-good-line)]"}`}>
         <div className="flex items-baseline gap-2">
-          <span className={`text-2xl font-bold tabular-nums ${lm ? "text-emerald-800" : "text-emerald-300"}`}>{holding}%</span>
-          <span className={`text-[11px] ${lm ? "text-emerald-700" : "text-emerald-300/80"}`}>per year, of what each unit cost you</span>
+          <span className={`text-2xl font-bold tabular-nums ${"text-[var(--t-good)]"}`}>{holding}%</span>
+          <span className={`text-[14px] ${"text-[var(--t-good)]"}`}>per year, of what each unit cost you</span>
         </div>
         <table className="w-full mt-2">
           <tbody>
             {breakdown.map((b) => (
               <tr key={b.part}>
-                <td className={`py-0.5 text-[11px] ${lm ? "text-emerald-800" : "text-emerald-300/90"}`}>{b.part}</td>
-                <td className={`py-0.5 text-[11px] ${muted}`}>{b.why}</td>
-                <td className={`py-0.5 text-[11px] font-bold tabular-nums text-right ${lm ? "text-emerald-800" : "text-emerald-300"}`}>{b.pct}%</td>
+                <td className={`py-0.5 text-[14px] ${"text-[var(--t-good)]"}`}>{b.part}</td>
+                <td className={`py-0.5 text-[14px] ${muted}`}>{b.why}</td>
+                <td className={`py-0.5 text-[14px] font-bold tabular-nums text-right ${"text-[var(--t-good)]"}`}>{b.pct}%</td>
               </tr>
             ))}
           </tbody>
@@ -127,10 +127,10 @@ export default function HoldingWizard({ lm = false, onApply, onClose }) {
 
       <div className="flex items-center gap-2">
         <button onClick={() => onApply?.(holding)}
-          className="px-4 py-2 rounded-lg text-xs font-bold bg-violet-600 hover:bg-violet-500 text-white">
+          className="px-4 py-2 rounded-lg text-[15px] font-bold bg-[var(--t-accent-soft)] hover:bg-[var(--t-accent-soft)] text-[var(--t-ink)]">
           Use {holding}%
         </button>
-        {onClose && <button onClick={onClose} className={`text-[11px] ${muted} hover:underline`}>Cancel</button>}
+        {onClose && <button onClick={onClose} className={`text-[14px] ${muted} hover:underline`}>Cancel</button>}
       </div>
     </div>
   );

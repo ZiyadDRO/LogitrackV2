@@ -220,7 +220,11 @@ def _effective_sku_costs(payload_costs: dict | None) -> dict | None:
     though the costs were sitting right there in the Scorecard."""
     merged = {str(sid): {"cost": float(c), "fees": 0.0} for sid, c in _sheet_costs.items()}
     for sid, v in (payload_costs or {}).items():
-        merged[str(sid)] = v
+        # Merge rather than replace: the sheet knows a cost and never knows a fee, so a
+        # payload carrying only a fee used to drop the cost, and one carrying only a
+        # cost used to drop the fee back to zero. Both halves survive now.
+        base = merged.get(str(sid), {})
+        merged[str(sid)] = {**base, **{k: x for k, x in (v or {}).items() if x is not None}}
     return merged or None
 
 
@@ -520,6 +524,7 @@ def _cohort_promo_lift(related):
 
 
 def build_entry(sku_id, sku_name, df_clean, mode, filename, today, events, related, n_relatives,
+                pool_cohesion=None,
                 calibrate=True, calib_windows=None, force_route=None, availability=None):
     events = events or []
     df = df_clean[df_clean["ds"] <= today].copy()
@@ -546,7 +551,8 @@ def build_entry(sku_id, sku_name, df_clean, mode, filename, today, events, relat
     if force_route:
         method, reason = force_route, f"forced to {force_route} (backtest comparison)"
     else:
-        method, reason = R.route(days, sales, demand_class, n_relatives, selling_days=selling_days)
+        method, reason = R.route(days, sales, demand_class, n_relatives, selling_days=selling_days,
+                                 pool_cohesion=pool_cohesion)
     # Price is only actually modeled on the Prophet route; global/croston/MA ignore it.
     price_modeled = (method == "prophet") and has_price
     effective_price = _effective_price(last_price, events, today)
@@ -803,7 +809,11 @@ def _rebuild(today, only: str | None = None, record_switches: bool = False):
     pool_catalog = {sid: c for sid, c in _catalog.items() if not _exclude_from_pooling(c, today)}
     base_cols = R.detect_group_columns(pool_catalog)
     groups, group_meta = R.adaptive_group_catalog(pool_catalog, base_cols)
-    clusters = R.cluster_catalog(groups, pool_catalog)   # behavioural sub-clusters per category
+    # The catalog-wide average fingerprint, computed once. Everything below measures
+    # similarity with this subtracted, so "alike" means alike beyond the rhythm the whole
+    # business shares rather than because of it.
+    _baseline = R.catalog_baseline(pool_catalog)
+    clusters = R.cluster_catalog(groups, pool_catalog, baseline=_baseline)   # behavioural sub-clusters per category
     targets = [only] if only else list(_catalog.keys())
     for sku_id in targets:
         c = _catalog[sku_id]
@@ -811,7 +821,13 @@ def _rebuild(today, only: str | None = None, record_switches: bool = False):
             # Pool only from the behavioural cluster this SKU best fits (not every
             # category-mate). n_rel is the chosen cluster's size, so routing to the
             # global model still requires ≥ MIN_RELATIVES genuinely-similar peers.
-            rels, n_rel, cluster_info = R.behavioral_relatives(sku_id, groups, pool_catalog, clusters)
+            rels, n_rel, cluster_info = R.behavioral_relatives(sku_id, groups, pool_catalog, clusters,
+                                                               baseline=_baseline)
+            # How much the chosen pool actually agrees on a shape. This used to be
+            # computed only for the Grouping tab's display while routing ignored it,
+            # so a pool the UI drew in red still supplied a newcomer's whole forecast.
+            pool_coh = (R._cohesion_for_ids(cluster_info["chosen"], pool_catalog, _baseline)
+                        if cluster_info and len(cluster_info.get("chosen") or []) >= 2 else None)
             # Hours-in-stock, where we have it. Absent → every day counts as fully
             # available, so an untracked catalogue behaves exactly as before.
             _avail = None
@@ -824,7 +840,8 @@ def _rebuild(today, only: str | None = None, record_switches: bool = False):
             except Exception:
                 _avail = None
             entry = build_entry(sku_id, c["sku_name"], c["df"], c["mode"], c["filename"],
-                                today, c.get("events", []), rels, n_rel, availability=_avail)
+                                today, c.get("events", []), rels, n_rel,
+                                pool_cohesion=pool_coh, availability=_avail)
             entry["cluster_info"] = cluster_info
             entry["group_info"] = group_meta.get(sku_id)
             _sku_cache[sku_id] = entry
@@ -901,12 +918,37 @@ def warmup():
 # ─── SKU list / delete / events ──────────────────────────────────────────────
 @app.get("/api/skus")
 def list_skus():
+    """The product list, WITH the stock and cost the uploaded sheet carried.
+
+    These two fields used to be sent only in the /api/upload response, so the browser
+    learned a product's real stock exactly once — at upload — and kept it in local
+    storage. Every restart restores the catalog from disk and calls this endpoint
+    instead, which said nothing about stock, so the client fell back to its 500-unit
+    default for the whole catalogue. On a 1.2/day product that reads as 417 days of
+    cover, and the Fleet reported every product overstocked or dead with nothing to
+    order. The engine knew the real figure the whole time — it just had no way to say it.
+
+    Clearing site data, or opening the tool in another browser, produced the same
+    silent wipe. The client seeds only where it has no value of its own, so a number
+    the user typed is never overwritten by the sheet.
+    """
     out = []
     for sku_id, e in _sku_cache.items():
         df = e["df_train"]
+        # Latest non-null units_in_stock on or before today, mirroring _ingest's own rule.
+        last_stock = None
+        try:
+            if df is not None and "units_in_stock" in df.columns:
+                ss = pd.to_numeric(df["units_in_stock"], errors="coerce").dropna()
+                if len(ss):
+                    last_stock = int(ss.iloc[-1])
+        except Exception:
+            last_stock = None
         out.append({"id": sku_id, "name": e["sku_name"] or sku_id, "mode": e["mode"], "filename": e["filename"],
                     "daysOfHistory": int((df["ds"].max() - df["ds"].min()).days) if df is not None else 0,
-                    "totalUnitsSold": int(df["y"].sum()) if df is not None else 0})
+                    "totalUnitsSold": int(df["y"].sum()) if df is not None else 0,
+                    "lastKnownStock": last_stock,
+                    "lastKnownCost": _sheet_costs.get(str(sku_id))})
     return out
 
 
@@ -1390,10 +1432,15 @@ def _ingest(df_raw, filename: str, stock_override: dict | None = None,
         for sid in groups_iter:
             if last_stock.get(sid) is None and stock_override.get(sid) is not None:
                 last_stock[sid] = int(stock_override[sid])
+    # Which source a cost came from travels with it. A number pulled from Shopify and
+    # one read out of a spreadsheet column deserve different trust, and the product
+    # page now shows which it was — it cannot work that out from the value alone.
+    cost_src: dict[str, str] = {sid: "sheet" for sid in last_cost}
     if cost_override:                        # live unit costs (Shopify) → prefill unit cost
         for sid in groups_iter:
             if last_cost.get(sid) is None and cost_override.get(sid) is not None:
                 last_cost[sid] = round(float(cost_override[sid]), 2)
+                cost_src[sid] = "shopify"
 
     if not any(s in _catalog for s in groups_iter):
         raise HTTPException(400, "No valid SKUs could be loaded. " + " ".join(errors))
@@ -1441,6 +1488,7 @@ def _ingest(df_raw, filename: str, stock_override: dict | None = None,
                       })})(e.get("censoring")), "hasPrice": e["has_price"],
                        "priceVaried": e["price_varied"], "route": e["route"], "winningModel": e["winning_model"],
                        "lastKnownStock": last_stock.get(sid), "lastKnownCost": last_cost.get(sid),
+                       "costSource": cost_src.get(sid),
                        "dateRange": {"start": dt["ds"].min().strftime("%B %d, %Y"), "end": dt["ds"].max().strftime("%B %d, %Y")}})
     # Start the measured recommendation straight away. Nobody should have to know the
     # Backtest tab exists to get a protection level grounded in their own history — the
@@ -1580,13 +1628,13 @@ def _compute_groups():
     cols = R.detect_group_columns(pool_catalog)
     base_groups = R.group_catalog(pool_catalog, cols)
     groups, group_meta = R.adaptive_group_catalog(pool_catalog, cols)
-    clusters = R.cluster_catalog(groups, pool_catalog)
-    # Map each established member → the id-set of its behavioural cluster, and score how
-    # tightly each cluster's seasonal patterns line up (avg pairwise correlation).
     # Catalog-wide baseline shape = the average seasonal fingerprint across all products.
-    # Subtracting it lets cohesion measure DISTINCTIVE co-movement (beyond generic seasonality).
-    _all_sigs = [s for s in (R._seasonal_signature(pool_catalog[sid].get("df")) for sid in pool_catalog) if s is not None]
-    _baseline = np.mean(_all_sigs, axis=0) if _all_sigs else None
+    # Subtracting it is what lets similarity mean DISTINCTIVE co-movement rather than
+    # "both follow the store's rhythm". It is built BEFORE clustering now, because the
+    # clustering itself is measured on it — it used to be computed afterwards, purely to
+    # decorate the display.
+    _baseline = R.catalog_baseline(pool_catalog)
+    clusters = R.cluster_catalog(groups, pool_catalog, baseline=_baseline)
     member_key = {}; cohesion_by_key = {}
     for g, cls in clusters.items():
         for cl in cls:
@@ -1617,11 +1665,11 @@ def _compute_groups():
                 if other == sid or other not in pool_catalog:
                     continue
                 osig = R._seasonal_signature(pool_catalog[other].get("df"))
-                score = R._shape_corr(sig, osig)
+                score = R.distinct_corr(sig, osig, _baseline)
                 if best is None or score > best["score"]:
                     best = {
                         "score": round(float(score), 3),
-                        "threshold": R.SHAPE_THRESHOLD,
+                        "threshold": R.DISTINCT_THRESHOLD,
                         "skuId": other,
                         "skuName": pool_catalog[other].get("sku_name") or other,
                         "cluster": list(key),
@@ -1646,11 +1694,11 @@ def _compute_groups():
             osig = R._seasonal_signature(pool_catalog[other].get("df"))
             if osig is None:
                 continue
-            score = R._shape_corr(sig, osig)
+            score = R.distinct_corr(sig, osig, _baseline)
             if best is None or score > best["score"]:
                 best = {
                     "score": round(float(score), 3),
-                    "threshold": R.SHAPE_THRESHOLD,
+                    "threshold": R.DISTINCT_THRESHOLD,
                     "skuId": other,
                     "skuName": pool_catalog[other].get("sku_name") or other,
                 }
@@ -2218,13 +2266,39 @@ def get_forecast(sku_id: str = Query(...), stock: int = Query(default=500, ge=0)
         f"provisional: it's built on only a few weeks of sales, so reorder timing is a heads-up rather "
         f"than a hard deadline, and the recommended order is kept conservative until more history builds."
     ) if young else None
-    if young:
-        YOUNG_BAND = 1.4   # widen the forward interval to reflect thin-history uncertainty
-        _fut = forecast["ds"] > last_actual
-        _mid = forecast.loc[_fut, "yhat"]
-        forecast.loc[_fut, "yhat_lower"] = (_mid - (_mid - forecast.loc[_fut, "yhat_lower"]) * YOUNG_BAND).clip(lower=0)
-        forecast.loc[_fut, "yhat_upper"] = _mid + (forecast.loc[_fut, "yhat_upper"] - _mid) * YOUNG_BAND
-        future_fc = forecast[forecast["ds"] > last_actual].copy().reset_index(drop=True)
+    # A young product's band used to be stretched 1.4x here. Removed deliberately: every
+    # band on every product is now the model's own FORECAST_BAND_PCT interval, unadjusted,
+    # so "80%" means the same thing everywhere. The 1.4 was a round number nobody had
+    # measured — the reasoning behind it was sound (a model fitted on three weeks is
+    # over-confident) but the size of the correction was a guess, and a guessed correction
+    # dressed as an 80% band is worse than an honest un-corrected one. If the Backtest
+    # tab's interval coverage shows young products landing outside their band far more
+    # than 20% of the time, put a widening back and set it FROM that measurement.
+    # This never touched order quantities: safety stock comes from measured lead-window
+    # error and the protection tier, not from these bounds. `young` still drives the
+    # provisional labelling and the order guardrail.
+
+    # ── Anchor the order math to TODAY, not to the last row of data ───────────────
+    # `future_fc` begins the day after the newest sale on file, which is only today if
+    # the data is fresh. Nothing re-imports on a schedule, so a catalog can easily be a
+    # week old — and every calculation below was indexing this frame as though position
+    # 0 were today. Two things went wrong at once. The stockout cumulative charged days
+    # that have ALREADY HAPPENED against the stock count the user entered TODAY, so it
+    # burned the shelf down twice and pulled the reorder date forward. And `d_ro` is
+    # measured from today (`(rod - today()).days`) yet was used as an index into this
+    # frame, so the coverage window was sampled by however many days the data was stale
+    # — the wrong slice of the season, drifting further off the longer between imports.
+    #
+    # `fc_fwd` starts at today, so an index into it IS a day offset from today, which is
+    # what every caller below already assumed. The full `future_fc` stays as it is for
+    # the chart series: the forecast line should still meet the end of the history
+    # rather than opening a gap the user has to interpret.
+    fc_fwd = future_fc[future_fc["ds"] >= today()].copy().reset_index(drop=True)
+    if fc_fwd.empty:
+        # Data older than the whole forecast horizon. Nothing forward-looking survives,
+        # so fall back to the raw frame rather than dividing by an empty window; the
+        # dormancy guard above has usually already flagged a product this stale.
+        fc_fwd = future_fc
 
     # Stock on the way counts FROM THE DAY IT LANDS, not from today. Adding it to today's
     # shelf treated a shipment 90 days out as if it were already in the warehouse, which
@@ -2232,17 +2306,17 @@ def get_forecast(sku_id: str = Query(...), stock: int = Query(default=500, ge=0)
     # genuinely needed. `on_order_eta_days` is how many days until it arrives; with no
     # date the old behaviour is kept (available immediately) so nothing silently changes
     # for callers that don't supply one.
-    future_fc["cum_mid"] = future_fc["yhat"].clip(lower=0).cumsum()
+    fc_fwd["cum_mid"] = fc_fwd["yhat"].clip(lower=0).cumsum()
     _eta = None if on_order_eta_days is None else max(0, int(on_order_eta_days))
     if units_on_order and _eta:
         # Available stock on each future day = today's stock + the PO once it has landed.
-        _days_out = (future_fc["ds"] - today()).dt.days
+        _days_out = (fc_fwd["ds"] - today()).dt.days
         _arrived = (_days_out >= _eta).astype(float) * float(units_on_order)
-        so = future_fc[future_fc["cum_mid"] >= (float(stock) + _arrived)]
+        so = fc_fwd[fc_fwd["cum_mid"] >= (float(stock) + _arrived)]
         eff_stock = stock + units_on_order      # for display/back-compat only
     else:
         eff_stock = stock + units_on_order
-        so = future_fc[future_fc["cum_mid"] >= eff_stock]
+        so = fc_fwd[fc_fwd["cum_mid"] >= eff_stock]
     # Internally -1 means "no stockout in the forecast horizon" (kept as an int so the
     # downstream order math stays simple). On the way OUT (see the return dict) it's
     # converted to None *only* when there's genuinely no reorder — so a real reorder
@@ -2313,8 +2387,28 @@ def get_forecast(sku_id: str = Query(...), stock: int = Query(default=500, ge=0)
         _status = "stale"
     else:
         _status = rec_source
+    # What this tier ACTUALLY delivered when replayed against real history, as opposed
+    # to what its name promises. The two differ — and systematically, not randomly: the
+    # buffer is sized as z x sigma off a NORMAL table, while real demand errors have
+    # fatter tails, so every tier under-delivers its nominal number. On this catalogue
+    # nominal 95% measured 84.8%, and nominal 99.5% measured 95.3%.
+    # The tier machinery already absorbs this (it picks by measured cost, which is how it
+    # settled on 99.5%), so the arithmetic is not wrong — but "Maximum protection (99.5%)"
+    # reads as a promise of 99.5%, and it is not one. Ship the measured figure alongside
+    # so the UI can stop overstating it.
+    _achieved_pct = None
+    try:
+        for _t in (((_last_backtest or {}).get("tierAnalysis") or {}).get("tiers") or []):
+            if _t.get("tier") is not None and float(_t["tier"]) == float(tier["pct"]):
+                _achieved_pct = _t.get("achievedService")
+                break
+    except Exception:
+        _achieved_pct = None
+
     protection_info = {
         "chosen": chosen_key, "recommended": rec_key, "options": PROTECTION_TIERS,
+        # Measured stayed-in-stock rate for the chosen tier; None until a backtest exists.
+        "achievedPct": _achieved_pct,
         "reason": rec_reason, "marginPct": round(margin_pct, 1) if margin_pct is not None else None,
         "costKnown": margin_pct is not None, "overridden": chosen_key != rec_key,
         # Whether a COST exists, separate from whether margin could be computed — the two
@@ -2339,17 +2433,17 @@ def get_forecast(sku_id: str = Query(...), stock: int = Query(default=500, ge=0)
         "jobStartedAt": _job.get("startedAt") if _status == "calculating" else None,
     }
     doff = max(d_ro, 0) + lead_time_days
-    cw = future_fc.iloc[doff:doff + coverage_days]
-    if cw.empty: cw = future_fc.tail(coverage_days)
+    cw = fc_fwd.iloc[doff:doff + coverage_days]
+    if cw.empty: cw = fc_fwd.tail(coverage_days)
     add = cw["yhat"].clip(lower=0).mean(); cov_qty = round(add * coverage_days); target = cov_qty + safety
     dud = max(d_ro, 0) + lead_time_days
-    dem_del = round(future_fc.head(dud)["yhat"].clip(lower=0).sum())
+    dem_del = round(fc_fwd.head(dud)["yhat"].clip(lower=0).sum())
     # …and only count it against the NEW order if it actually arrives before that order
     # does. A PO landing after your next delivery can't cover demand in between.
     _po_in_time = units_on_order if (_eta is None or _eta <= dud) else 0
     stock_del = max(0, stock - dem_del + _po_in_time)
     if d_ro > 0:
-        sbr = round(future_fc.head(d_ro)["yhat"].clip(lower=0).sum()); psr = max(0, stock - sbr)
+        sbr = round(fc_fwd.head(d_ro)["yhat"].clip(lower=0).sum()); psr = max(0, stock - sbr)
     else:
         sbr, psr = 0, stock
     order_qty = max(0, target - stock_del)
@@ -2385,7 +2479,7 @@ def get_forecast(sku_id: str = Query(...), stock: int = Query(default=500, ge=0)
 
     cmp = today().to_period("M")
     usf = int(df_train[df_train["ds"].dt.to_period("M") == cmp]["y"].sum())
-    fcr = float(future_fc[future_fc["ds"].dt.to_period("M") == cmp]["yhat"].clip(lower=0).sum())
+    fcr = float(fc_fwd[fc_fwd["ds"].dt.to_period("M") == cmp]["yhat"].clip(lower=0).sum())
     lmt = int(df_train[df_train["ds"].dt.to_period("M") == (cmp - 1)]["y"].sum())
 
     cards = []; cms = pd.Timestamp(today().to_period("M").to_timestamp())
@@ -2406,7 +2500,7 @@ def get_forecast(sku_id: str = Query(...), stock: int = Query(default=500, ge=0)
     # ── Slow sellers, and a check that the model hasn't collapsed the rate ──────
     # A sub-1/day product is not "no demand" — it's a slow recurring seller, and the
     # whole UI has to say so in rates rather than whole units.
-    _fc_rate = float(future_fc["yhat"].clip(lower=0).head(90).mean()) if len(future_fc) else 0.0
+    _fc_rate = float(fc_fwd["yhat"].clip(lower=0).head(90).mean()) if len(fc_fwd) else 0.0
     _y = df_train["y"].to_numpy(float)
     _r90 = float(_y[-90:].mean()) if len(_y) >= 30 else (float(_y.mean()) if len(_y) else 0.0)
     _r180 = float(_y[-180:].mean()) if len(_y) >= 60 else _r90
@@ -2491,6 +2585,11 @@ def get_forecast(sku_id: str = Query(...), stock: int = Query(default=500, ge=0)
         "route": e.get("route"), "routeReason": e.get("route_reason"), "forecastDetails": e.get("explain"),
         "clusterInfo": e.get("cluster_info"), "groupInfo": e.get("group_info"),
         "protection": protection_info, "stockDataAvailable": stock_data_available,
+        # How old the newest sale on file is. Nothing re-imports on a schedule, so the
+        # page can sit open for days looking live while the demand under it does not
+        # move. Every date on screen advances; the data does not. The UI says so.
+        "lastSalesDate": pd.Timestamp(last_actual).strftime("%Y-%m-%d"),
+        "dataAgeDays": max(int((today().normalize() - pd.Timestamp(last_actual).normalize()).days), 0),
         "avgDailyDemand": float(round(add, 1)), "safetyStock": safety, "coverageQty": cov_qty,
         "targetInventory": target, "orderQty": order_qty, "orderGuardrail": order_guardrail,
         "projectedStockReorder": psr,

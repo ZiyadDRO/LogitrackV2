@@ -77,40 +77,40 @@ export function ArrivalPromptList({ found = [], skuList = [], lm = false,
                                     onConfirm, onIgnore }) {
   if (!found.length) return null;
   const name = (id) => skuList.find(s => s.id === id)?.name || id;
-  const card = lm ? "bg-emerald-50 border-emerald-200" : "bg-emerald-950/15 border-emerald-900/40";
-  const head = lm ? "text-emerald-800" : "text-emerald-300";
-  const body = lm ? "text-emerald-700" : "text-emerald-300/80";
-  const faint = lm ? "text-emerald-600/70" : "text-emerald-400/60";
+  const card = "bg-[var(--t-good-soft)] border-[var(--t-good-line)]";
+  const head = "text-[var(--t-good)]";
+  const body = "text-[var(--t-good)]";
+  const faint = "text-[var(--t-good)]";
 
   return (
     <div className={`${card} border rounded-2xl overflow-hidden mb-5`}>
-      <div className={`px-4 py-3 border-b ${lm ? "border-emerald-200" : "border-emerald-900/40"}`}>
-        <div className={`text-sm font-bold ${head}`}>
+      <div className={`px-4 py-3 border-b ${"border-[var(--t-good-line)]"}`}>
+        <div className={`text-[16.5px] font-bold ${head}`}>
           New units detected — log {found.length === 1 ? "this arrival" : "these arrivals"}?
         </div>
-        <div className={`text-[11px] mt-0.5 ${body}`}>
+        <div className={`text-[14px] mt-0.5 ${body}`}>
           Stock went up on {found.length === 1 ? "a product" : "products"} with an order outstanding.
           Confirming records the delivery date, which is what sharpens your lead times.
         </div>
       </div>
       {found.map((f) => (
         <div key={`${f.orderId}-${f.arrivedOn}`}
-          className={`px-4 py-2.5 flex items-center gap-3 flex-wrap border-b last:border-b-0 ${lm ? "border-emerald-200/60" : "border-emerald-900/25"}`}>
+          className={`px-4 py-2.5 flex items-center gap-3 flex-wrap border-b last:border-b-0 ${"border-[var(--t-good-line)]"}`}>
           <div className="flex-1 min-w-[220px]">
-            <div className={`text-[12px] font-semibold ${head}`}>{name(f.skuId)}</div>
-            <div className={`text-[11px] ${body}`}>{f.message}</div>
+            <div className={`text-[15px] font-semibold ${head}`}>{name(f.skuId)}</div>
+            <div className={`text-[14px] ${body}`}>{f.message}</div>
             {(f.partial || f.over || f.confidence < 0.8) && (
-              <div className={`text-[10px] mt-0.5 ${faint}`}>
+              <div className={`text-[13px] mt-0.5 ${faint}`}>
                 Worth a look before confirming — the quantity doesn&apos;t match the order exactly.
               </div>
             )}
           </div>
           <button onClick={() => onConfirm && onConfirm(f)}
-            className={`text-[11px] font-semibold px-3 py-1.5 rounded-lg border transition-all ${lm ? "bg-white border-emerald-400 text-emerald-800 hover:bg-emerald-100" : "bg-emerald-950/40 border-emerald-700 text-emerald-200 hover:bg-emerald-900/40"}`}>
+            className={`text-[14px] font-semibold px-3 py-1.5 rounded-lg border transition-all ${"bg-[var(--t-panel)] border-[var(--t-good-line)] text-[var(--t-good)] hover:bg-[var(--t-good-soft)]"}`}>
             Yes, it arrived
           </button>
           <button onClick={() => onIgnore && onIgnore(f)}
-            className={`text-[11px] px-2.5 py-1.5 rounded-lg ${lm ? "text-emerald-700 hover:bg-emerald-100" : "text-emerald-400 hover:bg-emerald-900/30"}`}>
+            className={`text-[14px] px-2.5 py-1.5 rounded-lg ${"text-[var(--t-good)] hover:bg-[var(--t-good-soft)]"}`}>
             Ignore
           </button>
         </div>
@@ -122,21 +122,21 @@ export function ArrivalPromptList({ found = [], skuList = [], lm = false,
 /** Product-page banner for one SKU. */
 export function ArrivalPromptBanner({ arrival, lm = false, onConfirm, onIgnore }) {
   if (!arrival) return null;
-  const card = lm ? "bg-emerald-50 border-emerald-200" : "bg-emerald-950/15 border-emerald-900/40";
-  const head = lm ? "text-emerald-800" : "text-emerald-300";
-  const body = lm ? "text-emerald-700" : "text-emerald-300/80";
+  const card = "bg-[var(--t-good-soft)] border-[var(--t-good-line)]";
+  const head = "text-[var(--t-good)]";
+  const body = "text-[var(--t-good)]";
   return (
     <div className={`${card} border rounded-xl px-4 py-3 mb-4 flex items-center gap-3 flex-wrap`}>
       <div className="flex-1 min-w-[240px]">
-        <div className={`text-[12px] font-bold ${head}`}>An order arrival was detected</div>
-        <div className={`text-[11px] mt-0.5 ${body}`}>{arrival.message}</div>
+        <div className={`text-[15px] font-bold ${head}`}>An order arrival was detected</div>
+        <div className={`text-[14px] mt-0.5 ${body}`}>{arrival.message}</div>
       </div>
       <button onClick={() => onConfirm && onConfirm(arrival)}
-        className={`text-[11px] font-semibold px-3 py-1.5 rounded-lg border transition-all ${lm ? "bg-white border-emerald-400 text-emerald-800 hover:bg-emerald-100" : "bg-emerald-950/40 border-emerald-700 text-emerald-200 hover:bg-emerald-900/40"}`}>
+        className={`text-[14px] font-semibold px-3 py-1.5 rounded-lg border transition-all ${"bg-[var(--t-panel)] border-[var(--t-good-line)] text-[var(--t-good)] hover:bg-[var(--t-good-soft)]"}`}>
         Yes, mark it received
       </button>
       <button onClick={() => onIgnore && onIgnore(arrival)}
-        className={`text-[11px] px-2.5 py-1.5 rounded-lg ${lm ? "text-emerald-700 hover:bg-emerald-100" : "text-emerald-400 hover:bg-emerald-900/30"}`}>
+        className={`text-[14px] px-2.5 py-1.5 rounded-lg ${"text-[var(--t-good)] hover:bg-[var(--t-good-soft)]"}`}>
         Ignore
       </button>
     </div>

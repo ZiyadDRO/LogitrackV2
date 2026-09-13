@@ -9,18 +9,20 @@ import { formatDate, isoToDisplay, urgencyLevel, autoStrategy, computeSkuLeadTim
          makeSupId, makeOrdId, todayMs, todayStr, STATUS_CONFIG, poEtaDays, planningLeadTime, LEAD_TIME_MIN_DELIVERIES, FREIGHT_MODES, leadTimeTracks, supplierOf, resolveLane, readSlowShipment, slowShipmentNote,
          readLeadTimeChanges, latestChangeAt, applyLeadTimeChange, undoLastLeadTimeChange,
          describeLeadTimeChange, parkOrder, adoptParkedOrders } from '../lib/helpers';
+import { UnitEconomicsCard } from './UnitEconomics';
+import { terminal, MONO, SANS } from '../lib/theme';
 import { API, TZ, fetchJson } from '../lib/api';
 import { saveStorage } from '../lib/storage';
-import { GROQ_URL, GROQ_MODEL } from '../lib/ai';
+import { GROQ_URL, GROQ_MODEL, GROQ_LOW_REASONING } from '../lib/ai';
 
 // ─── ORDER MATH BREAKDOWN ─────────────────────
 export function OrderMathCard({ data, leadTime, coverageDays, unitsOnOrder, lm, skuSt, demandVolatilityColor }) {
-  const bg    = lm ? "bg-slate-50 border-slate-200"    : "bg-[#1c1c20] border-white/10";
-  const label = lm ? "text-slate-500"                  : "text-slate-500";
-  const head  = lm ? "text-slate-500 border-slate-200" : "text-slate-600 border-white/10";
-  const val   = lm ? "text-slate-900"                  : "text-white";
-  const sub   = lm ? "text-slate-600 border-slate-200" : "text-slate-300 border-white/10";
-  const divider = lm ? "border-slate-200" : "border-white/10";
+  const bg    = "bg-[var(--t-sunken)] border-[var(--t-line)]";
+  const label = "text-[var(--t-dim)]";
+  const head  = "text-[var(--t-dim)] border-[var(--t-line)]";
+  const val   = "text-[var(--t-ink)]";
+  const sub   = "text-[var(--t-soft)] border-[var(--t-line)]";
+  const divider = "border-[var(--t-line)]";
 
   // Detect lead time mode
   const usingP80 = skuSt?.p80 !== null && leadTime === skuSt?.p80 && skuSt?.p80 !== skuSt?.avg;
@@ -39,40 +41,51 @@ export function OrderMathCard({ data, leadTime, coverageDays, unitsOnOrder, lm, 
     // left side is short labels and numbers, the right side is sentences.
     <div className={`${bg} border rounded-xl grid md:grid-cols-[minmax(0,1fr)_minmax(0,1.45fr)]`} style={{overflow: "clip"}}>
       {/* ── Quantity math ── */}
-      <div className="p-3.5 font-mono text-xs space-y-1.5">
-        <div className={`text-[11px] uppercase tracking-widest font-bold pb-1.5 mb-0.5 border-b ${head}`}>Order qty breakdown</div>
+      <div className="p-3.5 font-mono text-[15px] space-y-1.5">
+        <div className={`text-[14px] uppercase tracking-widest font-bold pb-1.5 mb-0.5 border-b ${head}`}>Order qty breakdown</div>
         <div className={`flex justify-between ${label}`}><span>Demand after delivery ({coverageDays}d)</span><span className={`${val} tabular-nums`}>{data.coverageQty.toLocaleString()}</span></div>
-        <div className={`flex justify-between ${label}`}><span>Demand buffer</span><span className="text-violet-500 tabular-nums">+ {data.safetyStock.toLocaleString()}</span></div>
+        <div className={`flex justify-between ${label}`}><span>Demand buffer</span><span className="text-[var(--t-accent)] tabular-nums">+ {data.safetyStock.toLocaleString()}</span></div>
         <div className={`flex justify-between ${sub} border-t pt-1.5 mt-0.5`}><span>Target stock level</span><span className="font-bold tabular-nums">{data.targetInventory.toLocaleString()}</span></div>
-        <div className={`flex justify-between text-[11px] ${label}`}><span>Est. stock at delivery</span><span className="text-rose-500 tabular-nums">− {(data.stockAtDelivery ?? data.projectedStockReorder).toLocaleString()}</span></div>
+        <div className={`flex justify-between text-[14px] ${label}`}><span>Est. stock at delivery</span><span className="text-[var(--t-bad)] tabular-nums">− {(data.stockAtDelivery ?? data.projectedStockReorder).toLocaleString()}</span></div>
         {unitsOnOrder > 0 && (
-          <div className={`flex justify-between text-[11px] ${label}`}><span>Open PO in transit</span><span className="text-violet-500 tabular-nums">− {unitsOnOrder.toLocaleString()}</span></div>
+          <div className={`flex justify-between text-[14px] ${label}`}><span>Open PO in transit</span><span className="text-[var(--t-accent)] tabular-nums">− {unitsOnOrder.toLocaleString()}</span></div>
         )}
-        <div className={`flex justify-between font-bold border-t ${divider} pt-1.5 mt-0.5 text-sm ${lm ? "text-violet-700" : "text-violet-400"}`}><span>Units to order</span><span className="tabular-nums">= {data.orderQty.toLocaleString()}</span></div>
+        <div className={`flex justify-between font-bold border-t ${divider} pt-1.5 mt-0.5 text-[16.5px] ${"text-[var(--t-accent)]"}`}><span>Units to order</span><span className="tabular-nums">= {data.orderQty.toLocaleString()}</span></div>
       </div>
 
       {/* ── Protection summary ── */}
       <div className={`border-t md:border-t-0 md:border-l ${divider} divide-y ${divider}`}>
-        <div className={`text-[10px] uppercase tracking-widest font-bold px-3.5 pt-3.5 pb-1.5 ${lm ? "text-slate-400" : "text-slate-600"}`}>Protection breakdown</div>
+        <div className={`text-[13px] uppercase tracking-widest font-bold px-3.5 pt-3.5 pb-1.5 ${"text-[var(--t-dim)]"}`}>Protection breakdown</div>
 
         {/* Demand buffer row */}
-        <div className={`flex items-start gap-2.5 px-3.5 py-2 ${lm ? "bg-white" : "bg-transparent"}`}>
-          <div className={`mt-0.5 h-4 w-4 rounded-full flex items-center justify-center shrink-0 ${lm ? "bg-emerald-100" : "bg-emerald-950/40"}`}>
-            <svg className={`h-2.5 w-2.5 ${lm ? "text-emerald-600" : "text-emerald-400"}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7"/></svg>
+        <div className={`flex items-start gap-2.5 px-3.5 py-2 ${"bg-[var(--t-panel)]"}`}>
+          <div className={`mt-0.5 h-4 w-4 rounded-full flex items-center justify-center shrink-0 ${"bg-[var(--t-good-soft)]"}`}>
+            <svg className={`h-2.5 w-2.5 ${"text-[var(--t-good)]"}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7"/></svg>
           </div>
           <div className="flex-1 min-w-0">
             {/* While the measured recommendation is being computed, show NOTHING rather
                 than a provisional level. A number that appears and then changes invites
                 a decision the user would have to revisit. */}
             {prot?.status === "calculating" ? (
-              <div className={`text-[11px] font-semibold ${lm ? "text-slate-700" : "text-slate-300"}`}>Protection level</div>
+              <div className={`text-[14px] font-semibold ${"text-[var(--t-soft)]"}`}>Protection level</div>
             ) : (
-              <div className={`text-[11px] font-semibold ${lm ? "text-slate-700" : "text-slate-300"}`}>
+              <div className={`text-[14px] font-semibold ${"text-[var(--t-soft)]"}`}>
+                {/* Nominal AND measured. The tier name is a target, not an outcome: the
+                    buffer is z x sigma from a normal table while real demand has fatter
+                    tails, so every tier lands below its own label. The backtest already
+                    knows the real figure — showing only the nominal one let the page
+                    promise protection it does not deliver. */}
                 {prot?.label || "Standard"} protection ({prot?.servicePct ?? 95}%)
-                <span className={`ml-1.5 font-mono font-normal text-[11px] ${lm ? "text-slate-400" : "text-slate-500"}`}>+{data.safetyStock} units</span>
+                {prot?.achievedPct != null && (
+                  <span className={`ml-1.5 font-mono font-normal text-[14px] ${"text-[var(--t-warn)]"}`}
+                        title={`Replayed against your own sales history, this level actually kept ${prot.achievedPct}% of lead-time windows in stock. The tier name is the target; this is what it delivered.`}>
+                    · {prot.achievedPct}% measured
+                  </span>
+                )}
+                <span className={`ml-1.5 font-mono font-normal text-[14px] ${"text-[var(--t-dim)]"}`}>+{data.safetyStock} units</span>
               </div>
             )}
-            <div className={`text-[11px] mt-0.5 ${prot?.status === "calculating" ? (lm ? "text-violet-600" : "text-violet-300") : (lm ? "text-slate-400" : "text-slate-500")}`}>
+            <div className={`text-[14px] mt-0.5 ${prot?.status === "calculating" ? ("text-[var(--t-accent)]") : ("text-[var(--t-dim)]")}`}>
               {prot?.status === "calculating" ? (
                 // A backtest is in flight, so this number is about to change. Say so
                 // rather than presenting the weaker answer as settled.
@@ -93,34 +106,34 @@ export function OrderMathCard({ data, leadTime, coverageDays, unitsOnOrder, lm, 
         </div>
 
         {/* Delivery timing row */}
-        <div className={`flex items-start gap-2.5 px-3.5 py-2 ${lm ? "bg-white" : "bg-transparent"}`}>
+        <div className={`flex items-start gap-2.5 px-3.5 py-2 ${"bg-[var(--t-panel)]"}`}>
           {usingP80 ? (
-            <div className={`mt-0.5 h-4 w-4 rounded-full flex items-center justify-center shrink-0 ${lm ? "bg-violet-100" : "bg-violet-950/40"}`}>
-              <svg className={`h-2.5 w-2.5 ${lm ? "text-violet-600" : "text-violet-400"}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7"/></svg>
+            <div className={`mt-0.5 h-4 w-4 rounded-full flex items-center justify-center shrink-0 ${"bg-[var(--t-accent-soft)]"}`}>
+              <svg className={`h-2.5 w-2.5 ${"text-[var(--t-accent)]"}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7"/></svg>
             </div>
           ) : (
-            <div className={`mt-0.5 h-4 w-4 rounded-full flex items-center justify-center shrink-0 ${lm ? "bg-amber-100" : "bg-amber-950/40"}`}>
-              <svg className={`h-2.5 w-2.5 ${lm ? "text-amber-600" : "text-amber-400"}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v4m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/></svg>
+            <div className={`mt-0.5 h-4 w-4 rounded-full flex items-center justify-center shrink-0 ${"bg-[var(--t-warn-soft)]"}`}>
+              <svg className={`h-2.5 w-2.5 ${"text-[var(--t-warn)]"}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v4m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/></svg>
             </div>
           )}
           <div className="flex-1 min-w-0">
             {usingP80 ? (
               <>
-                <div className={`text-[11px] font-semibold ${lm ? "text-slate-700" : "text-slate-300"}`}>
+                <div className={`text-[14px] font-semibold ${"text-[var(--t-soft)]"}`}>
                   Late deliveries — P80 active
-                  <span className={`ml-1.5 font-mono font-normal text-[11px] ${lm ? "text-violet-500" : "text-violet-500"}`}>orders {daysEarlier}d earlier</span>
+                  <span className={`ml-1.5 font-mono font-normal text-[14px] ${"text-[var(--t-accent)]"}`}>orders {daysEarlier}d earlier</span>
                 </div>
-                <div className={`text-[11px] mt-0.5 ${lm ? "text-slate-400" : "text-slate-500"}`}>
+                <div className={`text-[14px] mt-0.5 ${"text-[var(--t-dim)]"}`}>
                   80% of past deliveries arrive within {leadTime}d — covers up to {daysEarlier}d delay
                 </div>
               </>
             ) : (
               <>
-                <div className={`text-[11px] font-semibold ${lm ? "text-amber-700" : "text-amber-400"}`}>
+                <div className={`text-[14px] font-semibold ${"text-[var(--t-warn)]"}`}>
                   Late deliveries — no protection
-                  {usingAvg && skuSt?.p80 && <span className={`ml-1.5 font-normal text-[11px] ${lm ? "text-slate-400" : "text-slate-500"}`}>using avg · switch to P80 to protect</span>}
+                  {usingAvg && skuSt?.p80 && <span className={`ml-1.5 font-normal text-[14px] ${"text-[var(--t-dim)]"}`}>using avg · switch to P80 to protect</span>}
                 </div>
-                <div className={`text-[11px] mt-0.5 ${lm ? "text-slate-400" : "text-slate-500"}`}>
+                <div className={`text-[14px] mt-0.5 ${"text-[var(--t-dim)]"}`}>
                   {usingAvg
                     ? `Using avg lead time (${leadTime}d) — ~50% of deliveries arrive on time`
                     : `Manual lead time (${leadTime}d) — log ≥ 3 orders to unlock P80`}
@@ -155,7 +168,7 @@ export function SkuSignalStrip({ mlData, statusCfg, apiKey, lm }) {
       const res = await fetch(GROQ_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
-        body: JSON.stringify({ model: GROQ_MODEL, messages: [{ role: "user", content: prompt }], max_tokens: 300, temperature: 0.3 }),
+        body: JSON.stringify({ model: GROQ_MODEL, messages: [{ role: "user", content: prompt }], max_tokens: 300, temperature: 0.3, ...GROQ_LOW_REASONING }),
       });
       const data = await res.json();
       setExplanation(data?.choices?.[0]?.message?.content || "Could not generate explanation.");
@@ -179,13 +192,13 @@ export function SkuSignalStrip({ mlData, statusCfg, apiKey, lm }) {
   const zeroStock = mlData.stockoutRowsDropped > 0;
   const hasDetail = mlData.statusMessage || mlData.reliabilityMessage || (pricePill && mlData.priceTiers?.length) || zeroStock;
 
-  const card = lm ? "bg-white border-slate-200" : "bg-[#161619] border-white/10";
-  const head = lm ? "text-slate-500" : "text-slate-600";
+  const card = "bg-[var(--t-panel)] border-[var(--t-line)]";
+  const head = "text-[var(--t-dim)]";
 
   return (
     <div className={`${card} border rounded-2xl px-4 py-3`}>
       <div className="flex items-center gap-2 flex-wrap">
-        <span className={`text-[11px] uppercase tracking-widest font-bold mr-1 ${head}`}>Forecast health</span>
+        <span className={`text-[14px] uppercase tracking-widest font-bold mr-1 ${head}`}>Forecast health</span>
         <SignalPill tone={statusTone[mlData.status] || "slate"} lm={lm}>
           <span className={`h-1.5 w-1.5 rounded-full ${statusCfg.dot}`} />{statusCfg.label}
         </SignalPill>
@@ -196,26 +209,26 @@ export function SkuSignalStrip({ mlData, statusCfg, apiKey, lm }) {
         <div className="flex-1 min-w-[12px]" />
         {lowRel && !explanation && !loading && (
           <button onClick={() => { setOpen(true); explain(); }}
-            className={`text-[11px] font-semibold ${lm ? "text-amber-700 hover:text-amber-800" : "text-amber-400 hover:text-amber-300"}`}>Why?</button>
+            className={`text-[14px] font-semibold ${"text-[var(--t-warn)] hover:text-[var(--t-warn)]"}`}>Why?</button>
         )}
         {hasDetail && (
           <button onClick={() => setOpen(o => !o)}
-            className={`text-[11px] font-semibold ${lm ? "text-slate-500 hover:text-slate-700" : "text-slate-500 hover:text-slate-300"}`}>{open ? "Hide details" : "Details"}</button>
+            className={`text-[14px] font-semibold ${"text-[var(--t-dim)] hover:text-[var(--t-soft)]"}`}>{open ? "Hide details" : "Details"}</button>
         )}
       </div>
 
       {open && (
-        <div className={`mt-3 pt-3 border-t space-y-3 ${lm ? "border-slate-200" : "border-white/10"}`}>
-          {mlData.statusMessage && <p className={`text-xs leading-relaxed ${lm ? "text-slate-500" : "text-slate-500"}`}>{mlData.statusMessage}</p>}
+        <div className={`mt-3 pt-3 border-t space-y-3 ${"border-[var(--t-line)]"}`}>
+          {mlData.statusMessage && <p className={`text-[15px] leading-relaxed ${"text-[var(--t-dim)]"}`}>{mlData.statusMessage}</p>}
           <ReliabilityBadge color={mlData.reliabilityColor} message={mlData.reliabilityMessage} intervalWidth={mlData.intervalWidth} demandVolatilityColor={mlData.demandVolatilityColor} lm={lm} />
           {zeroStock && (
-            <p className={`text-[11px] leading-relaxed ${lm ? "text-slate-500" : "text-slate-500"}`}>
+            <p className={`text-[14px] leading-relaxed ${"text-[var(--t-dim)]"}`}>
               {mlData.stockoutRowsDropped} zero-stock day{mlData.stockoutRowsDropped > 1 ? "s were" : " was"} removed from training so the model doesn't learn artificially low demand during stockouts.
             </p>
           )}
           {pricePill && mlData.priceTiers?.length > 0 && (
             <div>
-              <div className={`text-[11px] uppercase tracking-widest font-bold mb-1 ${head}`}>Price tiers</div>
+              <div className={`text-[14px] uppercase tracking-widest font-bold mb-1 ${head}`}>Price tiers</div>
               <PriceTierTable tiers={mlData.priceTiers} lm={lm} />
             </div>
           )}
@@ -223,11 +236,11 @@ export function SkuSignalStrip({ mlData, statusCfg, apiKey, lm }) {
             <div>
               {loading && (
                 <div className="flex items-center gap-2">
-                  <div className="h-2.5 w-2.5 border-2 border-amber-400 border-t-transparent rounded-full animate-spin" />
-                  <span className={`text-[11px] ${lm ? "text-amber-600" : "text-amber-400"}`}>Analysing data quality…</span>
+                  <div className="h-2.5 w-2.5 border-2 border-[var(--t-warn-line)] border-t-transparent rounded-full animate-spin" />
+                  <span className={`text-[14px] ${"text-[var(--t-warn)]"}`}>Analysing data quality…</span>
                 </div>
               )}
-              {explanation && <p className={`text-xs leading-relaxed whitespace-pre-wrap ${lm ? "text-slate-700" : "text-slate-300"}`}>{explanation}</p>}
+              {explanation && <p className={`text-[15px] leading-relaxed whitespace-pre-wrap ${"text-[var(--t-soft)]"}`}>{explanation}</p>}
             </div>
           )}
         </div>
@@ -436,8 +449,8 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
   if (!mlData) return (
     <div className="flex-1 flex items-center justify-center">
       <div className="flex flex-col items-center gap-3">
-        <div className="h-6 w-6 border-2 border-violet-500 border-t-transparent rounded-full animate-spin" />
-        <span className={`text-xs font-mono ${lm ? "text-slate-500" : "text-slate-500"}`}>Loading forecast…</span>
+        <div className="h-6 w-6 border-2 border-[var(--t-accent-line)] border-t-transparent rounded-full animate-spin" />
+        <span className={`text-[15px] font-mono ${"text-[var(--t-dim)]"}`}>Loading forecast…</span>
       </div>
     </div>
   );
@@ -447,57 +460,86 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
   const pctChange = mlData.currentMonth.lastMonthTotal > 0
     ? ((projTotal - mlData.currentMonth.lastMonthTotal) / mlData.currentMonth.lastMonthTotal) * 100 : 0;
   const hasOpenPO   = !!openPO;
-  const urgency     = urgencyLevel(mlData.daysUntilReorder, hasOpenPO);
+  /* plan.days, not the default. The reorder bands are a fraction of a product's OWN
+     lead time (at-risk = lead/2, due = lead x1.5), and omitting it fell back to 14 days
+     for everything — so a 60-day sea-freight line read "due within 90 days" on the Fleet
+     (which does pass it) and "due within 21 days" here. Same product, same moment, two
+     answers. It is the same lead time the forecast itself was requested with on line 344. */
+  const urgency     = urgencyLevel(mlData.daysUntilReorder, hasOpenPO, plan.days);
   const showReorder = mlData.daysUntilReorder != null && !hasOpenPO;
 
   // Theming shortcuts
-  const sidebarBg  = lm ? "bg-slate-100 border-slate-200" : "bg-[#161619] border-white/10";
-  const lbl        = lm ? "block text-xs text-slate-600 font-semibold uppercase tracking-widest mb-1.5"
-                        : "block text-[11px] text-slate-400 font-semibold uppercase tracking-widest mb-1.5";
-  const inp        = lm ? "w-full bg-white border border-slate-300 rounded-lg px-3 py-2 text-sm text-slate-900 focus:outline-none focus:border-violet-500"
-                        : "w-full bg-slate-900 border border-slate-700/60 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-violet-600/60 tabular-nums";
-  const divider    = lm ? "border-slate-200" : "border-white/10";
-  const infoHead   = lm ? "text-[11px] uppercase tracking-widest text-slate-500 font-bold" : "text-[9px] uppercase tracking-widest text-slate-700 font-bold";
-  const infoLabel  = lm ? "text-slate-500 text-xs" : "text-slate-600 text-[10px]";
-  const infoVal    = lm ? "text-slate-800" : "text-slate-400";
-  const mainBg     = lm ? "bg-slate-50" : "";
-  const cardBg     = lm ? "bg-white border-slate-200" : "bg-[#161619] border-white/10";
-  const textMain   = lm ? "text-slate-900" : "text-white";
-  const textMuted  = lm ? "text-slate-500" : "text-slate-500";
+  const sidebarBg  = "bg-[var(--t-sunken)] border-[var(--t-line)]";
+  const lbl        = "block text-[15px] text-[var(--t-soft)] font-semibold uppercase tracking-widest mb-1.5";
+  const inp        = "w-full bg-[var(--t-panel)] border border-[var(--t-line2)] rounded-lg px-3 py-2 text-[16.5px] text-[var(--t-ink)] focus:outline-none focus:border-[var(--t-accent)]";
+  const divider    = "border-[var(--t-line)]";
+  const infoHead   = "text-[14px] uppercase tracking-widest text-[var(--t-dim)] font-bold";
+  const infoLabel  = "text-[var(--t-dim)] text-[15px]";
+  const infoVal    = "text-[var(--t-ink)]";
+  const mainBg     = "bg-[var(--t-sunken)]";
+  const cardBg     = "bg-[var(--t-panel)] border-[var(--t-line)]";
+  const textMain   = "text-[var(--t-ink)]";
+  const textMuted  = "text-[var(--t-dim)]";
 
   // CI button active/inactive
-  const ciBtnActive   = lm ? "bg-violet-50 border-violet-400 ring-1 ring-violet-200" : "bg-violet-950/40 border-violet-700/60 ring-1 ring-violet-700/30";
-  const ciBtnInactive = lm ? "bg-white border-slate-300 hover:border-slate-400" : "bg-slate-900/60 border-slate-700/40 hover:border-slate-600";
-  const ciLblActive   = lm ? "text-violet-700" : "text-violet-300";
-  const ciLblInactive = lm ? "text-slate-700" : "text-slate-300";
-  const ciCiActive    = lm ? "text-violet-600" : "text-violet-400";
-  const ciCiInactive  = lm ? "text-slate-400" : "text-slate-600";
-  const ciSub         = lm ? "text-slate-500" : "text-slate-500";
+  const ciBtnActive   = "bg-[var(--t-accent-soft)] border-[var(--t-accent-line)] ring-1 ring-[var(--t-accent-line)]";
+  const ciBtnInactive = "bg-[var(--t-panel)] border-[var(--t-line2)] hover:border-[var(--t-line2)]";
+  const ciLblActive   = "text-[var(--t-accent)]";
+  const ciLblInactive = "text-[var(--t-soft)]";
+  const ciCiActive    = "text-[var(--t-accent)]";
+  const ciCiInactive  = "text-[var(--t-dim)]";
+  const ciSub         = "text-[var(--t-dim)]";
 
   // Month buttons
-  const moBtnActive   = lm ? "bg-violet-600 border-violet-500 text-white" : "bg-violet-600 border-violet-500 text-white shadow-lg shadow-violet-900/30";
-  const moBtnInactive = lm ? "bg-white border-slate-300 text-slate-600 hover:border-slate-400 hover:text-slate-800" : "bg-slate-900 border-slate-700/60 text-slate-400 hover:border-slate-600";
+  const moBtnActive   = "bg-[var(--t-btn-bg)] border-[var(--t-accent-line)] text-[var(--t-btn-fg)]";
+  const moBtnInactive = "bg-[var(--t-panel)] border-[var(--t-line2)] text-[var(--t-soft)] hover:border-[var(--t-line2)] hover:text-[var(--t-ink)]";
 
   // On order badge
-  const poCard = lm ? "bg-violet-50 border-violet-300" : "bg-violet-950/30 border-violet-800/40";
-  const poHead = lm ? "text-violet-700" : "text-violet-300";
-  const poText = lm ? "text-slate-600" : "text-slate-400";
+  const poCard = "bg-[var(--t-accent-soft)] border-[var(--t-accent-line)]";
+  const poHead = "text-[var(--t-accent)]";
+  const poText = "text-[var(--t-soft)]";
 
+  /* One block of variables at the root instead of the 228 `lm ? light : dark`
+     ternaries this file used to carry. The theme flips here; everything below reads
+     tokens and no longer knows or cares which mode it is in. */
+  const T = terminal(lm);
+  const VARS = {
+    "--t-bg": T.bg, "--t-panel": T.panel, "--t-sunken": T.sunken,
+    "--t-ink": T.ink, "--t-soft": T.soft, "--t-dim": T.dim, "--t-faint": T.faint,
+    "--t-line": T.line, "--t-line2": T.line2,
+    "--t-accent": T.amber, "--t-accent-soft": `${T.amber}14`, "--t-accent-line": `${T.amber}55`,
+    "--t-good": T.green, "--t-good-soft": `${T.green}16`, "--t-good-line": `${T.green}55`,
+    "--t-warn": T.over,  "--t-warn-soft": `${T.over}16`,  "--t-warn-line": `${T.over}55`,
+    "--t-bad": T.red,    "--t-bad-soft": `${T.red}14`,    "--t-bad-line": `${T.red}55`,
+    "--t-info": T.blue,  "--t-info-soft": `${T.blue}14`,  "--t-info-line": `${T.blue}55`,
+    "--t-btn-bg": T.btnBg, "--t-btn-fg": T.btnFg,
+  };
   return (
-    <div className="flex h-full">
+    <div className="flex h-full" style={{ ...VARS, background: T.bg, color: T.ink, fontFamily: SANS }}>
+      {/* Figures are monospaced; prose is not. Applied by class so the file's existing
+          `tabular-nums` and `font-mono` cells pick the face up without touching each one. */}
+      <style>{`.tabular-nums,.font-mono{font-family:${MONO};font-variant-numeric:tabular-nums}`}</style>
       {/* Forecast "why" panel — opened from the Forecast details button in the header */}
       <ForecastDetailsDrawer data={mlData} lm={lm} open={showForecastDetails} onClose={() => setShowForecastDetails(false)} />
       {/* Params panel */}
       <div ref={panelRef} style={{ width: panelWidth }}
         className={`relative shrink-0 ${sidebarBg} border-r flex flex-col`}>
         <div onMouseDown={startResizePanel} title="Drag to resize"
-          className={`absolute top-0 right-0 h-full w-1.5 cursor-col-resize z-30 ${lm ? "hover:bg-violet-300" : "hover:bg-violet-600/50"}`} />
+          className={`absolute top-0 right-0 h-full w-1.5 cursor-col-resize z-30 ${"hover:bg-[var(--t-line2)]"}`} />
         <div className="flex-1 flex flex-col p-5 gap-5 overflow-y-auto sku-scroll">
         <div className="space-y-4">
           <div>
             <label className={lbl}>Units in Stock</label>
             <input type="number" value={draftParams.stock} onChange={e => updateDraft("stock", Number(e.target.value))} className={inp} />
           </div>
+
+          {/* Unit economics. Cost and fees used to be editable ONLY in the Scorecard
+              tab, while the protection card six inches below this said "add a unit
+              cost to tune" — pointing at a control on a different screen. They live
+              here now, next to the thing they change. */}
+          <UnitEconomicsCard lm={lm} params={draftParams}
+            price={mlData?.currentPrice ?? mlData?.lastPrice ?? null}
+            onChange={updateDraftMany} />
           {/* ── Lead Time ──
               The "Lead Time (days)" summary card that used to head this section is gone.
               It restated one number — the default lane's — that the table below already
@@ -513,22 +555,22 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
                 pool: a sea crossing says nothing about how long air takes. Lanes are
                 created lazily, so a product that only ships one way shows one row with a
                 number and the rest blank — blank being a clearer signal than a guess. */}
-            <div className={`rounded-xl border overflow-hidden ${lm ? "bg-slate-50 border-slate-200" : "bg-slate-900/40 border-slate-700/40"}`}>
-              <div className={`px-3 py-2 flex items-center justify-between border-b ${lm ? "border-slate-200" : "border-slate-700/40"}`}>
-                <span className={`text-[10px] uppercase tracking-widest font-bold ${lm ? "text-slate-500" : "text-slate-500"}`}>
+            <div className={`rounded-xl border overflow-hidden ${"bg-[var(--t-sunken)] border-[var(--t-line)]"}`}>
+              <div className={`px-3 py-2 flex items-center justify-between border-b ${"border-[var(--t-line)]"}`}>
+                <span className={`text-[13px] uppercase tracking-widest font-bold ${"text-[var(--t-dim)]"}`}>
                   Lead time by shipping method
                 </span>
                 <label className="flex items-center gap-1.5">
-                  <span className={`text-[10px] ${lm ? "text-slate-500" : "text-slate-500"}`}>Usually ships by</span>
+                  <span className={`text-[13px] ${"text-[var(--t-dim)]"}`}>Usually ships by</span>
                   <select value={draftParams.freightMode || resolveLane(skuId, draftParams, suppliers) || Object.keys(FREIGHT_MODES)[0]}
                     onChange={e => updateDraft("freightMode", e.target.value)}
-                    className={`rounded border px-1.5 py-0.5 text-[11px] ${lm ? "bg-white border-slate-300 text-slate-900" : "bg-slate-900 border-slate-700 text-slate-200"}`}>
+                    className={`rounded border px-1.5 py-0.5 text-[14px] ${"bg-[var(--t-panel)] border-[var(--t-line2)] text-[var(--t-ink)]"}`}>
 
                     {Object.entries(FREIGHT_MODES).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
                   </select>
                 </label>
               </div>
-              <div className={`grid grid-cols-[1fr_auto_auto_auto] gap-x-3 px-3 py-1.5 text-[10px] uppercase tracking-wider font-semibold ${lm ? "text-slate-400" : "text-slate-600"}`}>
+              <div className={`grid grid-cols-[1fr_auto_auto_auto] gap-x-3 px-3 py-1.5 text-[13px] uppercase tracking-wider font-semibold ${"text-[var(--t-dim)]"}`}>
                 <span>Method</span><span className="text-right">Baseline</span>
                 {/* "Deliveries", not "Ships" or "Orders" — this counts shipments that
                     ARRIVED (both an ordered and a received date). An outstanding PO isn't
@@ -538,10 +580,10 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
               </div>
               {tracks.map(t => (
                 <div key={t.mode}
-                  className={`grid grid-cols-[1fr_auto_auto_auto] gap-x-3 items-center px-3 py-1.5 border-t text-[11px] ${lm ? "border-slate-200" : "border-slate-700/30"} ${t.isDefault ? (lm ? "bg-violet-50" : "bg-violet-950/20") : ""}`}>
-                  <span className={`font-medium ${t.used ? (lm ? "text-slate-700" : "text-slate-300") : (lm ? "text-slate-400" : "text-slate-600")}`}>
+                  className={`grid grid-cols-[1fr_auto_auto_auto] gap-x-3 items-center px-3 py-1.5 border-t text-[14px] ${"border-[var(--t-line)]"} ${t.isDefault ? ("bg-[var(--t-accent-soft)]") : ""}`}>
+                  <span className={`font-medium ${t.used ? ("text-[var(--t-soft)]") : ("text-[var(--t-dim)]")}`}>
                     {t.label}
-                    {t.isDefault && <span className={`ml-1.5 text-[9px] uppercase tracking-wide ${lm ? "text-violet-600" : "text-violet-400"}`}>default</span>}
+                    {t.isDefault && <span className={`ml-1.5 text-[12.5px] uppercase tracking-wide ${"text-[var(--t-accent)]"}`}>default</span>}
                   </span>
                   {/* `t.baseline` is the RESOLVED number for this lane — this product's
                       own, else the one inherited from its supplier, else (for the default
@@ -568,25 +610,25 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
                       updateDraftMany(patch);
                     }}
                     title={t.inherited ? `Inherited from ${supplierName || "this supplier"} — type here to give this product its own` : undefined}
-                    className={`w-16 text-right rounded border px-1.5 py-0.5 font-mono text-[11px] ${
+                    className={`w-16 text-right rounded border px-1.5 py-0.5 font-mono text-[14px] ${
                       t.inherited
-                        ? (lm ? "bg-white border-slate-200 text-slate-400 italic" : "bg-slate-900 border-slate-700/50 text-slate-500 italic")
-                        : (lm ? "bg-white border-slate-300 text-slate-900" : "bg-slate-900 border-slate-700 text-slate-200")}`} />
-                  <span className={`text-right font-mono tabular-nums w-12 ${t.p80 != null ? (lm ? "text-emerald-700 font-bold" : "text-emerald-400 font-bold") : (lm ? "text-slate-300" : "text-slate-700")}`}>
+                        ? ("bg-[var(--t-panel)] border-[var(--t-line)] text-[var(--t-dim)] italic")
+                        : ("bg-[var(--t-panel)] border-[var(--t-line2)] text-[var(--t-ink)]")}`} />
+                  <span className={`text-right font-mono tabular-nums w-12 ${t.p80 != null ? ("text-[var(--t-good)] font-bold") : ("text-[var(--t-soft)]")}`}>
                     {t.p80 != null ? `${t.p80}d` : "—"}
                   </span>
-                  <span className={`text-right font-mono tabular-nums w-8 ${lm ? "text-slate-500" : "text-slate-500"}`}>{t.n || "—"}</span>
+                  <span className={`text-right font-mono tabular-nums w-8 ${"text-[var(--t-dim)]"}`}>{t.n || "—"}</span>
                 </div>
               ))}
               {/* Carries the resolved planning number now that the card above is gone —
                   the one figure the whole section exists to produce, stated once. The
                   manual branch also carries the only way out of manual mode, which used
                   to live on the card. */}
-              <div className={`px-3 py-2 border-t text-[10px] ${lm ? "border-slate-200 text-slate-500" : "border-slate-700/40 text-slate-500"}`}>
+              <div className={`px-3 py-2 border-t text-[13px] ${"border-[var(--t-line)] text-[var(--t-dim)]"}`}>
                 {params.leadTimeMode === "manual"
                   ? <>Planning on <b>{plan.days}d</b> — pinned by you, ignoring delivery history.{" "}
                       <button onClick={() => updateDraft("leadTimeMode", undefined)}
-                        className={`font-semibold underline ${lm ? "text-slate-600" : "text-slate-300"}`}>measure it instead</button></>
+                        className={`font-semibold underline ${"text-[var(--t-soft)]"}`}>measure it instead</button></>
                   : activeTrack.p80 != null
                   ? <>Planning on <b>{plan.days}d</b> — measured {activeTrack.label}, P80 of {activeTrack.n} shipments. Your baseline is only used if that record goes away; editing it never drops a delivery.</>
                   : draftParams.freightMode
@@ -601,7 +643,7 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
                   the row above already overrides it. A checkbox to refuse an inheritance
                   you can simply overwrite is a switch with nothing behind it. */}
               {tracks.some(t => t.inherited) && (
-                <div className={`px-3 py-1.5 border-t text-[10px] ${lm ? "border-slate-200 text-slate-500" : "border-slate-700/40 text-slate-500"}`}>
+                <div className={`px-3 py-1.5 border-t text-[13px] ${"border-[var(--t-line)] text-[var(--t-dim)]"}`}>
                   Greyed numbers come from {supplierName || "this supplier"}. Type over one to make it this product&apos;s own.
                 </div>
               )}
@@ -615,17 +657,17 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
                 arrangement that never existed. Undo the newest and the one below it
                 becomes undoable in turn, all the way back to the original numbers. */}
             {changes.length > 0 && (
-              <div className={`rounded-xl border overflow-hidden ${lm ? "bg-slate-50 border-slate-200" : "bg-slate-900/40 border-slate-700/40"}`}>
-                <div className={`px-3 py-1.5 text-[10px] uppercase tracking-widest font-bold border-b ${lm ? "text-slate-500 border-slate-200" : "text-slate-500 border-slate-700/40"}`}>
+              <div className={`rounded-xl border overflow-hidden ${"bg-[var(--t-sunken)] border-[var(--t-line)]"}`}>
+                <div className={`px-3 py-1.5 text-[13px] uppercase tracking-widest font-bold border-b ${"text-[var(--t-dim)] border-[var(--t-line)]"}`}>
                   Lead time changes ({changes.length})
                 </div>
                 {changes.slice().reverse().map((c, i) => (
-                  <div key={c.at + i} className={`px-3 py-2 flex items-start gap-2 border-b last:border-b-0 ${lm ? "border-slate-200/70" : "border-slate-700/25"}`}>
+                  <div key={c.at + i} className={`px-3 py-2 flex items-start gap-2 border-b last:border-b-0 ${"border-[var(--t-line)]"}`}>
                     <div className="flex-1 min-w-0">
-                      <div className={`text-[11px] font-semibold ${i === 0 ? (lm ? "text-slate-800" : "text-slate-200") : (lm ? "text-slate-500" : "text-slate-500")}`}>
+                      <div className={`text-[14px] font-semibold ${i === 0 ? ("text-[var(--t-ink)]") : ("text-[var(--t-dim)]")}`}>
                         {describeLeadTimeChange(c)}
                       </div>
-                      <div className={`text-[10px] ${lm ? "text-slate-500" : "text-slate-600"}`}>
+                      <div className={`text-[13px] ${"text-[var(--t-dim)]"}`}>
                         {isoToDisplay(c.at)}
                         {i === 0
                           ? <> · measuring from here{plan.supersededN > 0 ? ` · ${plan.supersededN} earlier ${plan.supersededN === 1 ? "delivery" : "deliveries"} set aside` : ""}</>
@@ -634,13 +676,13 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
                     </div>
                     {i === 0 && (
                       <button onClick={() => { const patch = undoLastLeadTimeChange(draftParams); if (patch) updateDraftMany(patch); }}
-                        className={`shrink-0 text-[10px] font-semibold px-2 py-1 rounded-lg border transition-all ${lm ? "bg-white border-slate-300 text-slate-600 hover:border-slate-400" : "bg-slate-800 border-slate-700 text-slate-300 hover:border-slate-500"}`}>
+                        className={`shrink-0 text-[13px] font-semibold px-2 py-1 rounded-lg border transition-all ${"bg-[var(--t-panel)] border-[var(--t-line2)] text-[var(--t-soft)] hover:border-[var(--t-line2)]"}`}>
                         Undo
                       </button>
                     )}
                   </div>
                 ))}
-                <div className={`px-3 py-1.5 text-[9.5px] border-t ${lm ? "border-slate-200 text-slate-500" : "border-slate-700/40 text-slate-500"}`}>
+                <div className={`px-3 py-1.5 text-[14px] border-t ${"border-[var(--t-line)] text-[var(--t-dim)]"}`}>
                   Measured figures restart at the newest change, so P80 rebuilds from deliveries logged since then.
                   {plan.priorP80 ? ` The previous arrangement measured ${plan.priorP80}d.` : ""}
                   {" "}Nothing is deleted — undo brings the older deliveries straight back.
@@ -658,19 +700,19 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
                 deleted, so undo restores the previous measurement exactly. That's what
                 makes it safe to try. */}
             {ltChange ? (
-              <div className={`rounded-xl border px-3 py-2.5 space-y-2 ${lm ? "bg-white border-violet-300" : "bg-slate-900/60 border-violet-800/60"}`}>
-                <div className={`text-[11px] font-bold ${lm ? "text-slate-800" : "text-slate-200"}`}>New lead times from today</div>
-                <div className={`text-[10px] ${lm ? "text-slate-500" : "text-slate-500"}`}>
+              <div className={`rounded-xl border px-3 py-2.5 space-y-2 ${"bg-[var(--t-panel)] border-[var(--t-accent-line)]"}`}>
+                <div className={`text-[14px] font-bold ${"text-[var(--t-ink)]"}`}>New lead times from today</div>
+                <div className={`text-[13px] ${"text-[var(--t-dim)]"}`}>
                   Change what moved and leave the rest — anything you don&apos;t touch keeps its current number.
                 </div>
                 {tracks.map(t => (
                   <div key={t.mode} className="flex items-center gap-2">
-                    <span className={`text-[11px] w-14 shrink-0 ${lm ? "text-slate-600" : "text-slate-400"}`}>{t.label}</span>
+                    <span className={`text-[14px] w-14 shrink-0 ${"text-[var(--t-soft)]"}`}>{t.label}</span>
                     <input type="number" min="1" placeholder="—"
                       value={ltChange[t.mode] ?? ""}
                       onChange={e => setLtChange(c => ({ ...c, [t.mode]: e.target.value }))}
-                      className={`w-16 text-right rounded border px-1.5 py-0.5 font-mono text-[11px] ${lm ? "bg-white border-slate-300 text-slate-900" : "bg-slate-900 border-slate-700 text-slate-200"}`} />
-                    <span className={`text-[10px] ${lm ? "text-slate-400" : "text-slate-600"}`}>
+                      className={`w-16 text-right rounded border px-1.5 py-0.5 font-mono text-[14px] ${"bg-[var(--t-panel)] border-[var(--t-line2)] text-[var(--t-ink)]"}`} />
+                    <span className={`text-[13px] ${"text-[var(--t-dim)]"}`}>
                       d{t.baseline != null && Number(ltChange[t.mode]) !== t.baseline ? ` · was ${t.baseline}d` : ""}
                     </span>
                   </div>
@@ -690,20 +732,20 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
                       }
                       setLtChange(null);
                     }}
-                    className="text-[11px] font-bold px-3 py-1.5 rounded-lg bg-violet-700 hover:bg-violet-600 text-white transition-colors">
+                    className="text-[14px] font-bold px-3 py-1.5 rounded-lg bg-[var(--t-btn-bg)] hover:bg-[var(--t-btn-bg)] text-[var(--t-btn-fg)] transition-colors">
                     Apply from today
                   </button>
                   <button onClick={() => setLtChange(null)}
-                    className={`text-[11px] px-2 py-1.5 ${lm ? "text-slate-500 hover:text-slate-700" : "text-slate-400 hover:text-slate-200"}`}>cancel</button>
+                    className={`text-[14px] px-2 py-1.5 ${"text-[var(--t-dim)] hover:text-[var(--t-soft)]"}`}>cancel</button>
                 </div>
-                <div className={`text-[9.5px] ${lm ? "text-slate-400" : "text-slate-600"}`}>
+                <div className={`text-[14px] ${"text-[var(--t-dim)]"}`}>
                   Deliveries before today are set aside, not deleted. Undo brings them back.
                 </div>
               </div>
             ) : (
               <button
                 onClick={() => setLtChange(Object.fromEntries(tracks.map(t => [t.mode, t.baseline ?? ""])))}
-                className={`w-full text-[11px] font-semibold py-1.5 rounded-lg border transition-all ${lm ? "bg-white border-slate-300 text-slate-600 hover:border-violet-400 hover:text-violet-700" : "bg-slate-800/60 border-slate-700 text-slate-300 hover:border-violet-700 hover:text-violet-300"}`}>
+                className={`w-full text-[14px] font-semibold py-1.5 rounded-lg border transition-all ${"bg-[var(--t-panel)] border-[var(--t-line2)] text-[var(--t-soft)] hover:border-[var(--t-accent-line)] hover:text-[var(--t-accent)]"}`}>
                 Lead times have changed
               </button>
             )}
@@ -715,37 +757,37 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
             {plan.source === "next-order" ? (() => {
               const early = oneOff && oneOff.delta != null && oneOff.delta < 0;
               const tone = early
-                ? (lm ? "bg-sky-50 border-sky-200" : "bg-sky-950/20 border-sky-900/40")
-                : (lm ? "bg-amber-50 border-amber-200" : "bg-amber-950/20 border-amber-900/40");
+                ? ("bg-[var(--t-info-soft)] border-[var(--t-info-line)]")
+                : ("bg-[var(--t-warn-soft)] border-[var(--t-warn-line)]");
               const ink = early
-                ? (lm ? "text-sky-700" : "text-sky-300")
-                : (lm ? "text-amber-700" : "text-amber-300");
+                ? ("text-[var(--t-info)]")
+                : ("text-[var(--t-warn)]");
               return (
               <div className={`rounded-lg border px-2.5 py-2 ${tone}`}>
                 <div className="flex items-baseline gap-2">
                   <span className={`text-lg font-bold tabular-nums ${ink}`}>{plan.days}d</span>
-                  <span className={`text-[11px] ${ink}`}>
+                  <span className={`text-[14px] ${ink}`}>
                     on the next order
                     {oneOff?.delta ? ` · ${oneOff.delta > 0 ? "+" : ""}${oneOff.delta}d vs the usual ${normalPlan}d` : ""}
                   </span>
                   <button onClick={() => updateDraftMany({ slowShipment: undefined, nextLeadTime: undefined })}
-                    className={`ml-auto text-[11px] font-semibold underline ${lm ? "text-slate-500" : "text-slate-400"}`}>discard</button>
+                    className={`ml-auto text-[14px] font-semibold underline ${"text-[var(--t-dim)]"}`}>discard</button>
                 </div>
                 {plan.reason && (
-                  <div className={`text-[11px] mt-1 italic ${ink}`}>&ldquo;{plan.reason}&rdquo;</div>
+                  <div className={`text-[14px] mt-1 italic ${ink}`}>&ldquo;{plan.reason}&rdquo;</div>
                 )}
-                <div className={`text-[10px] mt-1 ${lm ? "text-slate-500" : "text-slate-500"}`}>
+                <div className={`text-[13px] mt-1 ${"text-[var(--t-dim)]"}`}>
                   {early
                     ? <>Reordering later and holding a smaller buffer until it&apos;s placed.</>
                     : <>Reordering earlier and holding a bigger buffer until it&apos;s placed.</>}
                   {" "}Raise the order and this becomes its note; discard it and nothing is kept.
                 </div>
                 <button onClick={() => setShowSlowWhy(v => !v)}
-                  className={`text-[10px] underline mt-1 ${ink}`}>
+                  className={`text-[13px] underline mt-1 ${ink}`}>
                   {showSlowWhy ? "hide" : "what happens to my history?"}
                 </button>
                 {showSlowWhy && (
-                  <div className={`text-[10px] mt-1 leading-relaxed ${lm ? "text-slate-500" : "text-slate-500"}`}>
+                  <div className={`text-[13px] mt-1 leading-relaxed ${"text-[var(--t-dim)]"}`}>
                     Nothing is excluded. When it lands it counts in this product&apos;s lead times and the
                     supplier&apos;s averages like any other delivery — because it really did take that long.
                     Protection levels stay tested against your normal{" "}
@@ -766,17 +808,17 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
               // A speed-up can't outrun the calendar: an order still takes at least a day.
               const tooFast = slowDraft.dir === "sooner" && valid && result < 1;
               return (
-              <div className={`rounded-xl border px-3 py-2.5 space-y-2 ${lm ? "bg-white border-slate-300" : "bg-slate-900/60 border-slate-700"}`}>
-                <div className={`text-[11px] font-bold ${lm ? "text-slate-800" : "text-slate-200"}`}>The next order only</div>
+              <div className={`rounded-xl border px-3 py-2.5 space-y-2 ${"bg-[var(--t-panel)] border-[var(--t-line2)]"}`}>
+                <div className={`text-[14px] font-bold ${"text-[var(--t-ink)]"}`}>The next order only</div>
                 <div className="flex items-center gap-1.5">
                   {[["later", "Arriving later"], ["sooner", "Arriving sooner"]].map(([k, label]) => (
                     <button key={k} type="button" onClick={() => setSlowDraft(x => ({ ...x, dir: k }))}
-                      className={`flex-1 text-[11px] font-semibold py-1 rounded-lg border transition-all ${
+                      className={`flex-1 text-[14px] font-semibold py-1 rounded-lg border transition-all ${
                         slowDraft.dir === k
                           ? (k === "sooner"
-                              ? (lm ? "bg-sky-100 border-sky-400 text-sky-800" : "bg-sky-950/40 border-sky-600 text-sky-200")
-                              : (lm ? "bg-amber-100 border-amber-400 text-amber-800" : "bg-amber-950/40 border-amber-600 text-amber-200"))
-                          : (lm ? "bg-white border-slate-300 text-slate-500 hover:border-slate-400" : "bg-slate-900 border-slate-700/60 text-slate-500 hover:border-slate-600")}`}>
+                              ? ("bg-[var(--t-info-soft)] border-[var(--t-info-line)] text-[var(--t-info)]")
+                              : ("bg-[var(--t-warn-soft)] border-[var(--t-warn-line)] text-[var(--t-warn)]"))
+                          : ("bg-[var(--t-panel)] border-[var(--t-line2)] text-[var(--t-dim)] hover:border-[var(--t-line2)]")}`}>
                       {label}
                     </button>
                   ))}
@@ -785,17 +827,17 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
                   <input type="number" min="1" autoFocus placeholder="days"
                     value={slowDraft.days}
                     onChange={e => setSlowDraft(x => ({ ...x, days: e.target.value }))}
-                    className={`w-20 rounded border px-1.5 py-1 text-xs ${lm ? "bg-white border-slate-300 text-slate-900" : "bg-slate-900 border-slate-700 text-slate-200"}`} />
-                  <span className={`text-[11px] ${lm ? "text-slate-500" : "text-slate-500"}`}>
+                    className={`w-20 rounded border px-1.5 py-1 text-[15px] ${"bg-[var(--t-panel)] border-[var(--t-line2)] text-[var(--t-ink)]"}`} />
+                  <span className={`text-[14px] ${"text-[var(--t-dim)]"}`}>
                     days {slowDraft.dir === "sooner" ? "sooner than" : "later than"} the usual {normalPlan}d
                   </span>
                 </div>
                 <input type="text" placeholder="what happened? (port strike, expedited freight, factory shutdown…)"
                   value={slowDraft.reason}
                   onChange={e => setSlowDraft(x => ({ ...x, reason: e.target.value }))}
-                  className={`w-full rounded border px-1.5 py-1 text-xs ${lm ? "bg-white border-slate-300 text-slate-900" : "bg-slate-900 border-slate-700 text-slate-200"}`} />
+                  className={`w-full rounded border px-1.5 py-1 text-[15px] ${"bg-[var(--t-panel)] border-[var(--t-line2)] text-[var(--t-ink)]"}`} />
                 {valid && (
-                  <div className={`text-[10px] ${tooFast ? (lm ? "text-rose-600" : "text-rose-400") : (lm ? "text-slate-600" : "text-slate-400")}`}>
+                  <div className={`text-[13px] ${tooFast ? ("text-[var(--t-bad)]") : ("text-[var(--t-soft)]")}`}>
                     {tooFast
                       ? `That's more than the whole ${normalPlan}-day wait — the next order can't arrive before it's placed.`
                       : `Planning the next order at ${result}d instead of ${normalPlan}d.`}
@@ -808,12 +850,12 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
                                                     reason: slowDraft.reason.trim(), at: todayStr() });
                       setSlowDraft({ open: false, dir: "later", days: "", reason: "" });
                     }}
-                    className={`text-[11px] font-bold px-3 py-1.5 rounded-lg transition-colors ${valid && !tooFast ? "bg-violet-700 hover:bg-violet-600 text-white" : `opacity-40 cursor-not-allowed border ${lm ? "border-slate-300 text-slate-400" : "border-slate-700 text-slate-600"}`}`}>
+                    className={`text-[14px] font-bold px-3 py-1.5 rounded-lg transition-colors ${valid && !tooFast ? "bg-[var(--t-btn-bg)] hover:bg-[var(--t-btn-bg)] text-[var(--t-btn-fg)]" : `opacity-40 cursor-not-allowed border ${"border-[var(--t-line2)] text-[var(--t-dim)]"}`}`}>
                     Save
                   </button>
                   <button onClick={() => setSlowDraft({ open: false, dir: "later", days: "", reason: "" })}
-                    className={`text-[11px] px-2 py-1.5 ${lm ? "text-slate-500 hover:text-slate-700" : "text-slate-400 hover:text-slate-200"}`}>cancel</button>
-                  <span className={`text-[10px] ml-auto text-right ${lm ? "text-slate-400" : "text-slate-600"}`}>
+                    className={`text-[14px] px-2 py-1.5 ${"text-[var(--t-dim)] hover:text-[var(--t-soft)]"}`}>cancel</button>
+                  <span className={`text-[13px] ml-auto text-right ${"text-[var(--t-dim)]"}`}>
                     The reason carries onto the order when you raise it.
                   </span>
                 </div>
@@ -821,7 +863,7 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
               );
             })() : (
               <button onClick={() => setSlowDraft({ open: true, dir: "later", days: "", reason: "" })}
-                className={`w-full text-[11px] font-semibold py-1.5 rounded-lg border transition-all ${lm ? "bg-white border-slate-300 text-slate-600 hover:border-amber-400 hover:text-amber-700" : "bg-slate-800/60 border-slate-700 text-slate-300 hover:border-amber-700 hover:text-amber-300"}`}>
+                className={`w-full text-[14px] font-semibold py-1.5 rounded-lg border transition-all ${"bg-[var(--t-panel)] border-[var(--t-line2)] text-[var(--t-soft)] hover:border-[var(--t-warn-line)] hover:text-[var(--t-warn)]"}`}>
                 Something&apos;s affecting the next order
               </button>
             )}
@@ -833,39 +875,39 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
               const activeP80   = skuSt.p80 !== null && draftParams.leadTime === skuSt.p80;
               const daysGap     = skuSt.p80 !== null && skuSt.avg !== null ? skuSt.p80 - skuSt.avg : null;
               return (
-                <div className={`rounded-xl border overflow-hidden ${lm ? "border-slate-200" : "border-slate-700/50"}`}>
+                <div className={`rounded-xl border overflow-hidden ${"border-[var(--t-line)]"}`}>
                   {/* Header */}
-                  <div className={`px-3 py-2 flex items-center justify-between ${lm ? "bg-slate-100" : "bg-slate-800/50"}`}>
-                    <span className={`text-[11px] font-bold uppercase tracking-widest ${lm ? "text-slate-500" : "text-slate-500"}`}>
+                  <div className={`px-3 py-2 flex items-center justify-between ${"bg-[var(--t-sunken)]"}`}>
+                    <span className={`text-[14px] font-bold uppercase tracking-widest ${"text-[var(--t-dim)]"}`}>
                       SKU lead times
                     </span>
-                    <span className={`text-[11px] ${lm ? "text-slate-400" : "text-slate-600"}`}>
+                    <span className={`text-[14px] ${"text-[var(--t-dim)]"}`}>
                       {skuSt.n} order{skuSt.n !== 1 ? "s" : ""}
-                      {!reliable && <span className={`ml-1.5 ${lm ? "text-amber-500" : "text-amber-400"}`}>· need ≥ 3 to apply</span>}
+                      {!reliable && <span className={`ml-1.5 ${"text-[var(--t-warn)]"}`}>· need ≥ 3 to apply</span>}
                     </span>
                   </div>
 
                   {/* Two-column comparison */}
-                  <div className={`grid ${skuSt.p80 !== null ? "grid-cols-2" : "grid-cols-1"} divide-x ${lm ? "divide-slate-200" : "divide-slate-700/50"}`}>
+                  <div className={`grid ${skuSt.p80 !== null ? "grid-cols-2" : "grid-cols-1"} divide-x ${"divide-[var(--t-line)]"}`}>
                     {/* AVG column */}
-                    <div className={`p-3 transition-colors ${activeAvg ? (lm ? "bg-slate-100" : "bg-slate-800/60") : (lm ? "bg-white" : "bg-transparent")}`}>
+                    <div className={`p-3 transition-colors ${activeAvg ? ("bg-[var(--t-sunken)]") : ("bg-[var(--t-panel)]")}`}>
                       <div className="flex items-center justify-between mb-1.5">
-                        <span className={`text-[10px] uppercase tracking-widest font-bold ${lm ? "text-slate-400" : "text-slate-500"}`}>Avg</span>
-                        {activeAvg && <span className={`text-[10px] font-semibold rounded-full px-1.5 py-0.5 ${lm ? "bg-slate-200 text-slate-600" : "bg-slate-700 text-slate-300"}`}>active</span>}
+                        <span className={`text-[13px] uppercase tracking-widest font-bold ${"text-[var(--t-dim)]"}`}>Avg</span>
+                        {activeAvg && <span className={`text-[13px] font-semibold rounded-full px-1.5 py-0.5 ${"bg-[var(--t-line)] text-[var(--t-soft)]"}`}>active</span>}
                       </div>
-                      <div className={`text-xl font-bold tabular-nums leading-none ${lm ? "text-slate-800" : "text-white"}`}>{skuSt.avg}d</div>
-                      <div className={`text-[11px] mt-1.5 leading-snug ${lm ? "text-slate-400" : "text-slate-500"}`}>
+                      <div className={`text-xl font-bold tabular-nums leading-none ${"text-[var(--t-ink)]"}`}>{skuSt.avg}d</div>
+                      <div className={`text-[14px] mt-1.5 leading-snug ${"text-[var(--t-dim)]"}`}>
                         No delay protection
                       </div>
-                      <div className={`text-[11px] ${lm ? "text-slate-400" : "text-slate-500"}`}>
+                      <div className={`text-[14px] ${"text-[var(--t-dim)]"}`}>
                         ~50% on-time
                       </div>
                       {reliable && (
                         <button onClick={() => updateDraft("leadTime", skuSt.avg)}
-                          className={`mt-2 w-full py-1 rounded-md text-[11px] font-semibold border transition-all ${
+                          className={`mt-2 w-full py-1 rounded-md text-[14px] font-semibold border transition-all ${
                             activeAvg
-                              ? (lm ? "bg-slate-200 border-slate-300 text-slate-500 cursor-default" : "bg-slate-700/50 border-slate-600 text-slate-400 cursor-default")
-                              : (lm ? "bg-white border-slate-300 text-slate-700 hover:border-slate-400" : "bg-slate-800 border-slate-700 text-slate-300 hover:border-slate-500")
+                              ? ("bg-[var(--t-line)] border-[var(--t-line2)] text-[var(--t-dim)] cursor-default")
+                              : ("bg-[var(--t-panel)] border-[var(--t-line2)] text-[var(--t-soft)] hover:border-[var(--t-line2)]")
                           }`}
                           disabled={activeAvg}>
                           {activeAvg ? "Selected" : "Use avg"}
@@ -875,24 +917,24 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
 
                     {/* P80 column */}
                     {skuSt.p80 !== null && (
-                      <div className={`p-3 transition-colors ${activeP80 ? (lm ? "bg-violet-50" : "bg-violet-950/30") : (lm ? "bg-white" : "bg-transparent")}`}>
+                      <div className={`p-3 transition-colors ${activeP80 ? ("bg-[var(--t-accent-soft)]") : ("bg-[var(--t-panel)]")}`}>
                         <div className="flex items-center justify-between mb-1.5">
-                          <span className={`text-[10px] uppercase tracking-widest font-bold ${lm ? "text-violet-500" : "text-violet-500"}`}>P80</span>
-                          {activeP80 && <span className={`text-[10px] font-semibold rounded-full px-1.5 py-0.5 ${lm ? "bg-violet-100 text-violet-700" : "bg-violet-900/60 text-violet-300"}`}>active</span>}
+                          <span className={`text-[13px] uppercase tracking-widest font-bold ${"text-[var(--t-accent)]"}`}>P80</span>
+                          {activeP80 && <span className={`text-[13px] font-semibold rounded-full px-1.5 py-0.5 ${"bg-[var(--t-accent-soft)] text-[var(--t-accent)]"}`}>active</span>}
                         </div>
-                        <div className={`text-xl font-bold tabular-nums leading-none ${lm ? "text-violet-700" : "text-violet-400"}`}>{skuSt.p80}d</div>
-                        <div className={`text-[11px] mt-1.5 leading-snug font-medium ${lm ? "text-violet-600" : "text-violet-500"}`}>
+                        <div className={`text-xl font-bold tabular-nums leading-none ${"text-[var(--t-accent)]"}`}>{skuSt.p80}d</div>
+                        <div className={`text-[14px] mt-1.5 leading-snug font-medium ${"text-[var(--t-accent)]"}`}>
                           {daysGap ? `Orders ${daysGap}d earlier` : "Earlier order"}
                         </div>
-                        <div className={`text-[11px] ${lm ? "text-slate-400" : "text-slate-500"}`}>
+                        <div className={`text-[14px] ${"text-[var(--t-dim)]"}`}>
                           80% on-time
                         </div>
                         {reliable && skuSt.p80 !== skuSt.avg && (
                           <button onClick={() => updateDraft("leadTime", skuSt.p80)}
-                            className={`mt-2 w-full py-1 rounded-md text-[11px] font-semibold border transition-all ${
+                            className={`mt-2 w-full py-1 rounded-md text-[14px] font-semibold border transition-all ${
                               activeP80
-                                ? (lm ? "bg-violet-100 border-violet-300 text-violet-600 cursor-default" : "bg-violet-900/50 border-violet-700 text-violet-300 cursor-default")
-                                : (lm ? "bg-violet-50 border-violet-300 text-violet-700 hover:bg-violet-100" : "bg-violet-950/30 border-violet-700/50 text-violet-300 hover:border-violet-500")
+                                ? ("bg-[var(--t-accent-soft)] border-[var(--t-accent-line)] text-[var(--t-accent)] cursor-default")
+                                : ("bg-[var(--t-accent-soft)] border-[var(--t-accent-line)] text-[var(--t-accent)] hover:bg-[var(--t-accent-soft)]")
                             }`}
                             disabled={activeP80}>
                             {activeP80 ? "Selected" : "Use P80 ↑"}
@@ -926,7 +968,7 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
                 <label className={lbl}>
                   <Tip text="How hard to guard against running out. When there is enough history and a unit cost, this is picked from the item's expected stockout cost versus buffer holding cost. Otherwise it falls back to the margin rule. You can override it.">Stockout Protection</Tip>
                 </label>
-                <div className={`rounded-xl border overflow-hidden ${lm ? "bg-slate-50 border-slate-200" : "bg-slate-900/40 border-slate-700/40"}`}>
+                <div className={`rounded-xl border overflow-hidden ${"bg-[var(--t-sunken)] border-[var(--t-line)]"}`}>
                   {/* While a test is running, show NOTHING — no tiers, no percentages, no
                       buffer. A provisional figure that appears and then changes invites a
                       decision the user would have to revisit, and it only stands for a few
@@ -934,19 +976,19 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
                       up on the estimate anyway: until the run finishes we don't know which. */}
                   {p.status === "calculating" ? (
                     <div className="px-3 py-4 flex items-center gap-2.5">
-                      <svg className={`h-4 w-4 animate-spin ${lm ? "text-violet-600" : "text-violet-400"}`} fill="none" viewBox="0 0 24 24">
+                      <svg className={`h-4 w-4 animate-spin ${"text-[var(--t-accent)]"}`} fill="none" viewBox="0 0 24 24">
                         <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
                         <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.4 0 0 5.4 0 12h4z" />
                       </svg>
                       <div>
-                        <div className={`text-[12px] font-semibold ${lm ? "text-slate-700" : "text-slate-200"}`}>Calculating…</div>
-                        <div className={`text-[11px] ${lm ? "text-slate-500" : "text-slate-500"}`}>
+                        <div className={`text-[15px] font-semibold ${"text-[var(--t-soft)]"}`}>Calculating…</div>
+                        <div className={`text-[14px] ${"text-[var(--t-dim)]"}`}>
                           Testing protection levels against this product&apos;s sales history. Usually a few minutes.
                         </div>
                       </div>
                     </div>
                   ) : (
-                  <div className="grid grid-cols-[repeat(auto-fit,minmax(64px,1fr))] gap-1 p-1.5">
+                  <div className="grid grid-cols-[repeat(auto-fit,minmax(96px,1fr))] gap-1.5 p-2">
                     {/* auto-fit, not a fixed column count: the tier list comes from the
                         backend and grew from 4 to 5. A hardcoded grid-cols-4 left the
                         fifth option stranded on its own row at quarter width. */}
@@ -955,14 +997,27 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
                       const isRec  = t.key === p.recommended;
                       return (
                         <button key={t.key} onClick={() => setProt(t.key)}
+                          style={active ? { boxShadow: "0 0 0 1px var(--t-accent)" } : undefined}
                           className={`relative rounded-lg px-1 py-1.5 text-center transition-all border ${active
-                            ? (lm ? "bg-violet-600 border-violet-600 text-white" : "bg-violet-500 border-violet-500 text-white")
-                            : (lm ? "bg-white border-slate-200 text-slate-600 hover:border-slate-300" : "bg-slate-900/40 border-slate-700/50 text-slate-300 hover:border-slate-600")}`}>
-                          <div className="text-[11px] font-bold leading-none">{t.label}</div>
-                          <div className={`text-[10px] font-mono mt-0.5 ${active ? "text-white/80" : (lm ? "text-slate-400" : "text-slate-500")}`}>{t.pct}%</div>
-                          {isRec && (
-                            <span className={`absolute -top-1.5 left-1/2 -translate-x-1/2 px-1 rounded-full text-[7px] uppercase tracking-wide font-bold whitespace-nowrap ${active ? "bg-white text-violet-700" : (lm ? "bg-violet-100 text-violet-700" : "bg-violet-500/20 text-violet-300")}`}>Recommended</span>
-                          )}
+                            ? ("bg-[var(--t-accent-soft)] border-[var(--t-accent)] text-[var(--t-ink)]")
+                            : isRec
+                            ? ("bg-[var(--t-panel)] border-[var(--t-accent-line)] text-[var(--t-soft)] hover:border-[var(--t-accent)]")
+                            : ("bg-[var(--t-panel)] border-[var(--t-line)] text-[var(--t-soft)] hover:border-[var(--t-line2)]")}`}>
+                          <div className="text-[14px] font-bold leading-none">{t.label}</div>
+                          <div className={`text-[13px] font-mono mt-0.5 ${active ? "text-[var(--t-accent)]" : ("text-[var(--t-dim)]")}`}>{t.pct}%</div>
+                          {/* No word inside the tile at all.
+                              It started as an absolutely-positioned pill, centred on the
+                              tile and `whitespace-nowrap`: about 110px of text laid over
+                              a 64px tile, so it covered the very label it pointed at —
+                              "90% Light" disappeared behind it. Moving it INTO the tile
+                              stopped it covering a neighbour, but then it just clipped.
+                              Measured across container widths from 300 to 700px the
+                              tiles land between 103 and 116px, depending on how many
+                              columns auto-fit picks, and the word needs 110: it fits at
+                              some widths and truncates at others, which is a coin flip
+                              rather than a fix.
+                              So the tile is marked by its BORDER, and the word is said
+                              in full on the line below, where there is room for it. */}
                         </button>
                       );
                     })}
@@ -970,26 +1025,30 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
                   )}
                   {/* Why this was chosen — suppressed entirely while a test runs. */}
                   {p.status !== "calculating" && (
-                  <div className={`px-3 py-2 text-[11px] leading-relaxed border-t ${lm ? "bg-white border-slate-200 text-slate-500" : "bg-slate-900/20 border-slate-700/40 text-slate-400"}`}>
+                  <div className={`px-3 py-2 text-[14px] leading-relaxed border-t ${"bg-[var(--t-panel)] border-[var(--t-line)] text-[var(--t-dim)]"}`}>
+                    {!p.overridden && (() => {
+                      const rec = (p.options || []).find(o => o.key === p.recommended);
+                      return rec ? <span className="font-semibold text-[var(--t-accent)]">Recommended: {rec.label} ({rec.pct}%). </span> : null;
+                    })()}
                     {p.overridden
-                      ? <><span className="font-semibold">Manual override.</span> {p.reason} <button onClick={() => setProt(p.recommended)} className={`underline ${lm ? "text-violet-600" : "text-violet-400"}`}>Reset to recommended</button></>
+                      ? <><span className="font-semibold">Manual override.</span> {p.reason} <button onClick={() => setProt(p.recommended)} className={`underline ${"text-[var(--t-accent)]"}`}>Reset to recommended</button></>
                       : p.reason}
                     {/* Why this product isn't on measured data. "Provisional" alone read
                         identically whether the cause was thin history, a missing cost, a
                         pricing problem, or a test still running. */}
                     {p.provisional && p.whyProvisional && (
-                      <div className={`mt-1.5 text-[10px] rounded-md px-2 py-1.5 leading-relaxed ${lm ? "bg-amber-50 text-amber-700" : "bg-amber-950/20 text-amber-400"}`}>
+                      <div className={`mt-1.5 text-[13px] rounded-md px-2 py-1.5 leading-relaxed ${"bg-[var(--t-warn-soft)] text-[var(--t-warn)]"}`}>
                         <span className="font-semibold">Why this isn&apos;t measured yet: </span>{p.whyProvisional}
                       </div>
                     )}
                     {p.economics?.tiers?.length > 0 && p.source === "economics" && (
-                      <div className={`mt-1.5 text-[10px] ${lm ? "text-slate-400" : "text-slate-500"}`}>
+                      <div className={`mt-1.5 text-[13px] ${"text-[var(--t-dim)]"}`}>
                         Meanwhile: estimated from margin ${p.economics.marginUnit}/unit and {p.economics.holdingPct}%/yr holding,
                         assuming demand error is well behaved.
                       </div>
                     )}
                     {p.source === "backtest" && p.economics && (
-                      <div className={`mt-1.5 text-[10px] ${lm ? "text-slate-400" : "text-slate-500"}`}>
+                      <div className={`mt-1.5 text-[13px] ${"text-[var(--t-dim)]"}`}>
                         Backtest winner · {p.economics.windows} tests · holding {p.economics.holdingPct}%/yr
                       </div>
                     )}
@@ -997,22 +1056,22 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
                   )}
                   {/* Stats footer */}
                   {p.status !== "calculating" && disp != null && (
-                    <div className={`divide-y ${lm ? "divide-slate-100 border-t border-slate-200" : "divide-slate-700/30 border-t border-slate-700/40"}`}>
-                      <div className={`flex items-center justify-between px-3 py-1.5 text-[11px] ${lm ? "bg-white" : "bg-slate-900/20"}`}>
+                    <div className={`divide-y ${"divide-[var(--t-line)] border-t border-[var(--t-line)]"}`}>
+                      <div className={`flex items-center justify-between px-3 py-1.5 text-[14px] ${"bg-[var(--t-panel)]"}`}>
                         <Tip text={`Swing in daily sales after trend and seasonality are removed, measured against the randomness any product this size carries anyway. 1.0x is as steady as that sales volume permits; past 2.0x it moves more than its size explains.${sigObs != null && refRate ? ` Here that is about ±${sigObs.toFixed(1)} a day on ${refRate.toFixed(1)} a day.` : ""} The buffer is sized from that raw swing in units, accumulated over a lead time — not from this ratio, which divides the swing by product size so that two products of different sizes can be compared. Bigger swing means a bigger buffer; a higher ratio does not, on its own.`}>
-                          <span className={lm ? "text-slate-400" : "text-slate-600"}>Sales volatility</span>
+                          <span className={"text-[var(--t-dim)]"}>Sales volatility</span>
                         </Tip>
-                        <span className={`font-mono font-bold ${lm ? "text-slate-600" : "text-slate-300"}`}>{disp.toFixed(1)}x{mlData.demandVolatilityLabel ? ` · ${mlData.demandVolatilityLabel}` : ""}</span>
+                        <span className={`font-mono font-bold ${"text-[var(--t-soft)]"}`}>{disp.toFixed(1)}x{mlData.demandVolatilityLabel ? ` · ${mlData.demandVolatilityLabel}` : ""}</span>
                       </div>
-                      <div className={`flex items-center justify-between px-3 py-1.5 text-[11px] ${lm ? "bg-white" : "bg-slate-900/20"}`}>
+                      <div className={`flex items-center justify-between px-3 py-1.5 text-[14px] ${"bg-[var(--t-panel)]"}`}>
                         <Tip text={`Protection level: the probability of not stocking out during a replenishment cycle. z=${zScore?.toFixed(3)} is the standard normal score for ${p.servicePct}%.`}>
-                          <span className={lm ? "text-slate-400" : "text-slate-600"}>Protection (z={zScore?.toFixed(2)})</span>
+                          <span className={"text-[var(--t-dim)]"}>Protection (z={zScore?.toFixed(2)})</span>
                         </Tip>
-                        <span className={`font-mono font-bold ${lm ? "text-violet-600" : "text-violet-300"}`}>{p.status === "calculating" ? "calculating…" : `${p.servicePct}%${p.status === "stale" ? " · re-testing" : p.source === "backtest" ? " · tested" : p.source === "economics" ? " · provisional" : p.marginPct != null ? ` · ${Math.round(p.marginPct)}% margin` : ""}`}</span>
+                        <span className={`font-mono font-bold ${"text-[var(--t-accent)]"}`}>{p.status === "calculating" ? "calculating…" : `${p.servicePct}%${p.achievedPct != null ? ` → ${p.achievedPct}% measured` : ""}${p.status === "stale" ? " · re-testing" : p.source === "backtest" ? " · tested" : p.source === "economics" ? " · provisional" : p.marginPct != null ? ` · ${Math.round(p.marginPct)}% margin` : ""}`}</span>
                       </div>
                       {/* Show details: plain-English buffer math */}
                       <button onClick={() => setShowBufferMath(v => !v)}
-                        className={`w-full flex items-center justify-between px-3 py-1.5 text-[11px] font-semibold ${lm ? "text-violet-600 hover:bg-slate-50" : "text-violet-400 hover:bg-slate-800/40"}`}>
+                        className={`w-full flex items-center justify-between px-3 py-1.5 text-[14px] font-semibold ${"text-[var(--t-accent)] hover:bg-[var(--t-sunken)]"}`}>
                         <span>{showBufferMath ? "Hide" : "Show"} how this buffer was calculated</span>
                         <svg className={`h-3 w-3 transition-transform ${showBufferMath ? "rotate-180" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" /></svg>
                       </button>
@@ -1020,8 +1079,8 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
                         const sigma = mlData.residualStd;
                         const lt    = draftParams.leadTime;
                         const rootL = lt != null ? Math.sqrt(lt) : null;
-                        const rowC  = lm ? "text-slate-500" : "text-slate-400";
-                        const valC  = lm ? "text-slate-700" : "text-slate-200";
+                        const rowC  = "text-[var(--t-dim)]";
+                        const valC  = "text-[var(--t-soft)]";
                         // The buffer is protection × the demand SWING over the whole lead-time wait.
                         // We use the larger of: the day-swing stretched by √lead (the floor), or the
                         // swing MEASURED over real lead-time windows (bigger when demand clumps). Back
@@ -1030,14 +1089,14 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
                         const usedSpread = (zScore && mlData.safetyStock != null) ? mlData.safetyStock / zScore : formulaSpread;
                         const widened = (usedSpread != null && formulaSpread != null) && usedSpread > formulaSpread * 1.08;
                         return (
-                          <div className={`px-3 py-2.5 space-y-1.5 text-[11px] ${lm ? "bg-slate-50" : "bg-slate-900/40"}`}>
+                          <div className={`px-3 py-2.5 space-y-1.5 text-[14px] ${"bg-[var(--t-sunken)]"}`}>
                             <div className={`flex justify-between ${rowC}`}><span>Typical demand</span><span className={`font-mono ${valC}`}>~{mlData.avgDailyDemand}/day{mlData.avgDailyDemand < 1 ? ` (~${Math.round(mlData.avgDailyDemand * 30)}/mo)` : ""}</span></div>
                             <div className={`flex justify-between ${rowC}`}><span>Day-to-day swing (σ)</span><span className={`font-mono ${valC}`}>±{sigma}/day</span></div>
                             <div className={`flex justify-between ${rowC}`}><span>Swing over the {lt}-day wait</span><span className={`font-mono ${valC}`}>±{usedSpread?.toFixed(1)} {widened ? "(measured)" : `≈ σ×√${lt}`}</span></div>
                             <div className={`flex justify-between ${rowC}`}><span>Protection factor</span><span className={`font-mono ${valC}`}>×{zScore?.toFixed(2)} ({p.servicePct}%)</span></div>
-                            <div className={`flex justify-between font-semibold border-t pt-1.5 ${lm ? "border-slate-200 text-slate-700" : "border-slate-700/50 text-slate-200"}`}><span>Buffer held</span><span className="font-mono">{mlData.safetyStock} units</span></div>
-                            <p className={`pt-1 leading-relaxed ${lm ? "text-slate-400" : "text-slate-500"}`}>
-                              We hold <span className="font-semibold">{mlData.safetyStock}</span> spare units so demand swings during the {lt}-day wait for a reorder won't run you out about {p.servicePct}% of the time. That swing is measured from how far past forecasts actually missed over real {lt}-day stretches{widened ? " — and because this item's sales come in clumps, it's wider than a steady seller's, so it earns extra buffer" : ", and here it lines up with the usual day-to-day swing stretched over the wait"}. A noisier or clumpier item, or a longer lead time, raises this; a steady one lowers it.
+                            <div className={`flex justify-between font-semibold border-t pt-1.5 ${"border-[var(--t-line)] text-[var(--t-soft)]"}`}><span>Buffer held</span><span className="font-mono">{mlData.safetyStock} units</span></div>
+                            <p className={`pt-1 leading-relaxed ${"text-[var(--t-dim)]"}`}>
+                              We hold <span className="font-semibold">{mlData.safetyStock}</span> spare units, aiming to cover demand swings during the {lt}-day wait about {p.servicePct}% of the time{p.achievedPct != null ? ` — replayed against your own history it came out at ${p.achievedPct}%, because the buffer is sized from a bell curve and real demand has a longer tail` : ""}. That swing is measured from how far past forecasts actually missed over real {lt}-day stretches{widened ? " — and because this item's sales come in clumps, it's wider than a steady seller's, so it earns extra buffer" : ", and here it lines up with the usual day-to-day swing stretched over the wait"}. A noisier or clumpier item, or a longer lead time, raises this; a steady one lowers it.
                             </p>
                           </div>
                         );
@@ -1072,19 +1131,19 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
               // Gap = days you'll be out of stock before this order can land (overdue only).
               const gapDays = Math.max(0, deliveryOffset - mlData.daysUntilStockout);
               return (
-                <div className={`rounded-xl border overflow-hidden ${lm ? "border-slate-200" : "border-slate-700/50"}`}>
-                  <div className={`px-3 py-2 flex items-center justify-between ${lm ? "bg-white" : "bg-transparent"}`}>
-                    <span className={`text-[11px] ${lm ? "text-slate-400" : "text-slate-500"}`}>Covered from</span>
-                    <span className={`text-[11px] font-semibold tabular-nums ${lm ? "text-slate-700" : "text-slate-300"}`}>{fmt(deliveryDate)}</span>
-                    <span className={`text-[11px] ${lm ? "text-slate-300" : "text-slate-600"}`}>→</span>
-                    <span className={`text-[11px] font-semibold tabular-nums ${lm ? "text-slate-700" : "text-slate-300"}`}>{fmt(coverageEnd)}</span>
+                <div className={`rounded-xl border overflow-hidden ${"border-[var(--t-line)]"}`}>
+                  <div className={`px-3 py-2 flex items-center justify-between ${"bg-[var(--t-panel)]"}`}>
+                    <span className={`text-[14px] ${"text-[var(--t-dim)]"}`}>Covered from</span>
+                    <span className={`text-[14px] font-semibold tabular-nums ${"text-[var(--t-soft)]"}`}>{fmt(deliveryDate)}</span>
+                    <span className={`text-[14px] ${"text-[var(--t-soft)]"}`}>→</span>
+                    <span className={`text-[14px] font-semibold tabular-nums ${"text-[var(--t-soft)]"}`}>{fmt(coverageEnd)}</span>
                   </div>
                   {gapDays > 0 && (
-                    <div className={`px-3 py-1.5 border-t text-[11px] leading-relaxed ${lm ? "border-rose-100 bg-rose-50 text-rose-600" : "border-rose-900/30 bg-rose-950/20 text-rose-300"}`}>
+                    <div className={`px-3 py-1.5 border-t text-[14px] leading-relaxed ${"border-[var(--t-bad-line)] bg-[var(--t-bad-soft)] text-[var(--t-bad)]"}`}>
                       ⚠ Even ordering today, stock won't arrive until {fmt(deliveryDate)} — expect ~{gapDays} day{gapDays !== 1 ? "s" : ""} out of stock before then.
                     </div>
                   )}
-                  <div className={`px-3 py-1.5 border-t text-[11px] leading-relaxed ${lm ? "border-slate-100 bg-slate-50 text-slate-400" : "border-slate-700/30 bg-slate-800/20 text-slate-600"}`}>
+                  <div className={`px-3 py-1.5 border-t text-[14px] leading-relaxed ${"border-[var(--t-line)] bg-[var(--t-sunken)] text-[var(--t-dim)]"}`}>
                     Estimated from current forecast. Actual window may vary — demand above forecast shortens it, below extends it. Delivery delays shift the start date.
                   </div>
                 </div>
@@ -1100,7 +1159,7 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
             <div className="flex gap-1.5">
               {[1, 2, 3].map(m => (
                 <button key={m} onClick={() => updateDraft("months", m)}
-                  className={`flex-1 py-2 rounded-lg text-sm font-bold border transition-all ${draftParams.months === m ? moBtnActive : moBtnInactive}`}>
+                  className={`flex-1 py-2 rounded-lg text-[16.5px] font-bold border transition-all ${draftParams.months === m ? moBtnActive : moBtnInactive}`}>
                   {m}mo
                 </button>
               ))}
@@ -1109,8 +1168,8 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
         </div>
 
         {loading && (
-          <div className={`text-[11px] font-mono p-2 rounded-lg flex items-center gap-2 ${lm ? "text-amber-700 bg-amber-50 border border-amber-200" : "text-amber-400 bg-amber-950/20 border border-amber-900/30"}`}>
-            <div className="h-2 w-2 border-2 border-amber-400 border-t-transparent rounded-full animate-spin" />
+          <div className={`text-[14px] font-mono p-2 rounded-lg flex items-center gap-2 ${"text-[var(--t-warn)] bg-[var(--t-warn-soft)] border border-[var(--t-warn-line)]"}`}>
+            <div className="h-2 w-2 border-2 border-[var(--t-warn-line)] border-t-transparent rounded-full animate-spin" />
             Recalculating…
           </div>
         )}
@@ -1118,25 +1177,25 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
         {hasOpenPO && (
           <div className={`${poCard} border rounded-xl p-3 space-y-1.5`}>
             <div className="flex items-center gap-1.5">
-              <div className="h-1.5 w-1.5 rounded-full bg-violet-500" />
-              <span className={`text-[11px] font-bold uppercase tracking-widest ${poHead}`}>Order In Transit</span>
+              <div className="h-1.5 w-1.5 rounded-full bg-[var(--t-accent)]" />
+              <span className={`text-[14px] font-bold uppercase tracking-widest ${poHead}`}>Order In Transit</span>
             </div>
-            <div className={`text-xs ${poText} space-y-0.5 font-mono`}>
+            <div className={`text-[15px] ${poText} space-y-0.5 font-mono`}>
               <div>{openPO.qty.toLocaleString()} units</div>
               <div>Est. delivery <span className={textMain}>{isoToDisplay(openPO.delivery)}</span></div>
               {openPO.supplier && <div className={textMuted}>{openPO.supplier}</div>}
             </div>
-            <button onClick={() => setShowPoModal(true)} className={`text-[11px] ${lm ? "text-violet-600 hover:text-violet-800" : "text-violet-400 hover:text-violet-300"} transition-colors`}>Edit / Mark received →</button>
+            <button onClick={() => setShowPoModal(true)} className={`text-[14px] ${"text-[var(--t-accent)] hover:text-[var(--t-accent)]"} transition-colors`}>Edit / Mark received →</button>
           </div>
         )}
 
         <div className={`border-t ${divider} pt-4 space-y-2`}>
           <div className={`${infoHead} mb-1`}>Model Info</div>
           {[
-            ["Yearly pattern",  mlData.activeYearly ? "Detected" : "—",       mlData.activeYearly ? (lm ? "text-emerald-700" : "text-emerald-400") : ""],
-            ["Weekly pattern",  mlData.activeWeekly ? "Detected" : "—",       mlData.activeWeekly ? (lm ? "text-emerald-700" : "text-emerald-400") : ""],
+            ["Yearly pattern",  mlData.activeYearly ? "Detected" : "—",       mlData.activeYearly ? ("text-[var(--t-good)]") : ""],
+            ["Weekly pattern",  mlData.activeWeekly ? "Detected" : "—",       mlData.activeWeekly ? ("text-[var(--t-good)]") : ""],
             ...(mlData.priceModeled ? [["Price tracking",  mlData.priceWellSampled ? "Active" : "Limited",
-              mlData.priceWellSampled ? (lm ? "text-emerald-700" : "text-emerald-400") : (lm ? "text-amber-700" : "text-amber-400")]] : []),
+              mlData.priceWellSampled ? ("text-[var(--t-good)]") : ("text-[var(--t-warn)]")]] : []),
             ["History",         `${mlData.daysOfHistory}d`,                   infoVal],
             ["Total sold",      mlData.totalUnitsSold?.toLocaleString(),       infoVal],
           ].map(([k, v, c]) => (
@@ -1145,7 +1204,7 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
             </div>
           ))}
           {mlData.stockoutRowsDropped > 0 && (
-            <div className={`flex justify-between text-[11px] ${lm ? "text-amber-600" : "text-amber-600"}`}>
+            <div className={`flex justify-between text-[14px] ${"text-[var(--t-warn)]"}`}>
               <span>Zero-stock days excluded</span><span>{mlData.stockoutRowsDropped}</span>
             </div>
           )}
@@ -1153,7 +1212,7 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
             <div className={`flex justify-between ${infoLabel}`}><span>Current price</span><span className={infoVal}>${(mlData.currentPrice ?? mlData.lastPrice).toFixed(2)}</span></div>
           )}
           {mlData.events?.length > 0 && (
-            <div className={`flex justify-between ${infoLabel}`}><span>Events logged</span><span className={lm ? "text-violet-700" : "text-violet-400"}>{mlData.events.length}</span></div>
+            <div className={`flex justify-between ${infoLabel}`}><span>Events logged</span><span className={"text-[var(--t-accent)]"}>{mlData.events.length}</span></div>
           )}
         </div>
       
@@ -1165,17 +1224,17 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
         <div className="flex items-start justify-between gap-4">
           <div>
             <h2 className={`text-xl font-bold ${textMain} tracking-tight`}>{mlData.skuName}</h2>
-            <p className={`text-xs ${textMuted} font-mono mt-1`}>{mlData.skuId} · {mlData.filename || "—"}</p>
+            <p className={`text-[15px] ${textMuted} font-mono mt-1`}>{mlData.skuId} · {mlData.filename || "—"}</p>
           </div>
           <div className="flex items-center gap-2 flex-wrap justify-end">
             <button onClick={onExport} disabled={!!exporting} title="Download this SKU's forecast, daily projection, and monthly breakdown as Excel"
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-emerald-600 hover:bg-emerald-500 disabled:opacity-60 text-white transition-all">
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[15px] font-semibold bg-[var(--t-btn-bg)] hover:bg-[var(--t-btn-bg)] disabled:opacity-60 text-[var(--t-btn-fg)] transition-all">
               <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2M7 10l5 5 5-5M12 15V3" /></svg>
               {exporting ? "Preparing…" : "Export"}
             </button>
             {mlData.forecastDetails && (
               <button onClick={() => setShowForecastDetails(true)} title="See how this forecast was produced"
-                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold border transition-all ${lm ? "bg-white border-slate-300 text-violet-600 hover:border-violet-400 hover:text-violet-700" : "bg-slate-900 border-slate-700 text-violet-400 hover:text-violet-300 hover:border-violet-700"}`}>
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[15px] font-semibold border transition-all ${"bg-[var(--t-panel)] border-[var(--t-line2)] text-[var(--t-accent)] hover:border-[var(--t-accent-line)] hover:text-[var(--t-accent)]"}`}>
                 <svg className="h-3 w-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                 </svg>
@@ -1183,10 +1242,10 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
               </button>
             )}
             <button onClick={() => setShowEvents(true)}
-              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold border transition-all ${
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[15px] font-semibold border transition-all ${
                 mlData.events?.length > 0
-                  ? (lm ? "bg-violet-50 border-violet-300 text-violet-700 hover:border-violet-400" : "bg-violet-950/30 border-violet-800/50 text-violet-300 hover:border-violet-600")
-                  : (lm ? "bg-white border-slate-300 text-slate-600 hover:border-slate-400 hover:text-slate-800" : "bg-slate-900 border-slate-700 text-slate-400 hover:text-slate-200 hover:border-slate-600")
+                  ? ("bg-[var(--t-accent-soft)] border-[var(--t-accent-line)] text-[var(--t-accent)] hover:border-[var(--t-accent-line)]")
+                  : ("bg-[var(--t-panel)] border-[var(--t-line2)] text-[var(--t-soft)] hover:border-[var(--t-line2)] hover:text-[var(--t-ink)]")
               }`}>
               <svg className="h-3 w-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M7 7h.01M7 3h5c.512 0 1.024.195 1.414.586l7 7a2 2 0 010 2.828l-7 7a2 2 0 01-2.828 0l-7-7A1.994 1.994 0 013 12V7a4 4 0 014-4z" />
@@ -1195,7 +1254,7 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
             </button>
             {!hasOpenPO && (
               <button onClick={() => setShowPoModal(true)}
-                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold border transition-all ${lm ? "bg-white border-slate-300 text-slate-600 hover:border-slate-400 hover:text-slate-800" : "bg-slate-900 border-slate-700 text-slate-400 hover:text-slate-200 hover:border-slate-600"}`}>
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[15px] font-semibold border transition-all ${"bg-[var(--t-panel)] border-[var(--t-line2)] text-[var(--t-soft)] hover:border-[var(--t-line2)] hover:text-[var(--t-ink)]"}`}>
                 <svg className="h-3 w-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M20 13V6a2 2 0 00-2-2H6a2 2 0 00-2 2v7m16 0v5a2 2 0 01-2 2H6a2 2 0 01-2-2v-5m16 0h-2.586a1 1 0 00-.707.293l-2.414 2.414a1 1 0 01-.707.293h-3.172a1 1 0 01-.707-.293l-2.414-2.414A1 1 0 006.586 13H4" />
                 </svg>
@@ -1203,16 +1262,16 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
               </button>
             )}
             <div className={`h-2 w-2 rounded-full ${statusCfg.dot}`} />
-            <span className={`text-xs ${textMuted}`}>{statusCfg.label}</span>
+            <span className={`text-[15px] ${textMuted}`}>{statusCfg.label}</span>
           </div>
         </div>
 
         {mlData.hasPrice && !mlData.priceModeled && (
-          <div className={`border rounded-2xl p-4 flex items-start gap-3 ${lm ? "bg-amber-50 border-amber-300" : "bg-amber-950/20 border-amber-900/40"}`}>
+          <div className={`border rounded-2xl p-4 flex items-start gap-3 ${"bg-[var(--t-warn-soft)] border-[var(--t-warn-line)]"}`}>
             <span className="text-base mt-0.5 shrink-0">⚠️</span>
             <div>
-              <div className={`text-sm font-bold mb-1 ${lm ? "text-amber-700" : "text-amber-300"}`}>PRICE SENSITIVITY UNAVAILABLE</div>
-              <p className={`text-xs leading-relaxed ${lm ? "text-amber-700" : "text-amber-300/70"}`}>
+              <div className={`text-[16.5px] font-bold mb-1 ${"text-[var(--t-warn)]"}`}>PRICE SENSITIVITY UNAVAILABLE</div>
+              <p className={`text-[15px] leading-relaxed ${"text-[var(--t-warn)]"}`}>
                 This product is forecast by <span className="font-semibold">{mlData.winningModel}</span> because it's new/sparse with no established history to learn a price response from.
                 Price effects can't be estimated reliably here, so price history, ranges, the safe-extrapolation zone, and the effect of price changes are hidden to avoid implying a precision that isn't there.
                 Price still feeds margin in the scorecard — it just doesn't move this forecast. Once the product builds up history (or is grouped with priced siblings), it can route to a price-aware model.
@@ -1226,20 +1285,20 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
           return (
             <div className={`border rounded-2xl p-4 flex items-start gap-3 ${
               isInfo
-                ? lm ? "bg-violet-50 border-violet-300"    : "bg-violet-950/20 border-violet-900/30"
-                : lm ? "bg-orange-50 border-orange-300" : "bg-orange-950/20 border-orange-900/30"
+                ? "bg-[var(--t-accent-soft)] border-[var(--t-accent-line)]"
+                : "bg-[var(--t-warn-soft)] border-[var(--t-warn-line)]"
             }`}>
               <span className="text-base mt-0.5 shrink-0">{isInfo ? "ℹ️" : "⚠️"}</span>
               <div>
-                <div className={`text-sm font-bold mb-1 ${
+                <div className={`text-[16.5px] font-bold mb-1 ${
                   isInfo
-                    ? lm ? "text-violet-700"    : "text-violet-300"
-                    : lm ? "text-orange-700" : "text-orange-300"
+                    ? "text-[var(--t-accent)]"
+                    : "text-[var(--t-warn)]"
                 }`}>{isInfo ? "PRICE NOT DIRECTLY OBSERVED" : "PRICE OUTSIDE HISTORICAL RANGE"}</div>
-                <p className={`text-xs leading-relaxed ${
+                <p className={`text-[15px] leading-relaxed ${
                   isInfo
-                    ? lm ? "text-violet-600"    : "text-violet-300/70"
-                    : lm ? "text-orange-600" : "text-orange-300/70"
+                    ? "text-[var(--t-accent)]"
+                    : "text-[var(--t-warn)]"
                 }`}>{mlData.priceChangeMessage}</p>
               </div>
             </div>
@@ -1247,46 +1306,46 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
         })()}
 
         {hasOpenPO && (
-          <div className={`border rounded-2xl p-4 flex items-start gap-3 ${lm ? "bg-violet-50 border-violet-300" : "bg-violet-950/20 border-violet-900/30"}`}>
+          <div className={`border rounded-2xl p-4 flex items-start gap-3 ${"bg-[var(--t-accent-soft)] border-[var(--t-accent-line)]"}`}>
             <span className="text-base mt-0.5 shrink-0">📦</span>
             <div className="flex-1">
-              <div className={`text-sm font-bold mb-1 ${lm ? "text-violet-700" : "text-violet-300"}`}>ORDER IN TRANSIT — REORDER ALERT SUPPRESSED</div>
-              <p className={`text-xs leading-relaxed ${lm ? "text-violet-600" : "text-violet-300/70"}`}>
+              <div className={`text-[16.5px] font-bold mb-1 ${"text-[var(--t-accent)]"}`}>ORDER IN TRANSIT — REORDER ALERT SUPPRESSED</div>
+              <p className={`text-[15px] leading-relaxed ${"text-[var(--t-accent)]"}`}>
                 <span className={`font-semibold ${textMain}`}>{openPO.qty.toLocaleString()} units</span>
                 {openPO.supplier ? ` ordered from ${openPO.supplier}` : " on order"}.
                 Expected delivery: <span className={`font-semibold ${textMain}`}>{isoToDisplay(openPO.delivery)}</span>.
               </p>
             </div>
-            <button onClick={() => setShowPoModal(true)} className={`text-[11px] border rounded-lg px-2 py-1 transition-colors shrink-0 ${lm ? "text-violet-600 border-violet-300 hover:bg-violet-100" : "text-violet-400 border-violet-800/40 hover:text-violet-300"}`}>Edit</button>
+            <button onClick={() => setShowPoModal(true)} className={`text-[14px] border rounded-lg px-2 py-1 transition-colors shrink-0 ${"text-[var(--t-accent)] border-[var(--t-accent-line)] hover:bg-[var(--t-accent-soft)]"}`}>Edit</button>
           </div>
         )}
 
         {mlData.inactive && (
-          <div className={`border rounded-2xl p-4 flex items-start gap-3 ${lm ? "bg-slate-100 border-slate-300" : "bg-slate-800/40 border-slate-600/50"}`}>
+          <div className={`border rounded-2xl p-4 flex items-start gap-3 ${"bg-[var(--t-sunken)] border-[var(--t-line2)]"}`}>
             <span className="text-base mt-0.5 shrink-0">💤</span>
             <div className="flex-1">
-              <div className={`text-sm font-bold mb-1 ${lm ? "text-slate-700" : "text-slate-200"}`}>INACTIVE — likely discontinued</div>
-              <p className={`text-xs leading-relaxed ${lm ? "text-slate-600" : "text-slate-400"}`}>{mlData.inactiveMessage}</p>
+              <div className={`text-[16.5px] font-bold mb-1 ${"text-[var(--t-soft)]"}`}>INACTIVE — likely discontinued</div>
+              <p className={`text-[15px] leading-relaxed ${"text-[var(--t-soft)]"}`}>{mlData.inactiveMessage}</p>
             </div>
           </div>
         )}
 
         {mlData.tooNew && (
-          <div className={`border rounded-2xl p-4 flex items-start gap-3 ${lm ? "bg-violet-50 border-violet-200" : "bg-violet-950/20 border-violet-900/40"}`}>
+          <div className={`border rounded-2xl p-4 flex items-start gap-3 ${"bg-[var(--t-accent-soft)] border-[var(--t-accent-line)]"}`}>
             <span className="text-base mt-0.5 shrink-0">🌱</span>
             <div className="flex-1">
-              <div className={`text-sm font-bold mb-1 ${lm ? "text-violet-700" : "text-violet-300"}`}>ESTABLISHING BASELINE — {mlData.ownDays} of {mlData.baselineDays} days</div>
-              <p className={`text-xs leading-relaxed ${lm ? "text-violet-700/80" : "text-violet-300/70"}`}>{mlData.tooNewMessage}</p>
+              <div className={`text-[16.5px] font-bold mb-1 ${"text-[var(--t-accent)]"}`}>ESTABLISHING BASELINE — {mlData.ownDays} of {mlData.baselineDays} days</div>
+              <p className={`text-[15px] leading-relaxed ${"text-[var(--t-accent)]"}`}>{mlData.tooNewMessage}</p>
             </div>
           </div>
         )}
 
         {mlData.young && (
-          <div className={`border rounded-2xl p-4 flex items-start gap-3 ${lm ? "bg-amber-50 border-amber-200" : "bg-amber-950/15 border-amber-900/30"}`}>
+          <div className={`border rounded-2xl p-4 flex items-start gap-3 ${"bg-[var(--t-warn-soft)] border-[var(--t-warn-line)]"}`}>
             <span className="text-base mt-0.5 shrink-0">🌿</span>
             <div className="flex-1">
-              <div className={`text-sm font-bold mb-1 ${lm ? "text-amber-700" : "text-amber-300"}`}>YOUNG PRODUCT — {mlData.ownDays} of {mlData.youngThreshold} days · forecast is provisional</div>
-              <p className={`text-xs leading-relaxed ${lm ? "text-amber-700/80" : "text-amber-300/70"}`}>
+              <div className={`text-[16.5px] font-bold mb-1 ${"text-[var(--t-warn)]"}`}>YOUNG PRODUCT — {mlData.ownDays} of {mlData.youngThreshold} days · forecast is provisional</div>
+              <p className={`text-[15px] leading-relaxed ${"text-[var(--t-warn)]"}`}>
                 {mlData.youngMessage}
                 {showReorder ? ` Heads-up: at this early pace, stock looks like it'll run low around ${formatDate(mlData.daysUntilStockout)} — consider ordering ~${mlData.orderQty?.toLocaleString()} when you're ready. It's not a hard deadline yet; the estimate firms up as more sales come in.` : ""}
               </p>
@@ -1295,27 +1354,27 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
         )}
 
         {showReorder && !mlData.young && (urgency === "critical" ? (
-          <div className={`border rounded-2xl p-4 flex items-start gap-3 ${lm ? "bg-red-50 border-red-300" : "bg-red-950/25 border-red-900/40"}`}>
+          <div className={`border rounded-2xl p-4 flex items-start gap-3 ${"bg-[var(--t-bad-soft)] border-[var(--t-bad-line)]"}`}>
             <span className="text-base mt-0.5 shrink-0">🚨</span>
             <div className="flex-1">
-              <div className={`text-sm font-bold mb-1 ${lm ? "text-red-700" : "text-red-300"}`}>{mlData.daysUntilReorder === 0 ? "REORDER DUE TODAY" : `REORDER OVERDUE — ${Math.abs(mlData.daysUntilReorder)} day${Math.abs(mlData.daysUntilReorder) !== 1 ? "s" : ""} ago`}</div>
-              <p className={`text-xs leading-relaxed ${lm ? "text-red-600" : "text-red-300/70"}`}>
+              <div className={`text-[16.5px] font-bold mb-1 ${"text-[var(--t-bad)]"}`}>{mlData.daysUntilReorder === 0 ? "REORDER DUE TODAY" : `REORDER OVERDUE — ${Math.abs(mlData.daysUntilReorder)} day${Math.abs(mlData.daysUntilReorder) !== 1 ? "s" : ""} ago`}</div>
+              <p className={`text-[15px] leading-relaxed ${"text-[var(--t-bad)]"}`}>
                 {mlData.daysUntilReorder === 0 ? "Today is your reorder deadline." : "Your reorder deadline has passed."} Stock projected to run out <span className={`font-semibold ${textMain}`}>{formatDate(mlData.daysUntilStockout)}</span>. Place your order immediately.
               </p>
             </div>
-            <button onClick={() => setShowPoModal(true)} className={`text-[11px] border rounded-lg px-2 py-1 transition-colors shrink-0 ${lm ? "text-red-600 border-red-300 hover:bg-red-100" : "text-red-300 border-red-800/50 hover:text-white"}`}>Mark Ordered</button>
+            <button onClick={() => setShowPoModal(true)} className={`text-[14px] border rounded-lg px-2 py-1 transition-colors shrink-0 ${"text-[var(--t-bad)] border-[var(--t-bad-line)] hover:bg-[var(--t-bad-soft)]"}`}>Mark Ordered</button>
           </div>
         ) : (
-          <div className={`border rounded-2xl p-4 flex items-start gap-3 ${lm ? "bg-amber-50 border-amber-300" : "bg-amber-950/15 border-amber-900/30"}`}>
+          <div className={`border rounded-2xl p-4 flex items-start gap-3 ${"bg-[var(--t-warn-soft)] border-[var(--t-warn-line)]"}`}>
             <span className="text-base mt-0.5 shrink-0">⚠️</span>
             <div className="flex-1">
-              <div className={`text-sm font-bold mb-1 ${lm ? "text-amber-700" : "text-amber-300"}`}>UPCOMING REORDER — {mlData.daysUntilReorder} days</div>
-              <p className={`text-xs leading-relaxed ${lm ? "text-amber-600" : "text-amber-300/70"}`}>
+              <div className={`text-[16.5px] font-bold mb-1 ${"text-[var(--t-warn)]"}`}>UPCOMING REORDER — {mlData.daysUntilReorder} days</div>
+              <p className={`text-[15px] leading-relaxed ${"text-[var(--t-warn)]"}`}>
                 Place order by <span className={`font-semibold ${textMain}`}>{formatDate(mlData.daysUntilReorder)}</span> to cover your {params.leadTime}-day lead time.
                 Stockout projected <span className={`font-semibold ${textMain}`}>{formatDate(mlData.daysUntilStockout)}</span>.
               </p>
             </div>
-            <button onClick={() => setShowPoModal(true)} className={`text-[11px] border rounded-lg px-2 py-1 transition-colors shrink-0 ${lm ? "text-amber-700 border-amber-300 hover:bg-amber-100" : "text-amber-300 border-amber-800/50 hover:text-white"}`}>Mark Ordered</button>
+            <button onClick={() => setShowPoModal(true)} className={`text-[14px] border rounded-lg px-2 py-1 transition-colors shrink-0 ${"text-[var(--t-warn)] border-[var(--t-warn-line)] hover:bg-[var(--t-warn-soft)]"}`}>Mark Ordered</button>
           </div>
         ))}
 
@@ -1324,25 +1383,25 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
           <MetricCard lm={lm} label="In Stock" value={params.stock.toLocaleString()}
             sub={mlData.stockDataAvailable === false ? "assumed — no stock data" : hasOpenPO ? `+ ${openPO.qty.toLocaleString()} on order` : "units on hand"}
-            valueColor={mlData.stockDataAvailable === false ? (lm ? "text-amber-600" : "text-amber-400") : undefined} />
+            valueColor={mlData.stockDataAvailable === false ? ("text-[var(--t-warn)]") : undefined} />
           <MetricCard lm={lm}
             label={<Tip text="When your current stock is predicted to run out if no new order arrives.">Stockout Date</Tip>}
             value={mlData.daysUntilStockout != null ? formatDate(mlData.daysUntilStockout).split(",")[0] : "—"}
             sub={mlData.daysUntilStockout != null ? `${mlData.daysUntilStockout} days away` : "Sufficient stock"}
-            valueColor="text-rose-500" />
+            valueColor="text-[var(--t-bad)]" />
           <MetricCard lm={lm}
             label={<Tip text="The last safe date to place an order so it arrives before you run out of stock.">Order By</Tip>}
             value={hasOpenPO ? "On Order" : mlData.daysUntilReorder > 0 ? formatDate(mlData.daysUntilReorder).split(",")[0] : mlData.daysUntilReorder === 0 ? "Today" : mlData.daysUntilReorder != null ? `${Math.abs(mlData.daysUntilReorder)}d` : "—"}
             sub={hasOpenPO ? `Est. ${isoToDisplay(openPO.delivery)}` : mlData.daysUntilReorder > 0 ? `${mlData.daysUntilReorder} days from now` : mlData.daysUntilReorder === 0 ? "Order today" : mlData.daysUntilReorder != null ? "overdue" : "—"}
-            valueColor={hasOpenPO ? (lm ? "text-violet-600" : "text-violet-300") : mlData.daysUntilReorder <= 0 && mlData.daysUntilReorder != null ? "text-red-500" : (lm ? "text-amber-600" : "text-amber-400")} />
+            valueColor={hasOpenPO ? ("text-[var(--t-accent)]") : mlData.daysUntilReorder <= 0 && mlData.daysUntilReorder != null ? "text-[var(--t-bad)]" : ("text-[var(--t-warn)]")} />
           <MetricCard lm={lm}
             label={<Tip text="Recommended order quantity: covers your coverage window demand plus a safety buffer for forecast uncertainty.">Units to Order</Tip>}
             value={mlData.orderQty.toLocaleString()} sub="recommended qty"
-            valueColor={lm ? "text-violet-700" : "text-violet-300"} accent />
+            valueColor={"text-[var(--t-accent)]"} accent />
         </div>
 
         {showReorder && (
-          <div className={`flex items-start gap-2 text-[11px] leading-relaxed ${lm ? "text-slate-500" : "text-slate-500"}`}>
+          <div className={`flex items-start gap-2 text-[14px] leading-relaxed ${"text-[var(--t-dim)]"}`}>
             <span className="shrink-0">ℹ️</span>
             <span>The stockout date, order-by date, and order quantity assume you place the order <span className="font-semibold">today</span>. They don't reduce the demand forecast for any stockout — that stays true demand (you simply lose those sales). Ordering later pushes delivery out and lengthens any out-of-stock gap.</span>
           </div>
@@ -1351,10 +1410,10 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
         {mlData.orderGuardrail?.active && (() => {
           const g = mlData.orderGuardrail;
           const tone = g.capExceeded
-            ? (lm ? "bg-amber-50 border-amber-200 text-amber-800" : "bg-amber-950/20 border-amber-900/40 text-amber-300")
-            : (lm ? "bg-slate-50 border-slate-200 text-slate-600" : "bg-slate-900/40 border-slate-700 text-slate-300");
+            ? ("bg-[var(--t-warn-soft)] border-[var(--t-warn-line)] text-[var(--t-warn)]")
+            : ("bg-[var(--t-sunken)] border-[var(--t-line)] text-[var(--t-soft)]");
           return (
-            <div className={`flex items-start gap-2.5 rounded-xl border px-4 py-3 text-[12px] ${tone}`}>
+            <div className={`flex items-start gap-2.5 rounded-xl border px-4 py-3 text-[15px] ${tone}`}>
               <span className="shrink-0 mt-0.5">{g.capExceeded ? "⚠️" : "ℹ️"}</span>
               <div>
                 <span className="font-semibold">New-product caution.</span> {g.reason}
@@ -1376,16 +1435,16 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
           <div className={`${cardBg} border rounded-2xl p-6`}>
             <div className="flex items-center gap-2 mb-2">
               <span className="text-lg">🌱</span>
-              <span className={`text-sm font-bold ${textMain}`}>Forecast paused — establishing baseline</span>
+              <span className={`text-[16.5px] font-bold ${textMain}`}>Forecast paused — establishing baseline</span>
             </div>
-            <p className={`text-xs leading-relaxed mb-5 ${textMuted}`}>
+            <p className={`text-[15px] leading-relaxed mb-5 ${textMuted}`}>
               We start forecasting once this product has about a week of its own sales ({mlData.ownDays}/{mlData.baselineDays} days so far). Until then, here's what we can track straight from inventory.
             </p>
             {/* For a slow seller, per-day whole units read as "0". Lead with how it
                 actually sells — a monthly rate and the fact that zero-sale days are
                 normal — before any daily number appears. */}
             {mlData.demandStory && (
-              <div className={`mb-4 rounded-xl border px-4 py-3 text-xs leading-relaxed ${lm ? "bg-sky-50 border-sky-200 text-slate-700" : "bg-sky-950/15 border-sky-900/40 text-slate-300"}`}>
+              <div className={`mb-4 rounded-xl border px-4 py-3 text-[15px] leading-relaxed ${"bg-[var(--t-info-soft)] border-[var(--t-info-line)] text-[var(--t-soft)]"}`}>
                 <span className="font-semibold">How this product sells: </span>{mlData.demandStory}
                 <div className={`mt-1 ${textMuted}`}>
                   Orders aren&apos;t sized from one day — they add this rate up across your lead time and coverage window.
@@ -1393,25 +1452,25 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
               </div>
             )}
             {mlData.rateCheck && (
-              <div className={`mb-4 rounded-xl border px-4 py-3 text-xs leading-relaxed ${lm ? "bg-amber-50 border-amber-200 text-amber-800" : "bg-amber-950/15 border-amber-900/30 text-amber-300"}`}>
+              <div className={`mb-4 rounded-xl border px-4 py-3 text-[15px] leading-relaxed ${"bg-[var(--t-warn-soft)] border-[var(--t-warn-line)] text-[var(--t-warn)]"}`}>
                 <span className="font-semibold">Forecast is running below recent sales. </span>{mlData.rateCheck.message}
               </div>
             )}
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-              <div><div className={`text-[11px] uppercase tracking-widest font-bold mb-1 ${textMuted}`}>In stock</div><span className={`text-2xl font-bold tabular-nums ${textMain}`}>{params.stock.toLocaleString()}</span></div>
-              <div><div className={`text-[11px] uppercase tracking-widest font-bold mb-1 ${textMuted}`}>Sold so far</div><span className={`text-2xl font-bold tabular-nums ${textMain}`}>{mlData.currentMonth?.unitsSoFar?.toLocaleString() ?? "—"}</span></div>
-              <div><div className={`text-[11px] uppercase tracking-widest font-bold mb-1 ${textMuted}`}>Observed pace</div><span className={`text-2xl font-bold tabular-nums ${textMain}`}>{mlData.observedDailyRate ?? "—"}</span><span className={`text-xs ${textMuted}`}>/day</span>
+              <div><div className={`text-[14px] uppercase tracking-widest font-bold mb-1 ${textMuted}`}>In stock</div><span className={`text-2xl font-bold tabular-nums ${textMain}`}>{params.stock.toLocaleString()}</span></div>
+              <div><div className={`text-[14px] uppercase tracking-widest font-bold mb-1 ${textMuted}`}>Sold so far</div><span className={`text-2xl font-bold tabular-nums ${textMain}`}>{mlData.currentMonth?.unitsSoFar?.toLocaleString() ?? "—"}</span></div>
+              <div><div className={`text-[14px] uppercase tracking-widest font-bold mb-1 ${textMuted}`}>Observed pace</div><span className={`text-2xl font-bold tabular-nums ${textMain}`}>{mlData.observedDailyRate ?? "—"}</span><span className={`text-[15px] ${textMuted}`}>/day</span>
                 {mlData.observedDailyRate != null && mlData.observedDailyRate < 1 && (
-                  <div className={`text-[11px] ${textMuted}`}>≈ {Math.round(mlData.observedDailyRate * 30)}/month</div>
+                  <div className={`text-[14px] ${textMuted}`}>≈ {Math.round(mlData.observedDailyRate * 30)}/month</div>
                 )}</div>
-              <div><div className={`text-[11px] uppercase tracking-widest font-bold mb-1 ${textMuted}`}>Stock covers</div><span className={`text-2xl font-bold tabular-nums ${textMain}`}>{mlData.observedRunwayDays != null ? `~${mlData.observedRunwayDays}` : "—"}</span><span className={`text-xs ${textMuted}`}>{mlData.observedRunwayDays != null ? " days" : ""}</span></div>
+              <div><div className={`text-[14px] uppercase tracking-widest font-bold mb-1 ${textMuted}`}>Stock covers</div><span className={`text-2xl font-bold tabular-nums ${textMain}`}>{mlData.observedRunwayDays != null ? `~${mlData.observedRunwayDays}` : "—"}</span><span className={`text-[15px] ${textMuted}`}>{mlData.observedRunwayDays != null ? " days" : ""}</span></div>
             </div>
             {mlData.observedRunwayDays != null && (() => {
               const soon = mlData.observedRunwayDays <= (params.leadTime || 14);
               return (
-                <div className={`mt-4 rounded-xl border px-4 py-3 text-xs leading-relaxed ${soon
-                  ? (lm ? "bg-amber-50 border-amber-200 text-amber-800" : "bg-amber-950/15 border-amber-900/30 text-amber-300")
-                  : (lm ? "bg-slate-50 border-slate-200 text-slate-600" : "bg-slate-900/40 border-slate-700 text-slate-300")}`}>
+                <div className={`mt-4 rounded-xl border px-4 py-3 text-[15px] leading-relaxed ${soon
+                  ? ("bg-[var(--t-warn-soft)] border-[var(--t-warn-line)] text-[var(--t-warn)]")
+                  : ("bg-[var(--t-sunken)] border-[var(--t-line)] text-[var(--t-soft)]")}`}>
                   {soon ? "⚠️ " : "ℹ️ "}At its current pace (~{mlData.observedDailyRate}/day), this runs out around{" "}
                   <span className="font-semibold">{mlData.observedStockoutTs ? new Date(mlData.observedStockoutTs).toLocaleDateString("en-US", { month: "short", day: "numeric" }) : `~${mlData.observedRunwayDays} days`}</span>
                   {" "}— about {mlData.observedRunwayDays} days of stock left.
@@ -1419,7 +1478,7 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
                 </div>
               );
             })()}
-            <p className={`text-[11px] mt-4 ${textMuted}`}>Pace and runway are raw observations from the days seen so far — not a forecast.</p>
+            <p className={`text-[14px] mt-4 ${textMuted}`}>Pace and runway are raw observations from the days seen so far — not a forecast.</p>
           </div>
           </>
         ) : (
@@ -1428,11 +1487,11 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
           onConfirm={onConfirmArrival} onIgnore={onIgnoreArrival} />
         {/* A seasonal scale on a route that has no seasonal curve of its own. */}
         {mlData.seasonalityApplied?.text && (
-          <div className={`mb-4 rounded-xl border px-4 py-3 text-xs leading-relaxed ${lm ? "bg-teal-50 border-teal-200 text-teal-900" : "bg-teal-950/15 border-teal-900/30 text-teal-300"}`}>
+          <div className={`mb-4 rounded-xl border px-4 py-3 text-[15px] leading-relaxed ${"bg-[var(--t-info-soft)] border-[var(--t-info-line)] text-[var(--t-info)]"}`}>
             <span className="font-semibold">Seasonal pattern. </span>
             {mlData.seasonalityApplied.text}
             {mlData.seasonalityApplied.applied && (
-              <span className={`block mt-1 ${lm ? "text-teal-700" : "text-teal-400/80"}`}>
+              <span className={`block mt-1 ${"text-[var(--t-info)]"}`}>
                 In this forecast window that ranges from {mlData.seasonalityApplied.troughMultiplier}× to
                 {" "}{mlData.seasonalityApplied.peakMultiplier}× the flat rate.
               </span>
@@ -1442,11 +1501,11 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
         {/* Price and promo effects on the routes that can't model them internally.
             Silent multipliers moving an order would be worse than none. */}
         {mlData.uplift?.text && (
-          <div className={`mb-4 rounded-xl border px-4 py-3 text-xs leading-relaxed ${lm ? "bg-violet-50 border-violet-200 text-violet-900" : "bg-violet-950/15 border-violet-900/30 text-violet-300"}`}>
+          <div className={`mb-4 rounded-xl border px-4 py-3 text-[15px] leading-relaxed ${"bg-[var(--t-accent-soft)] border-[var(--t-accent-line)] text-[var(--t-accent)]"}`}>
             <span className="font-semibold">Price &amp; promotions. </span>
             {mlData.uplift.text}
             {mlData.uplift.applied && (
-              <span className={`block mt-1 ${lm ? "text-violet-700" : "text-violet-400/80"}`}>
+              <span className={`block mt-1 ${"text-[var(--t-accent)]"}`}>
                 Applied to {mlData.uplift.daysLifted} upcoming day{mlData.uplift.daysLifted === 1 ? "" : "s"} in this forecast.
               </span>
             )}
@@ -1455,11 +1514,11 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
         {/* An adjusted forecast must never be silent — if the model was fitted on
             something other than raw sales, say so and say why. */}
         {mlData.censoring && (
-          <div className={`mb-4 rounded-xl border px-4 py-3 text-xs leading-relaxed ${lm ? "bg-sky-50 border-sky-200 text-sky-900" : "bg-sky-950/15 border-sky-900/30 text-sky-300"}`}>
+          <div className={`mb-4 rounded-xl border px-4 py-3 text-[15px] leading-relaxed ${"bg-[var(--t-info-soft)] border-[var(--t-info-line)] text-[var(--t-info)]"}`}>
             <span className="font-semibold">Adjusted for days you ran out. </span>
             {mlData.censoring.text}
             {mlData.censoring.addedUnits > 0 && (
-              <span className={`block mt-1 ${lm ? "text-sky-700" : "text-sky-400/80"}`}>
+              <span className={`block mt-1 ${"text-[var(--t-info)]"}`}>
             The forecast is fitted to an estimated {mlData.censoring.fittedUnits} units rather than the
             {" "}{mlData.censoring.observedUnits} you sold, because selling out caps sales without
             capping demand. Left uncorrected this drifts lower every cycle.
@@ -1468,44 +1527,45 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
           </div>
             )}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
-          <div className={`lg:col-span-2 ${cardBg} border rounded-2xl p-5 h-[360px]`}>
+          <div className={`lg:col-span-2 ${cardBg} border rounded-2xl p-5 h-[420px]`}>
             <ForecastChart historyPoints={mlData.chartDataHistory}
               futurePoints={mlData.inactive ? [] : mlData.chartDataFuture}
               rangePoints={mlData.inactive ? [] : mlData.chartDataRange}
               stockoutTime={mlData.inactive ? null : mlData.stockoutTimestamp}
               reorderTime={mlData.inactive ? null : mlData.reorderTimestamp} intervalWidth={mlData.intervalWidth}
+              poLandsTime={openPO?.delivery ? new Date(`${openPO.delivery}T12:00:00Z`).getTime() : null}
               upcomingPromos={mlData.upcomingPromos} lm={lm} />
           </div>
           {/* Current Month — standalone card aligned with chart */}
           <div className={`${cardBg} border rounded-2xl p-6 flex flex-col justify-between h-[360px]`}>
             {/* Top: header + big number */}
             <div>
-              <div className={`text-[11px] uppercase tracking-widest font-bold mb-4 ${textMuted}`}>Current Month</div>
+              <div className={`text-[14px] uppercase tracking-widest font-bold mb-4 ${textMuted}`}>Current Month</div>
               <div className="flex items-baseline gap-3 mb-1">
                 <span className={`text-6xl font-bold ${textMain} tabular-nums leading-none`}>{projTotal.toLocaleString()}</span>
               </div>
               <div className="flex items-center gap-2 mt-2">
-                <span className={`text-sm font-mono font-bold ${pctChange >= 0 ? "text-emerald-500" : "text-rose-500"}`}>
+                <span className={`text-[16.5px] font-mono font-bold ${pctChange >= 0 ? "text-[var(--t-good)]" : "text-[var(--t-bad)]"}`}>
                   {pctChange >= 0 ? "▲" : "▼"} {Math.abs(pctChange).toFixed(1)}%
                 </span>
-                <span className={`text-sm ${textMuted}`}>vs last month</span>
+                <span className={`text-[16.5px] ${textMuted}`}>vs last month</span>
               </div>
             </div>
             {/* Middle: sold / remaining */}
             <div className={`grid grid-cols-2 gap-4 py-5 border-y ${divider}`}>
               <div>
-                <div className={`text-[11px] uppercase tracking-widest font-bold mb-1 ${textMuted}`}>Sold so far</div>
+                <div className={`text-[14px] uppercase tracking-widest font-bold mb-1 ${textMuted}`}>Sold so far</div>
                 <span className={`text-3xl font-bold tabular-nums ${textMain}`}>{mlData.currentMonth.unitsSoFar.toLocaleString()}</span>
               </div>
               <div>
-                <div className={`text-[11px] uppercase tracking-widest font-bold mb-1 ${textMuted}`}>Remaining</div>
-                <span className="text-3xl font-bold tabular-nums text-violet-500">{mlData.currentMonth.forecastRemaining.toLocaleString()}</span>
+                <div className={`text-[14px] uppercase tracking-widest font-bold mb-1 ${textMuted}`}>Remaining</div>
+                <span className="text-3xl font-bold tabular-nums text-[var(--t-accent)]">{mlData.currentMonth.forecastRemaining.toLocaleString()}</span>
               </div>
             </div>
             {/* Bottom: last month */}
             <div className="flex items-baseline gap-2">
               <span className={`text-2xl font-bold tabular-nums ${textMain}`}>{mlData.currentMonth.lastMonthTotal.toLocaleString()}</span>
-              <span className={`text-sm ${textMuted}`}>last month</span>
+              <span className={`text-[16.5px] ${textMuted}`}>last month</span>
             </div>
           </div>
         </div>
@@ -1514,7 +1574,7 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
         <OrderMathCard data={mlData} leadTime={params.leadTime} coverageDays={params.coverage} unitsOnOrder={onOrderQty} lm={lm} skuSt={skuSt} demandVolatilityColor={mlData?.demandVolatilityColor} />
 
         <div>
-          <div className={`text-[11px] uppercase tracking-widest font-bold mb-3 ${textMuted}`}>Sales Forecast by Month</div>
+          <div className={`text-[14px] uppercase tracking-widest font-bold mb-3 ${textMuted}`}>Sales Forecast by Month</div>
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
             {mlData.monthCards?.map((card, i) => <MonthForecastCard key={i} card={card} lm={lm} />)}
           </div>
@@ -1524,7 +1584,7 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
 
         <div>
           <button onClick={() => setShowHistory(!showHistory)}
-            className={`flex items-center gap-2 text-xs transition-colors ${lm ? "text-violet-600 hover:text-violet-800" : "text-violet-400 hover:text-violet-300"}`}>
+            className={`flex items-center gap-2 text-[15px] transition-colors ${"text-[var(--t-accent)] hover:text-[var(--t-accent)]"}`}>
             <svg className={`h-3 w-3 transition-transform ${showHistory ? "rotate-90" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
             </svg>

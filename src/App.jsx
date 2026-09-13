@@ -1,6 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import AiDrawer from './AiDrawer';
-import ScorecardTab from './ScorecardTab';
 import BacktestTab from './BacktestTab';
 import LiveAccuracy from './components/LiveAccuracy';
 import { useArrivalPrompts, ArrivalPromptList, ArrivalPromptBanner } from './components/ArrivalPrompts';
@@ -9,6 +8,8 @@ import SkuDetailPanel from './components/SkuDetailPanel';
 import SupplierPanel from './components/SupplierPanel';
 import UploadPanel from './components/UploadPanel';
 import { FleetBento } from './components/FleetViews';
+import { CostsSheet } from './components/UnitEconomics';
+import { terminal, MONO, SANS } from './lib/theme';
 import { SkuListItem, FolderRow } from './components/Sidebar';
 import { AssignFolderModal } from './components/modals';
 import { ErrorToasts } from './components/common';
@@ -22,7 +23,7 @@ export default function App() {
   const [lightMode,    setLightMode]    = useState(false);
   const [skuList,      setSkuList]      = useState([]);
   const [activeSku,    setActiveSku]    = useState(null);
-  const [activeView,   setActiveView]   = useState("fleet"); // "fleet" | "suppliers" | "scorecard"
+  const [activeView,   setActiveView]   = useState("fleet"); // "fleet" | "suppliers" | "backtest" | "live" | "categorize"
   const [showProducts, setShowProducts] = useState(false);   // products drawer (slide-over over the content)
   const [palette,      setPalette]      = useState(false);   // ⌘K command palette
   const [paletteQ,     setPaletteQ]     = useState("");
@@ -38,6 +39,7 @@ export default function App() {
   const [btRes,        setBtRes]        = useState(null);
   const [btDiag,       setBtDiag]       = useState(null);
   const [showCategorize, setShowCategorize] = useState(false);
+  const [showCosts, setShowCosts] = useState(false);
   const [skuForecasts, setSkuForecasts] = useState([]);
   const [scorecardRows, setScorecardRows] = useState([]);
   const skuForecastsRef = useRef([]);
@@ -147,7 +149,7 @@ export default function App() {
     const res = await fetchJson(`${API}/api/scorecard`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      // Shared with ScorecardTab and AiDrawer — one question, one answer.
+      // Shared with the fleet card and AiDrawer — one question, one answer.
       body: JSON.stringify(buildScorecardBody(list, params, pos, suppliers)),
     }, "Loading scorecard");
     setScorecardRows(res?.rows || []);
@@ -188,10 +190,41 @@ export default function App() {
   }, [skuParams, refreshSkuSummary]);
 
   const loadSkuList = useCallback(async (currentParams, currentPOs) => {
-    const params = currentParams ?? {};
     const pos    = currentPOs    ?? {};
     const data   = (await fetchJson(`${API}/api/skus`, undefined, "Loading products")) || [];
     setSkuList(data);
+
+    /* Seed stock and unit cost from the uploaded sheet for any product this browser has
+       no value of its own for.
+
+       These were seeded ONLY in handleUploadSuccess, so the figures survived exactly as
+       long as local storage did. Restart the engine (which restores the catalog from
+       disk and comes back through this endpoint, not through upload), clear site data, or
+       open the tool in a second browser, and every product silently reverted to the
+       500-unit default — which on a 1.2/day seller reads as 417 days of cover, so the
+       whole Fleet reported "overstocked, nothing to order" while the engine held the real
+       numbers the entire time.
+
+       Same guard as the upload path: seed only where the browser is empty, so a figure
+       the user typed is never overwritten by a staler sheet. */
+    let params = { ...(currentParams ?? {}) };
+    let seeded = 0;
+    data.forEach(s => {
+      const cur = params[s.id];
+      const patch = {};
+      if (s.lastKnownStock != null && (cur?.stock == null || cur.stock === "")) {
+        patch.stock = s.lastKnownStock;
+      }
+      if (s.lastKnownCost != null && (cur?.unitCost == null || cur.unitCost === "")) {
+        patch.unitCost = s.lastKnownCost;
+        patch.unitCostSource = "sheet";
+      }
+      if (Object.keys(patch).length) {
+        params[s.id] = { ...(cur ?? DEFAULT_PARAMS), ...patch };
+        seeded += 1;
+      }
+    });
+    if (seeded) { setSkuParams(params); saveStorage("logitrack_params", params); }
     const forecasts = await Promise.all(data.map(s => {
       const p  = { ...DEFAULT_PARAMS, ...(params[s.id] || {}) };
       const oq = pos[s.id] ? pos[s.id].qty : 0;
@@ -479,7 +512,11 @@ export default function App() {
       if (sku.lastKnownCost !== null && sku.lastKnownCost !== undefined) {
         const existing = updatedParams[sku.id] ?? DEFAULT_PARAMS;
         if (existing.unitCost === undefined || existing.unitCost === null || existing.unitCost === "") {
-          updatedParams[sku.id] = { ...existing, unitCost: sku.lastKnownCost };
+          /* Stamp where it came from. The value alone can't be trusted the same way
+             from every source, and the product page now says which one it was. A
+             hand-typed cost is still never overwritten — that guard is the `if`. */
+          updatedParams[sku.id] = { ...existing, unitCost: sku.lastKnownCost,
+                                    unitCostSource: sku.costSource === "shopify" ? "shopify" : "sheet" };
         }
       }
     });
@@ -686,30 +723,30 @@ export default function App() {
   const scoreBySkuApp  = Object.fromEntries((scorecardRows || []).map(r => [r.skuId, r]));
 
   // Theme tokens for shell
-  const shellBg   = lm ? "bg-slate-100 text-slate-900" : "bg-[#0c0c0e] text-slate-100";
-  const sidebarBg = lm ? "bg-white border-slate-200" : "bg-[#161619] border-white/10";
-  const headerBg  = lm ? "bg-white border-slate-200" : "bg-[#161619] border-white/10";
-  const logoText  = lm ? "text-slate-900" : "text-white";
-  const subText   = lm ? "text-slate-500" : "text-slate-500";
-  const skusLabel = lm ? "text-slate-400" : "text-slate-600";
-  const divider   = lm ? "border-slate-200" : "border-white/10";
-  const fleetBtnActive   = lm ? "bg-slate-100 border-slate-300 text-slate-900" : "bg-slate-800/70 border-slate-700/60 text-white";
-  const fleetBtnInactive = lm ? "border-transparent text-slate-500 hover:bg-slate-100 hover:text-slate-800" : "border-transparent text-slate-400 hover:bg-slate-800/40 hover:text-slate-200";
-  const skuCountBadge    = lm ? "bg-slate-200 text-slate-500" : "bg-slate-700/60 text-slate-400";
-  const sectionTitleText = lm ? "text-slate-900" : "text-white";
-  const breadcrumbMuted  = lm ? "text-slate-500" : "text-slate-500";
-  const breadcrumbSep    = lm ? "text-slate-300" : "text-slate-700";
-  const skuTabActive     = lm ? "bg-slate-200 text-slate-900" : "bg-slate-700 text-white";
-  const skuTabInactive   = lm ? "text-slate-500 hover:text-slate-800 hover:bg-slate-100" : "text-slate-500 hover:text-slate-300 hover:bg-slate-800/60";
-  const dateText         = lm ? "text-slate-400" : "text-slate-600";
-  const importLabel      = lm ? "text-slate-400" : "text-slate-600";
-  const resetBtn         = lm ? "text-slate-500 hover:text-slate-700 border-slate-300 hover:border-slate-400 rounded-lg py-1.5" : "text-slate-500 hover:text-slate-300 border-white/10 hover:border-slate-700 rounded-lg py-1.5";
+  const shellBg   = "bg-[var(--t-sunken)] text-[var(--t-ink)]";
+  const sidebarBg = "bg-[var(--t-panel)] border-[var(--t-line)]";
+  const headerBg  = "bg-[var(--t-panel)] border-[var(--t-line)]";
+  const logoText  = "text-[var(--t-ink)]";
+  const subText   = "text-[var(--t-dim)]";
+  const skusLabel = "text-[var(--t-dim)]";
+  const divider   = "border-[var(--t-line)]";
+  const fleetBtnActive   = "bg-[var(--t-sunken)] border-[var(--t-line2)] text-[var(--t-ink)]";
+  const fleetBtnInactive = "border-transparent text-[var(--t-dim)] hover:bg-[var(--t-sunken)] hover:text-[var(--t-soft)]";
+  const skuCountBadge    = "bg-[var(--t-sunken)] text-[var(--t-dim)]";
+  const sectionTitleText = "text-[var(--t-ink)]";
+  const breadcrumbMuted  = "text-[var(--t-dim)]";
+  const breadcrumbSep    = "text-[var(--t-soft)]";
+  const skuTabActive     = "bg-[var(--t-sunken)] text-[var(--t-ink)]";
+  const skuTabInactive   = "text-[var(--t-dim)] hover:text-[var(--t-soft)] hover:bg-[var(--t-sunken)]";
+  const dateText         = "text-[var(--t-dim)]";
+  const importLabel      = "text-[var(--t-dim)]";
+  const resetBtn         = "text-[var(--t-dim)] hover:text-[var(--t-soft)] border-[var(--t-line2)] hover:border-[var(--t-line2)] rounded-lg py-1.5";
   const toggleBtn        = lm
-    ? "h-7 w-7 rounded-lg border border-slate-300 bg-white flex items-center justify-center text-slate-600 hover:bg-slate-100 transition-all shrink-0"
-    : "h-7 w-7 rounded-lg border border-slate-700 bg-slate-800/60 flex items-center justify-center text-slate-300 hover:bg-slate-700 transition-all shrink-0";
+    ? "h-7 w-7 rounded-lg border border-[var(--t-line2)] bg-[var(--t-panel)] flex items-center justify-center text-[var(--t-soft)] hover:bg-[var(--t-sunken)] transition-all shrink-0"
+    : "h-7 w-7 rounded-lg border border-[var(--t-line2)] bg-[var(--t-line)] flex items-center justify-center text-[var(--t-soft)] hover:bg-[var(--t-line)] transition-all shrink-0";
 
   const ThemeToggle = () => (
-    <button onClick={() => setLightMode(v => !v)} title={lm ? "Switch to dark mode" : "Switch to light mode"} className={toggleBtn}>
+    <button onClick={() => setLightMode(v => !v)} title={"Switch to dark mode"} className={toggleBtn}>
       <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
         {lm
           ? <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z" />
@@ -762,8 +799,30 @@ export default function App() {
     window.addEventListener("mousemove", move); window.addEventListener("mouseup", up);
   };
 
+  /* THE TOKENS LIVE HERE, at the app root, not per screen.
+     They started out on each converted component, which worked until a SHARED child
+     — MetricCard, the modals, the drawer — was converted too: those render inside
+     several different screens, and a `var(--t-ink)` only resolves where some ancestor
+     defined it. Declaring the whole palette once on the shell makes every token class
+     in the app resolve, wherever the component happens to be mounted. */
+  const T = terminal(lm);
+  const VARS = {
+    "--t-bg": T.bg, "--t-panel": T.panel, "--t-sunken": T.sunken,
+    "--t-ink": T.ink, "--t-soft": T.soft, "--t-dim": T.dim, "--t-faint": T.faint,
+    "--t-line": T.line, "--t-line2": T.line2,
+    "--t-accent": T.amber, "--t-accent-soft": `${T.amber}14`, "--t-accent-line": `${T.amber}55`,
+    "--t-good": T.green, "--t-good-soft": `${T.green}16`, "--t-good-line": `${T.green}55`,
+    "--t-warn": T.over,  "--t-warn-soft": `${T.over}16`,  "--t-warn-line": `${T.over}55`,
+    "--t-bad": T.red,    "--t-bad-soft": `${T.red}14`,    "--t-bad-line": `${T.red}55`,
+    "--t-info": T.blue,  "--t-info-soft": `${T.blue}14`,  "--t-info-line": `${T.blue}55`,
+    "--t-btn-bg": T.btnBg, "--t-btn-fg": T.btnFg,
+  };
   return (
-    <div className={`relative flex h-screen w-full ${shellBg} font-sans overflow-hidden`}>
+    <div style={{ ...VARS, background: T.bg, color: T.ink, fontFamily: SANS }}
+      className={`relative flex h-screen w-full font-sans overflow-hidden`}>
+      {/* Figures monospaced, prose not — applied by class so every existing
+          `tabular-nums` / `font-mono` cell in the app picks the face up. */}
+      <style>{`.tabular-nums,.font-mono{font-family:${MONO};font-variant-numeric:tabular-nums}`}</style>
       <style>{`.sku-scroll::-webkit-scrollbar{width:10px}.sku-scroll::-webkit-scrollbar-thumb{background:rgba(100,116,139,.55);border-radius:5px;border:2px solid transparent;background-clip:content-box}.sku-scroll::-webkit-scrollbar-thumb:hover{background:rgba(100,116,139,.85);background-clip:content-box}.sku-scroll{scrollbar-width:thin;scrollbar-color:rgba(100,116,139,.55) transparent}
       .sku-strip::-webkit-scrollbar{height:5px}.sku-strip::-webkit-scrollbar-track{background:transparent}.sku-strip::-webkit-scrollbar-thumb{background:rgba(100,116,139,.4);border-radius:3px}.sku-strip::-webkit-scrollbar-thumb:hover{background:rgba(100,116,139,.7)}.sku-strip{scrollbar-width:thin;scrollbar-color:rgba(100,116,139,.4) transparent}`}</style>
 
@@ -772,14 +831,14 @@ export default function App() {
       {showProducts && (
       <div style={{ width: sidebarWidth }} className={`absolute inset-y-0 left-0 z-40 shadow-2xl ${sidebarBg} border-r flex flex-col overflow-hidden`}>
         <div className={`px-5 pt-6 pb-5 border-b ${divider} flex items-center gap-3`}>
-          <div className="h-8 w-8 bg-violet-600 rounded-xl flex items-center justify-center shadow-lg shadow-violet-900/30">
-            <svg className="h-4 w-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <div className="h-8 w-8 bg-[var(--t-accent-soft)] rounded-xl flex items-center justify-center shadow-lg shadow-[var(--t-accent-line)]">
+            <svg className="h-4 w-4 text-[var(--t-ink)]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
             </svg>
           </div>
           <div>
-            <div className={`text-sm font-bold ${logoText} tracking-tight`}>LogiTrack</div>
-            <div className={`text-[11px] ${subText} font-mono`}>Demand Intelligence</div>
+            <div className={`text-[16.5px] font-bold ${logoText} tracking-tight`}>LogiTrack</div>
+            <div className={`text-[14px] ${subText} font-mono`}>Demand Intelligence</div>
           </div>
         </div>
 
@@ -789,59 +848,51 @@ export default function App() {
             <svg className="h-3.5 w-3.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z" />
             </svg>
-            <span className="text-sm font-semibold">Fleet Overview</span>
-            <span className={`ml-auto text-[11px] font-mono ${skuCountBadge} px-1.5 py-0.5 rounded-md`}>{skuList.length}</span>
+            <span className="text-[16.5px] font-semibold">Fleet Overview</span>
+            <span className={`ml-auto text-[14px] font-mono ${skuCountBadge} px-1.5 py-0.5 rounded-md`}>{skuList.length}</span>
           </button>
           <button onClick={() => { setActiveSku(null); setActiveView("suppliers"); }}
             className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-left transition-all border ${activeSku === null && activeView === "suppliers" ? fleetBtnActive : fleetBtnInactive}`}>
             <svg className="h-3.5 w-3.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4" />
             </svg>
-            <span className="text-sm font-semibold">Suppliers</span>
-            <span className={`ml-auto text-[11px] font-mono ${skuCountBadge} px-1.5 py-0.5 rounded-md`}>{namedSuppliers(suppliers).length}</span>
-          </button>
-          <button onClick={() => { setActiveSku(null); setActiveView("scorecard"); }}
-            className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-left transition-all border ${activeSku === null && activeView === "scorecard" ? fleetBtnActive : fleetBtnInactive}`}>
-            <svg className="h-3.5 w-3.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
-            </svg>
-            <span className="text-sm font-semibold">SKU Scorecard</span>
-            <span className={`ml-auto text-[11px] font-mono ${skuCountBadge} px-1.5 py-0.5 rounded-md`}>{skuList.length}</span>
+            <span className="text-[16.5px] font-semibold">Suppliers</span>
+            <span className={`ml-auto text-[14px] font-mono ${skuCountBadge} px-1.5 py-0.5 rounded-md`}>{namedSuppliers(suppliers).length}</span>
           </button>
           <button onClick={() => { setActiveSku(null); setActiveView("backtest"); }}
             className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-left transition-all border ${activeSku === null && activeView === "backtest" ? fleetBtnActive : fleetBtnInactive}`}>
             <svg className="h-3.5 w-3.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
             </svg>
-            <span className="text-sm font-semibold">Backtest</span>
+            <span className="text-[16.5px] font-semibold">Backtest</span>
           </button>
           <button onClick={() => { setActiveSku(null); setActiveView("live"); }}
             className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-left transition-all border ${activeSku === null && activeView === "live" ? fleetBtnActive : fleetBtnInactive}`}>
             <svg className="h-3.5 w-3.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M13 10V3L4 14h7v7l9-11h-7z" />
             </svg>
-            <span className="text-sm font-semibold">Live accuracy</span>
+            <span className="text-[16.5px] font-semibold">Live accuracy</span>
           </button>
         </div>
 
         <div className="px-3 flex-1 overflow-y-scroll sku-scroll space-y-0.5 pb-3">
           <div className="flex items-center justify-between px-1 py-2">
-            <div className={`text-[10px] uppercase tracking-widest ${skusLabel} font-bold`}>SKUs</div>
+            <div className={`text-[13px] uppercase tracking-widest ${skusLabel} font-bold`}>SKUs</div>
             <div className="flex items-center gap-1.5">
               <button onClick={() => { setActiveSku(null); setActiveView("categorize"); setShowProducts(false); }} title="Categorize & group products"
-                className={`h-9 w-9 rounded-lg flex items-center justify-center border transition-all ${lm ? "border-violet-200 bg-violet-50 text-violet-600 hover:bg-violet-100 hover:border-violet-300" : "border-violet-900/40 bg-violet-950/30 text-violet-300 hover:bg-violet-900/40 hover:border-violet-700"}`}>
+                className={`h-9 w-9 rounded-lg flex items-center justify-center border transition-all ${"border-[var(--t-accent-line)] bg-[var(--t-accent-soft)] text-[var(--t-accent)] hover:bg-[var(--t-accent-soft)] hover:border-[var(--t-accent-line)]"}`}>
                 <svg className="h-[18px] w-[18px]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 7h.01M7 3h5c.512 0 1.024.195 1.414.586l7 7a2 2 0 010 2.828l-7 7a2 2 0 01-2.828 0l-7-7A1.994 1.994 0 013 12V7a4 4 0 014-4z" />
                 </svg>
               </button>
               <button onClick={autoFolderByCategory} title="Auto-organize products into folders by category"
-                className={`h-9 w-9 rounded-lg flex items-center justify-center border transition-all ${lm ? "border-slate-200 bg-white text-slate-600 hover:bg-slate-100 hover:border-slate-300" : "border-slate-700/60 bg-slate-800/40 text-slate-300 hover:bg-slate-700/60 hover:border-slate-600"}`}>
+                className={`h-9 w-9 rounded-lg flex items-center justify-center border transition-all ${"border-[var(--t-line)] bg-[var(--t-panel)] text-[var(--t-soft)] hover:bg-[var(--t-sunken)] hover:border-[var(--t-line2)]"}`}>
                 <svg className="h-[18px] w-[18px]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3.75 9.776c.112-.017.227-.026.344-.026h15.812c.117 0 .232.009.344.026m-16.5 0a2.25 2.25 0 00-1.883 2.542l.857 6a2.25 2.25 0 002.227 1.932H19.05a2.25 2.25 0 002.227-1.932l.857-6a2.25 2.25 0 00-1.883-2.542m-16.5 0V6A2.25 2.25 0 016 3.75h3.879a1.5 1.5 0 011.06.44l2.122 2.12a1.5 1.5 0 001.06.44H18A2.25 2.25 0 0120.25 9v.776" />
                 </svg>
               </button>
               <button onClick={createFolder} title="Add new folder"
-                className={`h-9 w-9 rounded-lg flex items-center justify-center border transition-all ${lm ? "border-slate-200 bg-white text-slate-600 hover:bg-slate-100 hover:border-slate-300" : "border-slate-700/60 bg-slate-800/40 text-slate-300 hover:bg-slate-700/60 hover:border-slate-600"}`}>
+                className={`h-9 w-9 rounded-lg flex items-center justify-center border transition-all ${"border-[var(--t-line)] bg-[var(--t-panel)] text-[var(--t-soft)] hover:bg-[var(--t-sunken)] hover:border-[var(--t-line2)]"}`}>
                 <svg className="h-[18px] w-[18px]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 13h6m-3-3v6m-9 1V7a2 2 0 012-2h6l2 2h6a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z" />
                 </svg>
@@ -871,13 +922,13 @@ export default function App() {
         </div>
 
         <div onMouseDown={startResizeImport} title="Drag to resize"
-          className={`h-1.5 shrink-0 cursor-row-resize ${lm ? "hover:bg-violet-300" : "hover:bg-violet-600/50"}`} />
+          className={`h-1.5 shrink-0 cursor-row-resize ${"hover:bg-[var(--t-accent-soft)]"}`} />
         <div style={{ height: importHeight ?? undefined }} className={`p-4 border-t ${divider} space-y-3 shrink-0 overflow-y-auto sku-scroll`}>
-          <div className={`text-[10px] uppercase tracking-widest ${importLabel} font-bold`}>Import Data</div>
+          <div className={`text-[13px] uppercase tracking-widest ${importLabel} font-bold`}>Import Data</div>
           <UploadPanel onUploadSuccess={handleUploadSuccess} onUploadError={setUploadError}
             isUploading={isUploading} setIsUploading={setIsUploading} lm={lm} holdingPct={holdingPct} setHoldingPct={setHoldingPct} />
           {uploadError && (
-            <div className={`text-[11px] rounded-lg p-2 leading-relaxed border ${lm ? "text-red-700 bg-red-50 border-red-200" : "text-rose-400 bg-rose-950/20 border-rose-900/30"}`}>{uploadError}</div>
+            <div className={`text-[14px] rounded-lg p-2 leading-relaxed border ${"text-[var(--t-bad)] bg-[var(--t-bad-soft)] border-[var(--t-bad-line)]"}`}>{uploadError}</div>
           )}
           {/* Products the upload REFUSED. /api/upload has always returned a reason per
               dropped SKU in `errors` — "fewer than 2 rows", "could not be modeled
@@ -886,13 +937,13 @@ export default function App() {
               "✓ Loaded" and no hint that anything was missing. Shown before the success
               banner: what was dropped matters more than what worked. */}
           {uploadInfo?.errors?.length > 0 && (
-            <div className={`text-[11px] rounded-lg border overflow-hidden ${lm ? "text-amber-800 bg-amber-50 border-amber-300" : "text-amber-300 bg-amber-950/20 border-amber-900/40"}`}>
+            <div className={`text-[14px] rounded-lg border overflow-hidden ${"text-[var(--t-warn)] bg-[var(--t-warn-soft)] border-[var(--t-warn-line)]"}`}>
               <div className="p-2 font-semibold">
                 ⚠️ {uploadInfo.errors.length} product{uploadInfo.errors.length !== 1 ? "s" : ""} skipped — not in your catalogue
               </div>
-              <ul className={`px-2 pb-2 space-y-0.5 border-t pt-1.5 ${lm ? "border-amber-300" : "border-amber-900/40"}`}>
+              <ul className={`px-2 pb-2 space-y-0.5 border-t pt-1.5 ${"border-[var(--t-warn-line)]"}`}>
                 {uploadInfo.errors.map((e, i) => (
-                  <li key={i} className="font-mono text-[10.5px] leading-relaxed break-words">{e}</li>
+                  <li key={i} className="font-mono text-[15.5px] leading-relaxed break-words">{e}</li>
                 ))}
               </ul>
             </div>
@@ -900,7 +951,7 @@ export default function App() {
           {/* Large date re-anchoring shifts move sales into different calendar months and
               can distort learned seasonality — the user must know this happened. */}
           {uploadInfo && Math.abs(uploadInfo.dateShiftDays || 0) > 21 && (
-            <div className={`text-[11px] rounded-lg p-2 leading-relaxed border ${lm ? "text-amber-700 bg-amber-50 border-amber-300" : "text-amber-300 bg-amber-950/20 border-amber-900/40"}`}>
+            <div className={`text-[14px] rounded-lg p-2 leading-relaxed border ${"text-[var(--t-warn)] bg-[var(--t-warn-soft)] border-[var(--t-warn-line)]"}`}>
               ⚠️ <span className="font-semibold">Dates shifted {Math.abs(uploadInfo.dateShiftDays).toLocaleString()} days.</span>{" "}
               This file's data ends well in the past, so every date was moved forward to line up with today.
               A shift this large relocates sales into different months and can distort seasonal patterns —
@@ -908,30 +959,30 @@ export default function App() {
             </div>
           )}
           {uploadInfo && (
-            <div className={`text-[11px] rounded-lg border overflow-hidden ${lm ? "text-emerald-700 bg-emerald-50 border-emerald-200" : "text-emerald-400 bg-emerald-950/20 border-emerald-900/30"}`}>
+            <div className={`text-[14px] rounded-lg border overflow-hidden ${"text-[var(--t-good)] bg-[var(--t-good-soft)] border-[var(--t-good-line)]"}`}>
               <button onClick={() => setShowUploadDetails(v => !v)} className="w-full flex items-center justify-between gap-2 p-2 text-left">
                 <span className="truncate font-semibold">✓ Loaded {uploadInfo.loadedSkus?.length} SKU{uploadInfo.loadedSkus?.length !== 1 ? "s" : ""} from {uploadInfo.filename}</span>
                 <svg className={`h-3.5 w-3.5 shrink-0 transition-transform ${showUploadDetails ? "rotate-180" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" /></svg>
               </button>
               {showUploadDetails && (
-                <div className={`px-2 pb-2 pt-1.5 space-y-1 border-t leading-relaxed ${lm ? "border-emerald-200" : "border-emerald-900/40"}`}>
+                <div className={`px-2 pb-2 pt-1.5 space-y-1 border-t leading-relaxed ${"border-[var(--t-good-line)]"}`}>
                   {uploadInfo.loadedSkus?.some(s => s.lastKnownStock != null) && (
-                    <span className={`block ${lm ? "text-violet-700" : "text-violet-400"}`}>
+                    <span className={`block ${"text-[var(--t-accent)]"}`}>
                       Stock auto-detected: {uploadInfo.loadedSkus.filter(s => s.lastKnownStock != null).map(s => `${s.id}: ${s.lastKnownStock.toLocaleString()} units`).join(" · ")}
                     </span>
                   )}
                   {uploadInfo.loadedSkus?.some(s => s.lastKnownCost != null) && (
-                    <span className={`block ${lm ? "text-violet-700" : "text-violet-400"}`}>
+                    <span className={`block ${"text-[var(--t-accent)]"}`}>
                       Unit costs auto-detected for {uploadInfo.loadedSkus.filter(s => s.lastKnownCost != null).length} SKU{uploadInfo.loadedSkus.filter(s => s.lastKnownCost != null).length !== 1 ? "s" : ""} — margins &amp; protection tiers will use them (your own entries are never overwritten)
                     </span>
                   )}
                   {uploadInfo.loadedSkus?.some(s => s.stockoutRowsDropped > 0) && (
-                    <span className={`block ${lm ? "text-amber-600" : "text-amber-400"}`}>
+                    <span className={`block ${"text-[var(--t-warn)]"}`}>
                       {uploadInfo.loadedSkus.filter(s => s.stockoutRowsDropped > 0).map(s => `${s.id}: ${s.stockoutRowsDropped} zero-stock days excluded`).join(" · ")}
                     </span>
                   )}
                   {uploadInfo.dataQuality && (uploadInfo.dataQuality.duplicateRowsMerged > 0 || uploadInfo.dataQuality.missingSalesFilledZero > 0 || uploadInfo.dataQuality.badDatesDropped > 0 || uploadInfo.dataQuality.missingDaysFilled > 0) && (
-                    <span className={`block ${lm ? "text-slate-500" : "text-slate-400"}`}>
+                    <span className={`block ${"text-[var(--t-dim)]"}`}>
                       Cleaned: {[
                         uploadInfo.dataQuality.duplicateRowsMerged > 0 && `${uploadInfo.dataQuality.duplicateRowsMerged} duplicate row${uploadInfo.dataQuality.duplicateRowsMerged !== 1 ? "s" : ""} merged (no double-counting)`,
                         uploadInfo.dataQuality.missingSalesFilledZero > 0 && `${uploadInfo.dataQuality.missingSalesFilledZero} missing sales value${uploadInfo.dataQuality.missingSalesFilledZero !== 1 ? "s" : ""} set to 0`,
@@ -940,7 +991,7 @@ export default function App() {
                       ].filter(Boolean).join(" · ")} · {uploadInfo.dataQuality.rowsUsed?.toLocaleString()} rows used
                     </span>
                   )}
-                  {uploadInfo.errors?.length > 0 && <span className={`block ${lm ? "text-amber-600" : "text-amber-400"}`}>{uploadInfo.errors.join(" ")}</span>}
+                  {uploadInfo.errors?.length > 0 && <span className={`block ${"text-[var(--t-warn)]"}`}>{uploadInfo.errors.join(" ")}</span>}
                 </div>
               )}
             </div>
@@ -954,12 +1005,12 @@ export default function App() {
               title: "Reset everything?",
               body: "Wipes the whole tool back to first run: every product and forecast, your stock levels, unit costs, suppliers, purchase orders and folders, the last test result, and the accuracy and inventory history. Nothing is kept, on this computer or on the server. This can't be undone.",
               confirmLabel: "Wipe everything", danger: true, onConfirm: handleResetEverything })}
-            className={`w-full text-[11px] py-1.5 rounded-lg transition-colors border ${resetBtn}`}>
+            className={`w-full text-[14px] py-1.5 rounded-lg transition-colors border ${resetBtn}`}>
             Reset everything
           </button>
         </div>
         <div onMouseDown={startResizeWidth} title="Drag to resize sidebar"
-          className={`absolute top-0 right-0 h-full w-1.5 cursor-col-resize z-30 ${lm ? "hover:bg-violet-300" : "hover:bg-violet-600/50"}`} />
+          className={`absolute top-0 right-0 h-full w-1.5 cursor-col-resize z-30 ${"hover:bg-[var(--t-accent-soft)]"}`} />
       </div>
       )}
 
@@ -968,27 +1019,27 @@ export default function App() {
         <div className={`h-14 border-b ${divider} ${headerBg} flex items-center px-4 gap-2 shrink-0`}>
           <div className="flex items-center gap-2 mr-1 shrink-0">
             <div className="h-7 w-7 rounded-lg flex items-center justify-center shrink-0" style={{ background:"linear-gradient(135deg,#8b7dff,#6c5cff)", boxShadow:"0 4px 14px rgba(108,92,255,.45)" }}>
-              <span className="text-white text-[13px] font-bold">L</span>
+              <span className="text-[var(--t-ink)] text-[15.5px] font-bold">L</span>
             </div>
-            <span className={`text-[15px] font-bold ${logoText} tracking-tight hidden md:block`}>LogiTrack</span>
+            <span className={`text-[16.5px] font-bold ${logoText} tracking-tight hidden md:block`}>LogiTrack</span>
           </div>
           <nav className="flex items-center gap-0.5 shrink-0">
-            {[["fleet","Fleet"],["suppliers","Suppliers"],["scorecard","Scorecard"],["backtest","Backtest"],["live","Live accuracy"],["categorize","Grouping"]].map(([v,label]) => (
+            {[["fleet","Fleet"],["suppliers","Suppliers"],["backtest","Backtest"],["live","Live accuracy"],["categorize","Grouping"]].map(([v,label]) => (
               <button key={v} onClick={() => { setActiveSku(null); setActiveView(v); }}
-                className={`px-2.5 py-1 rounded-lg text-[13px] font-semibold transition-all ${activeSku===null && activeView===v ? (lm ? "bg-violet-100 text-violet-700" : "bg-violet-500/15 text-violet-300") : (lm ? "text-slate-500 hover:bg-slate-100" : "text-slate-400 hover:bg-slate-800/60")}`}>
+                className={`px-2.5 py-1 rounded-lg text-[15.5px] font-semibold transition-all ${activeSku===null && activeView===v ? ("bg-[var(--t-accent-soft)] text-[var(--t-accent)]") : ("text-[var(--t-dim)] hover:bg-[var(--t-sunken)]")}`}>
                 {label}
               </button>
             ))}
           </nav>
           <button onClick={() => setShowProducts(v => !v)} title="Products & import"
-            className={`shrink-0 flex items-center gap-1.5 h-8 px-3 rounded-lg text-[13px] font-semibold border transition-colors ${lm ? "border-slate-200 text-slate-600 hover:bg-slate-100" : "border-slate-700/60 text-slate-300 hover:bg-slate-800/60"}`}>
+            className={`shrink-0 flex items-center gap-1.5 h-8 px-3 rounded-lg text-[15.5px] font-semibold border transition-colors ${"border-[var(--t-line)] text-[var(--t-soft)] hover:bg-[var(--t-sunken)]"}`}>
             <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M4 6h16M4 12h16M4 18h16" /></svg>
             Products
           </button>
           {activeSku ? (
             <>
               <button onClick={() => setActiveSku(null)}
-                className={`text-xs flex items-center gap-1.5 transition-colors ${lm ? "text-slate-500 hover:text-slate-800" : "text-slate-500 hover:text-slate-300"}`}>
+                className={`text-[15px] flex items-center gap-1.5 transition-colors ${"text-[var(--t-dim)] hover:text-[var(--t-soft)]"}`}>
                 <svg className="h-3 w-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
                 </svg>
@@ -999,7 +1050,7 @@ export default function App() {
                 const folderEntry = Object.entries(folders).find(([, f]) => f.skuIds.includes(activeSku));
                 return folderEntry ? (
                   <>
-                    <span className={`text-xs ${breadcrumbMuted} flex items-center gap-1`}>
+                    <span className={`text-[15px] ${breadcrumbMuted} flex items-center gap-1`}>
                       <svg className="h-3 w-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V7z" />
                       </svg>
@@ -1010,11 +1061,11 @@ export default function App() {
                 ) : null;
               })()}
               <span title={skuList.find(s => s.id === activeSku)?.name || activeSku}
-                className={`text-xs font-semibold whitespace-nowrap truncate max-w-[220px] shrink-0 ${sectionTitleText}`}>{skuList.find(s => s.id === activeSku)?.name || activeSku}</span>
+                className={`text-[15px] font-semibold whitespace-nowrap truncate max-w-[220px] shrink-0 ${sectionTitleText}`}>{skuList.find(s => s.id === activeSku)?.name || activeSku}</span>
               <div className="sku-strip flex items-center gap-1 ml-4 min-w-0 overflow-x-auto pb-1">
                 {skuList.map(s => (
                   <button key={s.id} onClick={() => setActiveSku(s.id)}
-                    className={`px-3 py-1 rounded-lg text-xs font-mono transition-all whitespace-nowrap ${activeSku === s.id ? skuTabActive : skuTabInactive}`}>
+                    className={`px-3 py-1 rounded-lg text-[15px] font-mono transition-all whitespace-nowrap ${activeSku === s.id ? skuTabActive : skuTabInactive}`}>
                     {s.id}
                   </button>
                 ))}
@@ -1023,13 +1074,13 @@ export default function App() {
           ) : null}
           <div className="ml-auto flex items-center gap-2.5">
             <button onClick={() => { setPaletteQ(""); setPalette(true); }} title="Search (⌘K)"
-              className={`hidden sm:flex items-center gap-2 h-8 px-3 rounded-lg text-[12.5px] border transition-colors ${lm ? "border-slate-200 text-slate-400 hover:bg-slate-100" : "border-slate-700/60 text-slate-400 hover:bg-slate-800/60"}`}>
+              className={`hidden sm:flex items-center gap-2 h-8 px-3 rounded-lg text-[15.5px] border transition-colors ${"border-[var(--t-line)] text-[var(--t-dim)] hover:bg-[var(--t-sunken)]"}`}>
               <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M21 21l-4.35-4.35M17 11a6 6 0 11-12 0 6 6 0 0112 0z" /></svg>
               <span>Search</span>
-              <span className={`ml-1 text-[10px] font-mono px-1.5 py-0.5 rounded border ${lm ? "border-slate-200 text-slate-400" : "border-slate-700 text-slate-500"}`}>⌘K</span>
+              <span className={`ml-1 text-[13px] font-mono px-1.5 py-0.5 rounded border ${"border-[var(--t-line)] text-[var(--t-dim)]"}`}>⌘K</span>
             </button>
             <ThemeToggle />
-            <span className={`text-[11px] ${dateText} font-mono`}>{new Date().toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" })}</span>
+            <span className={`text-[14px] ${dateText} font-mono`}>{new Date().toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" })}</span>
           </div>
         </div>
 
@@ -1039,25 +1090,25 @@ export default function App() {
               read before any products are loaded. */}
           {skuList.length === 0 && activeView !== "suppliers" && activeView !== "backtest" && activeView !== "live" ? (
             <div className="flex-1 flex flex-col items-center justify-center text-center px-8">
-              <div className={`h-16 w-16 rounded-2xl flex items-center justify-center mb-5 ${lm ? "bg-violet-100" : "bg-violet-950/40"}`}>
-                <svg className={`h-7 w-7 ${lm ? "text-violet-600" : "text-violet-400"}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <div className={`h-16 w-16 rounded-2xl flex items-center justify-center mb-5 ${"bg-[var(--t-accent-soft)]"}`}>
+                <svg className={`h-7 w-7 ${"text-[var(--t-accent)]"}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M7 16a4 4 0 01-.88-7.9A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
                 </svg>
               </div>
               {restoring ? (
                 <>
-                  <h2 className={`text-lg font-bold ${lm ? "text-slate-900" : "text-white"}`}>Restoring your products…</h2>
-                  <p className={`text-sm mt-2 max-w-md ${lm ? "text-slate-500" : "text-slate-400"}`}>
+                  <h2 className={`text-lg font-bold ${"text-[var(--t-ink)]"}`}>Restoring your products…</h2>
+                  <p className={`text-[16.5px] mt-2 max-w-md ${"text-[var(--t-dim)]"}`}>
                     Your data is saved. The forecasts are being rebuilt from it, which takes about a minute. This page fills in on its own when it's done.
                   </p>
                 </>
               ) : (
                 <>
-                  <h2 className={`text-lg font-bold ${lm ? "text-slate-900" : "text-white"}`}>No products loaded</h2>
-                  <p className={`text-sm mt-2 max-w-md ${lm ? "text-slate-500" : "text-slate-400"}`}>
+                  <h2 className={`text-lg font-bold ${"text-[var(--t-ink)]"}`}>No products loaded</h2>
+                  <p className={`text-[16.5px] mt-2 max-w-md ${"text-[var(--t-dim)]"}`}>
                     Upload a sales file following the format to get started. Your file needs <span className="font-semibold">Date</span> and <span className="font-semibold">Units_Sold</span> columns — optional: SKU, Category, Price, On_Promotion, Units_In_Stock.
                   </p>
-                  <p className={`text-xs mt-3 ${lm ? "text-slate-400" : "text-slate-500"}`}>
+                  <p className={`text-[15px] mt-3 ${"text-[var(--t-dim)]"}`}>
                     Click <span className="font-semibold">Products</span> in the top bar to import a file or download the template.
                   </p>
                 </>
@@ -1075,14 +1126,8 @@ export default function App() {
               onExport={exportSuppliers} exporting={exporting === "suppliers"}
               pendingArrival={pendingArrival} onArrivalHandled={() => { setPendingArrival(null); refreshArrivals(); }}
               skuParams={skuParams} />
-          ) : activeView === "scorecard" ? (
-            <div className="flex-1 overflow-y-auto">
-              <ScorecardTab api={API} skuList={skuList} skuParams={skuParams}
-                setSkuParams={setSkuParams} openPOs={openPOs} lm={lm} folders={folders}
-                suppliers={suppliers} />
-            </div>
           ) : activeView === "backtest" ? (
-            <BacktestTab api={API} lm={lm} apiKey={GROQ_API_KEY} skuParams={skuParams}
+            <BacktestTab api={API} lm={lm} skuParams={skuParams}
               holdingPct={holdingPct} setHoldingPct={setHoldingPct} res={btRes} setRes={setBtRes} diag={btDiag} setDiag={setBtDiag}
               waiting={btWaiting.map(id => skuList.find(s => s.id === id)?.name || id)} waitingIds={btWaiting}
               onPickSku={(id) => { setActiveSku(id); setActiveView("fleet"); }} />
@@ -1097,11 +1142,11 @@ export default function App() {
             <div className="flex-1 overflow-y-auto">
               {restoreNote && (
                 <div className="px-4 sm:px-6 pt-4 sm:pt-6">
-                  <div className={`flex items-start gap-2.5 rounded-xl border px-4 py-2.5 text-xs leading-relaxed ${lm ? "bg-emerald-50 border-emerald-200 text-emerald-800" : "bg-emerald-950/30 border-emerald-900/50 text-emerald-300"}`}>
+                  <div className={`flex items-start gap-2.5 rounded-xl border px-4 py-2.5 text-[15px] leading-relaxed ${"bg-[var(--t-good-soft)] border-[var(--t-good-line)] text-[var(--t-good)]"}`}>
                     <span className="shrink-0 mt-0.5">✓</span>
                     <span className="flex-1">{restoreNote}</span>
                     <button onClick={() => setRestoreNote(null)}
-                      className={`shrink-0 ${lm ? "text-emerald-500 hover:text-emerald-700" : "text-emerald-600 hover:text-emerald-400"}`}>✕</button>
+                      className={`shrink-0 ${"text-[var(--t-good)] hover:text-[var(--t-good)]"}`}>✕</button>
                   </div>
                 </div>
               )}
@@ -1114,7 +1159,7 @@ export default function App() {
               <FleetBento skuForecasts={skuForecasts} getParams={getParams}
                 openPOs={openPOs} onSelectSku={setActiveSku} lm={lm}
                 onExportFleet={exportFleet} onExportAll={exportAll} exporting={exporting}
-                scorecardRows={scorecardRows} />
+                scorecardRows={scorecardRows} onEditCosts={() => setShowCosts(true)} />
             </div>
           )}
         </div>
@@ -1125,21 +1170,21 @@ export default function App() {
       {/* A backtest can take minutes. Without a visible marker the dashboard looks
           finished while the protection levels are still provisional. */}
       {btJob?.status === "running" && (
-        <div className={`fixed bottom-4 left-1/2 -translate-x-1/2 z-40 flex items-center gap-2.5 px-4 py-2.5 rounded-full border shadow-lg text-[12px] ${lm ? "bg-white border-violet-200 text-slate-700" : "bg-[#0d1117] border-violet-900/50 text-slate-200"}`}>
-          <svg className={`h-3.5 w-3.5 animate-spin ${lm ? "text-violet-600" : "text-violet-400"}`} fill="none" viewBox="0 0 24 24">
+        <div className={`fixed bottom-4 left-1/2 -translate-x-1/2 z-40 flex items-center gap-2.5 px-4 py-2.5 rounded-full border shadow-lg text-[15px] ${"bg-[var(--t-panel)] border-[var(--t-accent-line)] text-[var(--t-soft)]"}`}>
+          <svg className={`h-3.5 w-3.5 animate-spin ${"text-[var(--t-accent)]"}`} fill="none" viewBox="0 0 24 24">
             <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
             <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.4 0 0 5.4 0 12h4z" />
           </svg>
           <span>
             <span className="font-semibold">Testing your protection levels against your own sales history…</span>
-            <span className={`ml-1.5 ${lm ? "text-slate-500" : "text-slate-400"}`}>
+            <span className={`ml-1.5 ${"text-[var(--t-dim)]"}`}>
               a few minutes · figures shown are provisional estimates until it finishes
             </span>
           </span>
         </div>
       )}
       {btJob?.status === "error" && (
-        <div className={`fixed bottom-4 left-1/2 -translate-x-1/2 z-40 px-4 py-2.5 rounded-full border shadow-lg text-[12px] ${lm ? "bg-rose-50 border-rose-200 text-rose-700" : "bg-rose-950/40 border-rose-900/50 text-rose-300"}`}>
+        <div className={`fixed bottom-4 left-1/2 -translate-x-1/2 z-40 px-4 py-2.5 rounded-full border shadow-lg text-[15px] ${"bg-[var(--t-bad-soft)] border-[var(--t-bad-line)] text-[var(--t-bad)]"}`}>
             <span className="font-semibold">Protection test failed.</span> Still using estimates. <span className="font-mono opacity-80">{btJob.error}</span>
             <button onClick={() => triggerBacktest("retry")} className="ml-2 underline font-semibold">Retry</button>
         </div>
@@ -1147,6 +1192,10 @@ export default function App() {
 
       <AiDrawer skuForecasts={skuForecasts} skuParams={skuParams} skuList={skuList}
         openPOs={openPOs} folders={folders} apiKey={GROQ_API_KEY} suppliers={suppliers} api={API} />
+
+      <CostsSheet open={showCosts} onClose={() => setShowCosts(false)}
+        skuList={skuList} scorecardRows={scorecardRows} skuParams={skuParams}
+        setSkuParams={setSkuParams} lm={lm} />
 
       <CategorizePanel skuList={skuList} api={API} apiKey={GROQ_API_KEY} lm={lm} onApplied={onCatalogChanged}
         scorecardRows={scorecardRows}
@@ -1162,15 +1211,15 @@ export default function App() {
         <div className="fixed inset-0 z-[60] flex items-center justify-center p-4" onClick={() => setConfirm(null)}>
           <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
           <div onClick={e => e.stopPropagation()}
-            className={`relative w-full max-w-sm rounded-2xl border shadow-2xl p-5 ${lm ? "bg-white border-slate-200" : "bg-[#161619] border-white/10"}`}
+            className={`relative w-full max-w-sm rounded-2xl border shadow-2xl p-5 ${"bg-[var(--t-panel)] border-[var(--t-line)]"}`}
             style={{ boxShadow: "0 24px 70px rgba(0,0,0,.5)" }}>
-            <div className={`text-base font-bold ${lm ? "text-slate-900" : "text-white"}`}>{confirm.title}</div>
-            {confirm.body && <p className={`text-[13px] mt-2 leading-relaxed ${lm ? "text-slate-600" : "text-slate-400"}`}>{confirm.body}</p>}
+            <div className={`text-base font-bold ${"text-[var(--t-ink)]"}`}>{confirm.title}</div>
+            {confirm.body && <p className={`text-[15.5px] mt-2 leading-relaxed ${"text-[var(--t-soft)]"}`}>{confirm.body}</p>}
             <div className="flex items-center justify-end gap-2 mt-5">
               <button onClick={() => setConfirm(null)}
-                className={`px-3.5 py-2 rounded-lg text-[13px] font-semibold transition-colors ${lm ? "text-slate-600 hover:bg-slate-100" : "text-slate-300 hover:bg-white/5"}`}>Cancel</button>
+                className={`px-3.5 py-2 rounded-lg text-[15.5px] font-semibold transition-colors ${"text-[var(--t-soft)] hover:bg-[var(--t-sunken)]"}`}>Cancel</button>
               <button onClick={() => { const fn = confirm.onConfirm; setConfirm(null); fn?.(); }}
-                className={`px-3.5 py-2 rounded-lg text-[13px] font-bold text-white transition-colors ${confirm.danger ? "bg-rose-600 hover:bg-rose-500" : "bg-violet-600 hover:bg-violet-500"}`}>{confirm.confirmLabel || "Confirm"}</button>
+                className={`px-3.5 py-2 rounded-lg text-[15.5px] font-bold text-[var(--t-ink)] transition-colors ${confirm.danger ? "bg-[var(--t-bad-soft)] hover:bg-[var(--t-bad-soft)]" : "bg-[var(--t-accent-soft)] hover:bg-[var(--t-accent-soft)]"}`}>{confirm.confirmLabel || "Confirm"}</button>
             </div>
           </div>
         </div>
@@ -1183,7 +1232,7 @@ export default function App() {
           : skuList).slice(0, 8);
         const navHits = [
           ["Fleet overview", "fleet", "📊"], ["Suppliers", "suppliers", "🏭"],
-          ["Scorecard", "scorecard", "🎯"], ["Backtest", "backtest", "🧪"], ["Product grouping", "categorize", "🗂️"],
+          ["Backtest", "backtest", "🧪"], ["Product grouping", "categorize", "🗂️"],
         ].filter(([label]) => !q || label.toLowerCase().includes(q));
         const go = () => { const f = skuHits[0]; if (f) { setActiveSku(f.id); setPalette(false); } else if (navHits[0]) { setActiveSku(null); setActiveView(navHits[0][1]); setPalette(false); } };
         return (
@@ -1191,39 +1240,39 @@ export default function App() {
             onClick={() => setPalette(false)}>
             <div className="absolute inset-0 bg-black/55 backdrop-blur-sm" />
             <div onClick={e => e.stopPropagation()}
-              className={`relative w-full max-w-xl rounded-2xl border shadow-2xl overflow-hidden ${lm ? "bg-white border-slate-200" : "bg-[#161619] border-white/10"}`}
+              className={`relative w-full max-w-xl rounded-2xl border shadow-2xl overflow-hidden ${"bg-[var(--t-panel)] border-[var(--t-line)]"}`}
               style={{ boxShadow: "0 30px 90px rgba(0,0,0,.6)" }}>
-              <div className={`flex items-center gap-3 px-4 h-14 border-b ${lm ? "border-slate-100" : "border-white/10"}`}>
-                <svg className={`h-4 w-4 shrink-0 ${lm ? "text-slate-400" : "text-slate-500"}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M21 21l-4.35-4.35M17 11a6 6 0 11-12 0 6 6 0 0112 0z" /></svg>
+              <div className={`flex items-center gap-3 px-4 h-14 border-b ${"border-[var(--t-line)]"}`}>
+                <svg className={`h-4 w-4 shrink-0 ${"text-[var(--t-dim)]"}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M21 21l-4.35-4.35M17 11a6 6 0 11-12 0 6 6 0 0112 0z" /></svg>
                 <input autoFocus value={paletteQ} onChange={e => setPaletteQ(e.target.value)}
                   onKeyDown={e => { if (e.key === "Enter") go(); }}
                   placeholder="Jump to a SKU, supplier, or view…"
-                  className={`flex-1 bg-transparent outline-none text-[15px] ${lm ? "text-slate-900 placeholder-slate-400" : "text-white placeholder-slate-500"}`} />
-                <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded border ${lm ? "border-slate-200 text-slate-400" : "border-slate-700 text-slate-500"}`}>esc</span>
+                  className={`flex-1 bg-transparent outline-none text-[16.5px] ${"text-[var(--t-ink)] placeholder-[var(--t-line2)]"}`} />
+                <span className={`text-[13px] font-mono px-1.5 py-0.5 rounded border ${"border-[var(--t-line)] text-[var(--t-dim)]"}`}>esc</span>
               </div>
               <div className="max-h-[52vh] overflow-y-auto py-2">
                 {skuHits.length > 0 && (
-                  <div className={`px-4 pt-1 pb-1 text-[11px] font-semibold uppercase tracking-wide ${lm ? "text-slate-400" : "text-slate-500"}`}>Products</div>
+                  <div className={`px-4 pt-1 pb-1 text-[14px] font-semibold uppercase tracking-wide ${"text-[var(--t-dim)]"}`}>Products</div>
                 )}
                 {skuHits.map(s => (
                   <button key={s.id} onClick={() => { setActiveSku(s.id); setPalette(false); }}
-                    className={`w-full flex items-center gap-3 px-4 py-2.5 text-left transition-colors ${lm ? "hover:bg-slate-100" : "hover:bg-white/5"}`}>
-                    <span className={`text-[11px] font-mono px-1.5 py-0.5 rounded ${lm ? "bg-slate-100 text-slate-500" : "bg-white/5 text-slate-400"}`}>{s.id}</span>
-                    <span className={`text-[14px] ${lm ? "text-slate-800" : "text-slate-200"}`}>{s.name || s.id}</span>
+                    className={`w-full flex items-center gap-3 px-4 py-2.5 text-left transition-colors ${"hover:bg-[var(--t-sunken)]"}`}>
+                    <span className={`text-[14px] font-mono px-1.5 py-0.5 rounded ${"bg-[var(--t-sunken)] text-[var(--t-dim)]"}`}>{s.id}</span>
+                    <span className={`text-[15.5px] ${"text-[var(--t-soft)]"}`}>{s.name || s.id}</span>
                   </button>
                 ))}
                 {navHits.length > 0 && (
-                  <div className={`px-4 pt-2 pb-1 text-[11px] font-semibold uppercase tracking-wide ${lm ? "text-slate-400" : "text-slate-500"}`}>Views</div>
+                  <div className={`px-4 pt-2 pb-1 text-[14px] font-semibold uppercase tracking-wide ${"text-[var(--t-dim)]"}`}>Views</div>
                 )}
                 {navHits.map(([label, view, icon]) => (
                   <button key={view} onClick={() => { setActiveSku(null); setActiveView(view); setPalette(false); }}
-                    className={`w-full flex items-center gap-3 px-4 py-2.5 text-left transition-colors ${lm ? "hover:bg-slate-100" : "hover:bg-white/5"}`}>
-                    <span className="text-[15px]">{icon}</span>
-                    <span className={`text-[14px] ${lm ? "text-slate-800" : "text-slate-200"}`}>{label}</span>
+                    className={`w-full flex items-center gap-3 px-4 py-2.5 text-left transition-colors ${"hover:bg-[var(--t-sunken)]"}`}>
+                    <span className="text-[16.5px]">{icon}</span>
+                    <span className={`text-[15.5px] ${"text-[var(--t-soft)]"}`}>{label}</span>
                   </button>
                 ))}
                 {skuHits.length === 0 && navHits.length === 0 && (
-                  <div className={`px-4 py-8 text-center text-[13px] ${lm ? "text-slate-400" : "text-slate-500"}`}>No matches for “{paletteQ}”.</div>
+                  <div className={`px-4 py-8 text-center text-[15.5px] ${"text-[var(--t-dim)]"}`}>No matches for “{paletteQ}”.</div>
                 )}
               </div>
             </div>

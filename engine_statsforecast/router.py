@@ -166,11 +166,19 @@ def _usable_member_ids(member_ids, catalog: dict, min_days: int = RELATIVE_MIN_D
     return out
 
 
-def _cohesion_for_ids(member_ids, catalog: dict) -> float:
+def _cohesion_for_ids(member_ids, catalog: dict, baseline=None) -> float:
+    """Average agreement across a set of SKUs.
+
+    With a `baseline` this is DISTINCTIVE agreement — what the pooling gate wants, and the
+    same scale the clustering threshold is on. Without one it stays the raw score, which is
+    what adaptive_group_catalog's split test wants: that test compares a subgroup against
+    its parent, and since the shared rhythm inflates both sides of a difference it largely
+    cancels there. An absolute threshold is where the inflation actually does damage."""
     sigs = [s for s in (_seasonal_signature(catalog[m]["df"]) for m in member_ids if m in catalog) if s is not None]
     if len(sigs) < 2:
         return 0.0
-    vals = [_shape_corr(sigs[i], sigs[j]) for i in range(len(sigs)) for j in range(i + 1, len(sigs))]
+    vals = [distinct_corr(sigs[i], sigs[j], baseline)
+            for i in range(len(sigs)) for j in range(i + 1, len(sigs))]
     return float(np.mean(vals)) if vals else 0.0
 
 
@@ -374,7 +382,31 @@ def related_frames(sku_id: str, groups: dict, catalog: dict,
 #  not just "relatives that share a label."
 # ─────────────────────────────────────────────────────────────────────────────
 SHAPE_MIN_DAYS  = 120    # history needed before a SKU has a stable seasonal signature
-SHAPE_THRESHOLD = 0.40   # min weekly+monthly correlation to call two SKUs "alike"
+SHAPE_THRESHOLD = 0.40   # raw fingerprint correlation — kept for display ("move together")
+DISTINCT_THRESHOLD = 0.35
+"""Minimum DISTINCTIVE agreement to call two SKUs alike — correlation measured after the
+catalog-wide average fingerprint is subtracted from both.
+
+Grouping used to threshold the RAW correlation, which is dominated by the rhythm every
+product shares. Nearly everything is busier at the weekend, so those seven weekday numbers
+are close to identical catalog-wide and lift every comparison. Measured on products built
+to be unrelated but given a common weekend rhythm, the raw score called them alike:
+
+    products with no real seasonality      100% of unrelated pairs matched
+    weakly seasonal                         22%
+    strongly seasonal                       11%
+
+versus 3%, 5% and 8% on the distinctive score. The failure is worst exactly where most of
+a catalog lives — products without a strong season of their own, where the weekend rhythm
+is all that is left in the fingerprint to correlate on.
+
+The app already computed this number and showed it on the Grouping tab as "Specific to
+this group"; it simply wasn't the one that decided anything. Now it is.
+
+0.35 rather than 0.40 because removing the shared component lowers every score: on the
+real catalog 0.40 split two mirrors of the same product line that score 0.38 against each
+other, which is plainly wrong. 0.35 keeps every genuine family intact.
+"""
 
 
 def _seasonal_signature(df, min_days: int = SHAPE_MIN_DAYS):
@@ -389,15 +421,35 @@ def _seasonal_signature(df, min_days: int = SHAPE_MIN_DAYS):
     mu = float(y.mean()) or 1.0
     norm = y / mu
     wd = d["ds"].dt.weekday.to_numpy(); mn = d["ds"].dt.month.to_numpy() - 1
-    wk = np.array([norm[wd == i].mean() if (wd == i).any() else 1.0 for i in range(7)])
-    mo = np.array([norm[mn == i].mean() if (mn == i).any() else 1.0 for i in range(12)])
+    # NaN, not 1.0, for a slot the product has never lived through. A SKU at the
+    # 180-day pooling minimum has only seen half the year, and filling the other six
+    # months with a neutral 1.0 does not represent "no seasonality here" — it invents
+    # six data points, and any two short-history SKUs then share those SAME six
+    # invented values. Measured on real months only, two products whose correlation is
+    # -0.03 were scoring +0.53 and being pooled together. _shape_corr masks to the
+    # slots both products actually observed and refuses to judge on too few.
+    wk = np.array([norm[wd == i].mean() if (wd == i).any() else np.nan for i in range(7)])
+    mo = np.array([norm[mn == i].mean() if (mn == i).any() else np.nan for i in range(12)])
     return np.concatenate([wk, mo])
 
 
+MIN_JOINT_MONTHS = 5     # calendar months both products must have actually observed
+
+
 def _shape_corr(a, b) -> float:
-    """Correlation between two seasonal fingerprints, robust to flat (no-season) ones."""
+    """Correlation between two seasonal fingerprints, over the slots BOTH products
+    actually observed. Robust to flat (no-season) profiles. Returns 0.0 — "cannot
+    judge" — when the two histories overlap in too little of the year to compare,
+    rather than scoring them on invented values."""
     if a is None or b is None:
         return 0.0
+    a = np.asarray(a, float); b = np.asarray(b, float)
+    m = np.isfinite(a) & np.isfinite(b)
+    # Slots 7..18 are the months. Two SKUs whose histories cover different halves of
+    # the year have nothing comparable to say about each other's annual shape.
+    if int(m[7:].sum()) < MIN_JOINT_MONTHS or int(m.sum()) < 3:
+        return 0.0
+    a, b = a[m], b[m]
     fa, fb = np.std(a) < 1e-9, np.std(b) < 1e-9
     if fa or fb:
         return 1.0 if (fa and fb) else 0.0   # two flat profiles are 'alike'; flat vs seasonal isn't
@@ -405,28 +457,75 @@ def _shape_corr(a, b) -> float:
     return c if np.isfinite(c) else 0.0
 
 
-def _cluster_by_shape(items, threshold: float = SHAPE_THRESHOLD):
-    """items: list of (key, signature). Connected-components clustering — any two SKUs
-    whose fingerprints correlate ≥ threshold land in the same cluster."""
-    n = len(items); parent = list(range(n))
-    def find(a):
-        while parent[a] != a:
-            parent[a] = parent[parent[a]]; a = parent[a]
-        return a
+def catalog_baseline(catalog: dict):
+    """The average seasonal fingerprint across the whole catalog — "what a typical
+    product of this business does". Subtracting it is what separates "these two move
+    together" from "these two move together in a way the rest of the catalog does not"."""
+    sigs = [s for s in (_seasonal_signature((c or {}).get("df")) for c in catalog.values())
+            if s is not None]
+    if not sigs:
+        return None
+    return np.nanmean(np.vstack(sigs), axis=0)
+
+
+def distinct_corr(a, b, baseline=None) -> float:
+    """How alike two fingerprints are AFTER the catalog-wide rhythm is taken out of both.
+    Falls back to the raw comparison when there is no baseline to subtract (a catalog too
+    small to have an average worth speaking of)."""
+    if baseline is None or a is None or b is None:
+        return _shape_corr(a, b)
+    bl = np.asarray(baseline, float)
+    return _shape_corr(np.asarray(a, float) - bl, np.asarray(b, float) - bl)
+
+
+def _cluster_by_shape(items, threshold: float = DISTINCT_THRESHOLD, baseline=None):
+    """items: list of (key, signature). COMPLETE-linkage clustering — a SKU joins a
+    cluster only if it clears `threshold` against EVERY member already in it.
+
+    This was single-linkage (connected components), which merges two clusters on one
+    chance link: A~B at 0.41 and B~C at 0.41 put A and C in the same pool even when
+    A and C correlate 0.05. Roughly 10% of genuinely unrelated pairs clear 0.40 by
+    chance at the 180-day minimum — a 19-point correlation with no significance test —
+    and chaining compounds that fast: simulated on products built to be unrelated,
+    20 of them collapsed 71% into one cluster and 40 of them 98%, at which point the
+    behavioural split has stopped doing anything at all. On the real catalog this
+    change is what separates the three Brixton faucets (weakest pair 0.55) from a
+    bundle component that had chained in at 0.21.
+
+    Seeded most-connected-first so the densest genuine family forms before stragglers
+    get a chance to claim members.
+    """
+    n = len(items)
+    if n == 0:
+        return []
+    C = np.eye(n)
     for i in range(n):
         for j in range(i + 1, n):
-            if _shape_corr(items[i][1], items[j][1]) >= threshold:
-                parent[find(i)] = find(j)
-    buckets: dict = {}
-    for i in range(n):
-        buckets.setdefault(find(i), []).append(items[i][0])
-    return list(buckets.values())
+            C[i, j] = C[j, i] = distinct_corr(items[i][1], items[j][1], baseline)
+    used = [False] * n
+    out = []
+    for i in sorted(range(n), key=lambda k: -float(C[k].sum())):
+        if used[i]:
+            continue
+        cl = [i]; used[i] = True
+        for j in sorted(range(n), key=lambda k: -float(C[i, k])):
+            if used[j] or j == i:
+                continue
+            if all(C[j, k] >= threshold for k in cl):
+                cl.append(j); used[j] = True
+        out.append([items[k][0] for k in cl])
+    return out
 
 
 def cluster_catalog(groups: dict, catalog: dict, min_days: int = RELATIVE_MIN_DAYS,
-                    threshold: float = SHAPE_THRESHOLD) -> dict:
+                    threshold: float = DISTINCT_THRESHOLD, baseline=None) -> dict:
     """For every category, cluster its usable members (≥ min_days history) by seasonal
     shape. Returns {group_key: [[sku_id, ...], ...]}."""
+    # One baseline for the whole catalog, not per category: the rhythm being removed is
+    # the BUSINESS's, and computing it per group would subtract part of what makes a
+    # group distinctive in the first place.
+    if baseline is None:
+        baseline = catalog_baseline(catalog)
     by_group: dict = {}
     for sid, g in groups.items():
         if g is None:
@@ -439,7 +538,7 @@ def cluster_catalog(groups: dict, catalog: dict, min_days: int = RELATIVE_MIN_DA
         sigs = [(m, _seasonal_signature(catalog[m]["df"])) for m in members]
         sigs = [(m, s) for m, s in sigs if s is not None]
         out[g] = ([[m for m, _ in sigs]] if sigs else []) if len(sigs) <= 1 \
-            else _cluster_by_shape(sigs, threshold)
+            else _cluster_by_shape(sigs, threshold, baseline)
     return out
 
 
@@ -461,9 +560,13 @@ def cluster_cohesion(member_ids, catalog, baseline=None) -> dict | None:
         res = [np.asarray(s, float) - bl for s in sigs]
         dist = [_shape_corr(res[i], res[j]) for i in range(len(res)) for j in range(i + 1, len(res))]
         out["distinctive"] = round(float(np.mean(dist)), 3) if dist else None
+        # The weakest pair on the SAME scale the threshold uses. "Weakest pair" was
+        # reported raw while the threshold applied to the distinctive score, so the two
+        # numbers sat side by side looking comparable and were not.
+        out["distinctiveMin"] = round(float(np.min(dist)), 3) if dist else None
         # Plain-language drivers: the months/weekend where this group's average shape
         # deviates most from the catalog norm (what makes them distinctively alike).
-        dev = np.mean(sigs, axis=0) - bl
+        dev = np.nanmean(np.vstack(sigs), axis=0) - bl
         TH = 0.10
         mo = dev[7:19]
         hi = [_MONTHS[i] for i in np.argsort(mo)[::-1] if mo[i] > TH][:2]
@@ -479,7 +582,8 @@ _MONTHS = ["January", "February", "March", "April", "May", "June", "July", "Augu
 
 
 def behavioral_relatives(sku_id: str, groups: dict, catalog: dict,
-                         clusters: dict | None = None, min_days: int = RELATIVE_MIN_DAYS):
+                         clusters: dict | None = None, min_days: int = RELATIVE_MIN_DAYS,
+                         baseline=None):
     """The donor frames a SKU should actually pool from: the single behavioural cluster
     (within its category) it best fits. Returns (frames, n, info).
 
@@ -489,8 +593,10 @@ def behavioral_relatives(sku_id: str, groups: dict, catalog: dict,
     g = groups.get(sku_id)
     if g is None:
         return [], 0, None
+    if baseline is None:
+        baseline = catalog_baseline(catalog)
     if clusters is None:
-        clusters = cluster_catalog(groups, catalog, min_days=min_days)
+        clusters = cluster_catalog(groups, catalog, min_days=min_days, baseline=baseline)
     cls = [[m for m in cl if m != sku_id] for cl in clusters.get(g, [])]
     cls = [cl for cl in cls if cl]
     if not cls:
@@ -509,13 +615,18 @@ def behavioral_relatives(sku_id: str, groups: dict, catalog: dict,
 
     def centroid(cl):
         sigs = [s for s in (_seasonal_signature(catalog[m]["df"]) for m in cl) if s is not None]
-        return np.mean(sigs, axis=0) if sigs else None
+        # nanmean: signatures carry NaN for unobserved months, and a plain mean would
+        # poison every slot any one sibling happens to be missing.
+        return np.nanmean(np.vstack(sigs), axis=0) if sigs else None
 
     tgt_df = catalog[sku_id].get("df")
     tgt_days = _days(tgt_df) if tgt_df is not None and len(tgt_df) > 1 else 0
     tgt_sig = _seasonal_signature(tgt_df, min_days=28)
     if tgt_sig is not None and tgt_days >= NEW_DAYS:
-        chosen = max(candidate_cls, key=lambda cl: _shape_corr(tgt_sig, centroid(cl)))
+        # distinct_corr, not _shape_corr: the clusters were formed on distinctive
+        # agreement, so picking between them on the raw score would let the shared
+        # weekend rhythm decide which pool a newcomer joins.
+        chosen = max(candidate_cls, key=lambda cl: distinct_corr(tgt_sig, centroid(cl), baseline))
         basis = "matched by its own seasonal shape"
     else:
         own = tgt_df.dropna(subset=["y"])["y"] if tgt_df is not None else []
@@ -543,7 +654,8 @@ def _days(df: pd.DataFrame) -> int:
 #  ROUTE DECISION
 # ─────────────────────────────────────────────────────────────────────────────
 def route(days_history: int, total_sales: int, demand_class: str,
-          n_relatives: int, selling_days: int | None = None) -> tuple[str, str]:
+          n_relatives: int, selling_days: int | None = None,
+          pool_cohesion: float | None = None) -> tuple[str, str]:
     """Returns (method, plain_language_reason). method ∈ prophet|global|croston|abstain."""
     intermittent = demand_class in ("intermittent", "lumpy")   # sells sporadically, but DOES sell
     sparse = intermittent or demand_class == "no_demand"
@@ -579,7 +691,18 @@ def route(days_history: int, total_sales: int, demand_class: str,
     # 3) New / thin / no-own-sales, but enough related products to learn from → global pooled.
     #    (A NEW sparse SKU can't yet be told apart from a genuinely intermittent one, so it
     #    borrows from peers; a no-demand SKU has nothing for Croston to model.)
-    if n_relatives >= MIN_RELATIVES and (is_new or sparse or not established):
+    #    The pool must also actually AGREE on a shape. cluster_cohesion was being
+    #    computed, shown on the Grouping tab, and then ignored here: routing asked only
+    #    "are there two of them?", so a cluster the app itself displayed as incoherent
+    #    still supplied a newcomer's whole forecast. It was backwards, too — the weaker
+    #    borrowing (Prophet's yearly blend, shape only) has always been gated at
+    #    cohesion >= 0.35, while THIS route, which borrows shape *and* volume level,
+    #    had no gate at all. Same floor now applies to both.
+    #    `None` means the caller could not measure it (a single-member pool, or a
+    #    backtest path that has no cohesion to hand) — that keeps the old behaviour
+    #    rather than silently withdrawing pooling from callers that never opted in.
+    pool_incoherent = pool_cohesion is not None and pool_cohesion < MIN_GROUP_COHESION
+    if n_relatives >= MIN_RELATIVES and not pool_incoherent and (is_new or sparse or not established):
         why_thin = ("it's a new product with little history of its own" if is_new
                     else "it has no sales of its own yet" if demand_class == "no_demand"
                     else "its own demand is too sparse to model alone" if sparse
@@ -598,6 +721,15 @@ def route(days_history: int, total_sales: int, demand_class: str,
 
     # 5) Not enough signal of any kind → abstain (last-resort moving average).
     if days_history < MIN_HISTORY_DAYS or total_sales < MIN_HISTORY_SALES:
+        if pool_incoherent:
+            return "abstain", (
+                f"LAST-RESORT ESTIMATE — this product has little history of its own "
+                f"({days_history} days, {total_sales} units), and while it does have "
+                f"{n_relatives} category peers, those peers do not agree on a seasonal shape "
+                f"(cohesion {pool_cohesion:.2f}, below the {MIN_GROUP_COHESION:.2f} needed to "
+                f"trust a borrowed pattern), so borrowing from them would invent a season this "
+                f"product may not have. It falls back to a flat moving average; treat it as a "
+                f"rough placeholder until it builds more history or its peer group tightens up.")
         return "abstain", (
             f"LAST-RESORT ESTIMATE — this product has neither enough of its own sales history "
             f"({days_history} days, {total_sales} units) nor enough similar products to borrow from, "

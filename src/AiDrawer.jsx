@@ -1,7 +1,8 @@
 import { posInt, namedSuppliers, buildScorecardBody } from './lib/helpers';
 import { useState, useRef, useEffect } from "react";
 import { loadStorage, saveStorage } from "./lib/storage";
-import { GROQ_URL, GROQ_MODEL_CHAT, GROQ_NO_TOOLS, groqToolsRan } from "./lib/ai";
+import { GROQ_URL, GROQ_MODEL_CHAT, GROQ_NO_TOOLS, groqToolsRan,
+         checkGroqModels, groqHealthMessage, recordGroqUsage, usageSummary } from "./lib/ai";
 
 // ─────────────────────────────────────────────
 // FULL CONTEXT BUILDER  (folder + supplier aware)
@@ -47,12 +48,30 @@ function rosterLine(s, sc, po, params) {
  *  Matching is loose on purpose: lowercase, and a product counts as named if the
  *  question contains its id or any word of its name four characters or longer. "Harlow"
  *  pulls in every Harlow product, which is the behaviour someone typing that expects. */
-function pickDetailSkus(question, skuForecasts, scorecard, cap = 6) {
-  // 6, not a rounder 10, because a rendered detail block is about 2,900 characters.
-  // Roster (~130 chars x every product) + 6 blocks lands near 21,000 characters, which
-  // clears the budget below with room for the preamble, the chat turns and the reply.
-  // Ten blocks came to 34,000 and would have tripped the very truncation this exists to
-  // avoid. If the blocks are ever slimmed, this can rise.
+function pickDetailSkus(question, skuForecasts, scorecard, cap = 3) {
+  // 3, and the reason is a hard external ceiling rather than taste.
+  //
+  // groq/compound-mini advertises 70,000 tokens per minute, but it is a ROUTER: it
+  // dispatches to sub-models (openai/gpt-oss-120b, llama-3.3-70b-versatile) that carry
+  // their own free-tier limits, and gpt-oss-120b's is 8,000 TPM. Probing it directly,
+  // requests up to ~6,400 real tokens returned 200 and ~9,500 came back 429 naming the
+  // SUB-MODEL, not compound. So the usable per-request budget is ~8,000 tokens, not
+  // 70,000, and the headline figure is unreachable for a single large call.
+  //
+  // A detail block renders at ~2,900 characters (~725 tokens). Budget for one question:
+  //   roster, every product      ~1,050 tokens
+  //   3 detail blocks            ~2,175
+  //   preamble and instructions    ~500
+  //   compound-mini's own scaffold ~449   (measured: a 30-token prompt bills as 449)
+  //   recent chat turns            ~200
+  //   room for the reply           ~700
+  //                              -------
+  //                              ~5,100 tokens, with ~2,900 of headroom.
+  // At 6 blocks the same sum reaches ~7,250, which is inside the ceiling on paper and
+  // over it in practice once a question or a reply runs long. That margin is what made
+  // the drawer fail intermittently rather than consistently.
+  //
+  // On a paid tier this can go straight back to 6, or higher.
   const q = (question || "").toLowerCase();
   const scMap = {};
   (scorecard?.rows || []).forEach(r => { scMap[r.skuId] = r; });
@@ -502,6 +521,10 @@ ${skuLines}`;
         }),
       });
       const data = await res.json();
+      // The brief renders in its own component, so there is no setUsage in scope here.
+      // recordGroqUsage stores at module level regardless, which is where the reading
+      // lives; the drawer's header picks it up on its next render.
+      recordGroqUsage(data, 600);
       const ran = groqToolsRan(data);
       if (ran) console.warn(`[ai] built-in tools ran despite being disabled: ${ran}`);
       setBrief((ran ? `[warning: the model ran ${ran} — external content may have influenced this brief]\n\n` : "")
@@ -520,33 +543,33 @@ ${skuLines}`;
   };
 
   return (
-    <div className="mx-4 mb-3 border border-slate-800/60 rounded-2xl overflow-hidden">
+    <div className="mx-4 mb-3 border border-[var(--t-line)] rounded-2xl overflow-hidden">
       <button onClick={generate} disabled={loading}
-        className="w-full flex items-center gap-2.5 px-4 py-3 bg-slate-900/60 hover:bg-slate-800/60 disabled:opacity-60 transition-colors text-left">
-        <div className="h-6 w-6 rounded-lg bg-sky-600/20 border border-sky-700/40 flex items-center justify-center shrink-0">
+        className="w-full flex items-center gap-2.5 px-4 py-3 bg-[var(--t-bg)] hover:bg-[var(--t-line)] disabled:opacity-60 transition-colors text-left">
+        <div className="h-6 w-6 rounded-lg bg-[var(--t-info-soft)] border border-[var(--t-info-line)] flex items-center justify-center shrink-0">
           {loading
-            ? <div className="h-2.5 w-2.5 border-2 border-sky-400 border-t-transparent rounded-full animate-spin" />
-            : <svg className="h-3 w-3 text-sky-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            ? <div className="h-2.5 w-2.5 border-2 border-[var(--t-info-line)] border-t-transparent rounded-full animate-spin" />
+            : <svg className="h-3 w-3 text-[var(--t-info)]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
               </svg>
           }
         </div>
         <div>
-          <div className="text-[11px] font-semibold text-white">
+          <div className="text-[14px] font-semibold text-[var(--t-ink)]">
             {loading ? "Generating brief…" : "Generate Reorder Brief"}
           </div>
-          <div className="text-[10px] text-slate-500">AI-written purchasing summary, ready to forward</div>
+          <div className="text-[13px] text-[var(--t-dim)]">AI-written purchasing summary, ready to forward</div>
         </div>
       </button>
       {brief && (
-        <div className="border-t border-slate-800/60 bg-[#070b10]">
+        <div className="border-t border-[var(--t-line)] bg-[#070b10]">
           <div className="px-4 py-3 max-h-64 overflow-y-auto">
-            <p className="text-[11px] text-slate-300 leading-relaxed whitespace-pre-wrap">{brief}</p>
+            <p className="text-[14px] text-[var(--t-soft)] leading-relaxed whitespace-pre-wrap">{brief}</p>
           </div>
-          <div className="px-4 py-2 border-t border-slate-800/40 flex justify-between items-center">
-            <button onClick={() => setBrief(null)} className="text-[10px] text-slate-600 hover:text-slate-400 transition-colors">dismiss</button>
+          <div className="px-4 py-2 border-t border-[var(--t-line)] flex justify-between items-center">
+            <button onClick={() => setBrief(null)} className="text-[13px] text-[var(--t-soft)] hover:text-[var(--t-dim)] transition-colors">dismiss</button>
             <button onClick={copy}
-              className="flex items-center gap-1.5 text-[10px] font-semibold text-sky-400 hover:text-sky-300 border border-sky-900/40 hover:border-sky-700/60 bg-sky-950/20 rounded-lg px-2.5 py-1 transition-all">
+              className="flex items-center gap-1.5 text-[13px] font-semibold text-[var(--t-info)] hover:text-[var(--t-info)] border border-[var(--t-info-line)] hover:border-[var(--t-info-line)] bg-[var(--t-info-soft)] rounded-lg px-2.5 py-1 transition-all">
               {copied
                 ? <><svg className="h-2.5 w-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>Copied!</>
                 : <><svg className="h-2.5 w-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" /></svg>Copy to clipboard</>
@@ -575,16 +598,16 @@ function MessageBubble({ msg }) {
   return (
     <div className={`flex gap-2.5 ${isUser ? "flex-row-reverse" : "flex-row"}`}>
       {!isUser && (
-        <div className="h-6 w-6 shrink-0 rounded-lg bg-violet-600/30 border border-violet-700/50 flex items-center justify-center mt-0.5">
-          <svg className="h-3 w-3 text-violet-300" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+        <div className="h-6 w-6 shrink-0 rounded-lg bg-[var(--t-accent-soft)] border border-[var(--t-accent-line)] flex items-center justify-center mt-0.5">
+          <svg className="h-3 w-3 text-[var(--t-accent)]" viewBox="0 0 24 24" fill="none" stroke="currentColor">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
           </svg>
         </div>
       )}
-      <div className={`max-w-[85%] rounded-2xl px-3.5 py-2.5 text-[11px] leading-relaxed whitespace-pre-wrap ${
+      <div className={`max-w-[85%] rounded-2xl px-3.5 py-2.5 text-[14px] leading-relaxed whitespace-pre-wrap ${
         isUser
-          ? "bg-sky-600/20 border border-sky-700/40 text-sky-100 rounded-tr-sm"
-          : "bg-slate-800/60 border border-slate-700/50 text-slate-200 rounded-tl-sm"
+          ? "bg-[var(--t-info-soft)] border border-[var(--t-info-line)] text-[var(--t-info)] rounded-tr-sm"
+          : "bg-[var(--t-line)] border border-[var(--t-line2)] text-[var(--t-ink)] rounded-tl-sm"
       }`}>
         {msg.content}
       </div>
@@ -598,14 +621,14 @@ function MessageBubble({ msg }) {
 function TypingIndicator() {
   return (
     <div className="flex gap-2.5 flex-row">
-      <div className="h-6 w-6 shrink-0 rounded-lg bg-violet-600/30 border border-violet-700/50 flex items-center justify-center">
-        <svg className="h-3 w-3 text-violet-300" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+      <div className="h-6 w-6 shrink-0 rounded-lg bg-[var(--t-accent-soft)] border border-[var(--t-accent-line)] flex items-center justify-center">
+        <svg className="h-3 w-3 text-[var(--t-accent)]" viewBox="0 0 24 24" fill="none" stroke="currentColor">
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
         </svg>
       </div>
-      <div className="bg-slate-800/60 border border-slate-700/50 rounded-2xl rounded-tl-sm px-4 py-3 flex items-center gap-1">
+      <div className="bg-[var(--t-line)] border border-[var(--t-line2)] rounded-2xl rounded-tl-sm px-4 py-3 flex items-center gap-1">
         {[0, 1, 2].map(i => (
-          <div key={i} className="h-1.5 w-1.5 rounded-full bg-slate-500 animate-bounce"
+          <div key={i} className="h-1.5 w-1.5 rounded-full bg-[var(--t-sunken)] animate-bounce"
                style={{ animationDelay: `${i * 150}ms`, animationDuration: "0.8s" }} />
         ))}
       </div>
@@ -625,6 +648,17 @@ export default function AiDrawer({ skuForecasts, openPOs, skuParams, skuList, fo
   // Off by default: including full sales history makes the request too large for
   // Groq's free tier (12k tokens/min). Turn on once you're on a higher tier.
   const [includeHistory, setIncludeHistory] = useState(false);
+  // Deprecation banner and a live token readout. Both exist because this project's
+  // failures have all been silent: a retired model surfaced as "couldn't parse that",
+  // and an oversized request surfaced as nothing at all.
+  const [health, setHealth] = useState(null);
+  const [usage,  setUsage]  = useState(null);
+
+  useEffect(() => {
+    let alive = true;
+    checkGroqModels().then(h => { if (alive) setHealth(h); });
+    return () => { alive = false; };
+  }, []);
   const bottomRef = useRef(null);
   const inputRef  = useRef(null);
 
@@ -761,12 +795,16 @@ export default function AiDrawer({ skuForecasts, openPOs, skuParams, skuList, fo
     // blocks are dropped from the end — losing depth on some products, never their
     // existence. (The old comment also cited a 12k/min budget, which was the retired
     // model's; see GROQ_MODEL_CHAT in lib/ai.js for the current one.)
-    // 90k with history, not the 200k it was. 200,000 characters is ~50,000 tokens for a
-    // SINGLE message, which is most of compound-mini's 70,000-per-minute allowance in one
-    // go and guarantees a 429 on the follow-up question. 90k is ~22,500 tokens, so three
-    // history-backed questions fit inside a minute. Without history the roster keeps the
-    // whole thing near 22,000 characters and this never fires at all.
-    const FLEET_CHAR_BUDGET = includeHistory ? 90000 : 28000;
+    // Both figures are now set by the ~8,000-token per-request ceiling described above,
+    // not by the per-minute allowance. 20,000 characters is ~5,000 tokens, which leaves
+    // room for the preamble, the turns and the reply.
+    //
+    // "Full sales history" cannot fit inside that ceiling on the free tier at all: 90
+    // days of daily rows across a real catalogue runs to tens of thousands of tokens on
+    // its own. Rather than let the toggle build a request that is certain to be refused,
+    // it now gets the same budget and is trimmed to fit — the model sees a slice of the
+    // history and is told so, instead of the request failing outright.
+    const FLEET_CHAR_BUDGET = 20000;
     if (fleetCtx.length > FLEET_CHAR_BUDGET) {
       const cut = fleetCtx.lastIndexOf("\n\n━━━ SKU:", FLEET_CHAR_BUDGET);
       fleetCtx = (cut > 0 ? fleetCtx.slice(0, cut) : fleetCtx.slice(0, FLEET_CHAR_BUDGET)) +
@@ -863,6 +901,7 @@ ${fleetCtx}
       }
 
       const data = await res.json();
+      recordGroqUsage(data, 700); setUsage(usageSummary());
       // Tools are meant to be off. If one ran anyway, external content reached the same
       // context as the catalogue, and the reader has to know that before trusting it.
       const ran = groqToolsRan(data);
@@ -899,20 +938,20 @@ ${fleetCtx}
           ? { position: "fixed", top: `${btnY}px`, right: "24px", bottom: "auto", zIndex: 40 }
           : { position: "fixed", bottom: "24px",  right: "24px",            zIndex: 40 }
         }
-        className="flex items-center gap-2 px-4 py-2.5 rounded-2xl bg-violet-600 hover:bg-violet-500 border border-violet-500/60 shadow-lg shadow-violet-900/40 transition-colors select-none cursor-grab active:cursor-grabbing"
+        className="flex items-center gap-2 px-4 py-2.5 rounded-2xl bg-[var(--t-accent-soft)] hover:bg-[var(--t-accent-soft)] border border-[var(--t-accent-line)] shadow-lg shadow-[var(--t-accent-line)] transition-colors select-none cursor-grab active:cursor-grabbing"
       >
         {/* Grip indicator */}
-        <svg className="h-3 w-3 text-violet-300/60 shrink-0" viewBox="0 0 10 16" fill="currentColor">
+        <svg className="h-3 w-3 text-[var(--t-accent)] shrink-0" viewBox="0 0 10 16" fill="currentColor">
           <circle cx="3" cy="3"  r="1.2"/><circle cx="7" cy="3"  r="1.2"/>
           <circle cx="3" cy="8"  r="1.2"/><circle cx="7" cy="8"  r="1.2"/>
           <circle cx="3" cy="13" r="1.2"/><circle cx="7" cy="13" r="1.2"/>
         </svg>
-        <svg className="h-4 w-4 text-white" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+        <svg className="h-4 w-4 text-[var(--t-ink)]" viewBox="0 0 24 24" fill="none" stroke="currentColor">
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
         </svg>
-        <span className="text-xs font-semibold text-white">Ask AI</span>
+        <span className="text-[15px] font-semibold text-[var(--t-ink)]">Ask AI</span>
         {urgentCount > 0 && (
-          <span className="h-4 w-4 rounded-full bg-red-500 text-white text-[10px] font-bold flex items-center justify-center">
+          <span className="h-4 w-4 rounded-full bg-[var(--t-bad-soft)] text-[var(--t-ink)] text-[13px] font-bold flex items-center justify-center">
             {urgentCount}
           </span>
         )}
@@ -924,28 +963,36 @@ ${fleetCtx}
       )}
 
       {/* ── DRAWER ── */}
-      <div className={`fixed top-0 right-0 h-full z-50 w-[420px] flex flex-col bg-[#0a0e14] border-l border-slate-800/80 shadow-2xl shadow-black/60 transition-transform duration-300 ease-out ${open ? "translate-x-0" : "translate-x-full"}`}>
+      <div className={`fixed top-0 right-0 h-full z-50 w-[420px] flex flex-col bg-[#0a0e14] border-l border-[var(--t-line)] shadow-2xl shadow-black/60 transition-transform duration-300 ease-out ${open ? "translate-x-0" : "translate-x-full"}`}>
 
         {/* Header */}
-        <div className="shrink-0 px-5 py-4 border-b border-slate-800/60 flex items-center gap-3">
-          <div className="h-7 w-7 rounded-xl bg-violet-600/30 border border-violet-700/50 flex items-center justify-center">
-            <svg className="h-3.5 w-3.5 text-violet-300" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+        <div className="shrink-0 px-5 py-4 border-b border-[var(--t-line)] flex items-center gap-3">
+          <div className="h-7 w-7 rounded-xl bg-[var(--t-accent-soft)] border border-[var(--t-accent-line)] flex items-center justify-center">
+            <svg className="h-3.5 w-3.5 text-[var(--t-accent)]" viewBox="0 0 24 24" fill="none" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
             </svg>
           </div>
           <div className="flex-1">
-            <div className="text-xs font-bold text-white">Fleet Intelligence</div>
-            <div className="text-[10px] text-slate-500 font-mono">
+            <div className="text-[15px] font-bold text-[var(--t-ink)]">Fleet Intelligence</div>
+            <div className="text-[13px] text-[var(--t-dim)] font-mono">
               {skuForecasts?.length ?? 0} SKU{skuForecasts?.length !== 1 ? "s" : ""}
               {folderCount > 0 ? ` · ${folderCount} folder${folderCount !== 1 ? "s" : ""}` : ""}
               {/* Derived from GROQ_MODEL_CHAT rather than typed, so the label can't outlive
                   the model it names the next time Groq retires one. */}
               {` · full context · ${GROQ_MODEL_CHAT.split("/").pop()}`}
+              {/* The measured size of the last request. Every limit hit in this project
+                  was diagnosed by estimating tokens from character counts, and the
+                  estimates were wrong twice; this is the number Groq actually billed. */}
+              {usage && (
+                <span className={usage.tight ? "text-[var(--t-warn)]" : "text-[var(--t-soft)]"}>
+                  {` · ${usage.text}`}{usage.tight ? " (tight)" : ""}
+                </span>
+              )}
             </div>
           </div>
           <button onClick={() => setOpen(false)}
-            className="h-7 w-7 rounded-lg bg-slate-800/60 hover:bg-slate-700 flex items-center justify-center transition-colors">
-            <svg className="h-3.5 w-3.5 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            className="h-7 w-7 rounded-lg bg-[var(--t-line)] hover:bg-[var(--t-line)] flex items-center justify-center transition-colors">
+            <svg className="h-3.5 w-3.5 text-[var(--t-dim)]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
             </svg>
           </button>
@@ -960,13 +1007,31 @@ ${fleetCtx}
           apiKey={apiKey}
         />
 
+        {/* Retired-model banner. Sits above everything because when it fires, nothing
+            else in this drawer will work, and the alternative is six features failing
+            separately with errors that each describe a symptom rather than the cause. */}
+        {groqHealthMessage(health) && (
+          <div className="shrink-0 mx-4 mt-3 rounded-lg border border-[var(--t-warn-line)] bg-[var(--t-warn-soft)] px-3 py-2.5">
+            <div className="flex items-start gap-2">
+              <svg className="h-3.5 w-3.5 text-[var(--t-warn)] mt-0.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                      d="M12 9v4m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/>
+              </svg>
+              <div>
+                <div className="text-[14px] font-semibold text-[var(--t-warn)]">Model no longer available</div>
+                <div className="text-[14px] text-[var(--t-warn)] mt-0.5 leading-snug">{groqHealthMessage(health)}</div>
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* Messages */}
         <div className="flex-1 overflow-y-auto px-4 py-4 space-y-3">
           {messages.length === 0 && (
             <div className="space-y-4 pt-2">
               <div className="text-center space-y-1.5">
-                <div className="text-[11px] text-slate-400 font-medium">Ask anything about your inventory</div>
-                <div className="text-[11px] text-slate-600">
+                <div className="text-[14px] text-[var(--t-dim)] font-medium">Ask anything about your inventory</div>
+                <div className="text-[14px] text-[var(--t-soft)]">
                   {folderCount > 0
                     ? `Folders, forecasts, reorders, events — all in context`
                     : "3-month forecasts, parameters, events, POs — all in context"}
@@ -983,8 +1048,8 @@ ${fleetCtx}
                   ...SUGGESTED_PROMPTS,
                 ].slice(0, 4).map((p, i) => (
                   <button key={i} onClick={() => sendMessage(p)}
-                    className="text-left px-3 py-2.5 rounded-xl bg-slate-800/50 border border-slate-700/50 hover:border-violet-700/50 hover:bg-violet-950/20 transition-all group">
-                    <span className="text-[11px] text-slate-400 group-hover:text-violet-300 transition-colors leading-snug">{p}</span>
+                    className="text-left px-3 py-2.5 rounded-xl bg-[var(--t-line)] border border-[var(--t-line2)] hover:border-[var(--t-accent-line)] hover:bg-[var(--t-accent-soft)] transition-all group">
+                    <span className="text-[14px] text-[var(--t-dim)] group-hover:text-[var(--t-accent)] transition-colors leading-snug">{p}</span>
                   </button>
                 ))}
               </div>
@@ -1000,7 +1065,7 @@ ${fleetCtx}
         {messages.length > 0 && (
           <div className="px-4 pb-1 flex justify-end">
             <button onClick={() => { setMessages([]); setError(null); }}
-              className="text-[10px] text-slate-600 hover:text-slate-400 transition-colors">
+              className="text-[13px] text-[var(--t-soft)] hover:text-[var(--t-dim)] transition-colors">
               Clear conversation
             </button>
           </div>
@@ -1009,18 +1074,18 @@ ${fleetCtx}
         {/* Input */}
         <div className="shrink-0 px-4 pb-5 pt-2">
           {error && (
-            <div className="mb-2 text-[10px] text-rose-400 bg-rose-950/20 border border-rose-900/30 rounded-lg px-3 py-2">{error}</div>
+            <div className="mb-2 text-[13px] text-[var(--t-bad)] bg-[var(--t-bad-soft)] border border-[var(--t-bad-line)] rounded-lg px-3 py-2">{error}</div>
           )}
           <div className="flex items-center justify-between mb-2">
             <button onClick={() => setIncludeHistory(v => !v)} role="switch" aria-checked={includeHistory}
               title="Feeds the assistant each SKU's complete monthly + recent daily sales history so it can answer historical questions. It's large, so it needs a higher Groq tier than the free 12,000 tokens/minute."
-              className="flex items-center gap-2 text-[10px] text-slate-400 hover:text-slate-300 transition-colors select-none">
-              <span className={`relative h-4 w-7 rounded-full transition-colors shrink-0 ${includeHistory ? "bg-violet-600" : "bg-slate-700"}`}>
-                <span className={`absolute top-0.5 h-3 w-3 rounded-full bg-white transition-all ${includeHistory ? "left-[14px]" : "left-0.5"}`} />
+              className="flex items-center gap-2 text-[13px] text-[var(--t-dim)] hover:text-[var(--t-soft)] transition-colors select-none">
+              <span className={`relative h-4 w-7 rounded-full transition-colors shrink-0 ${includeHistory ? "bg-[var(--t-accent-soft)]" : "bg-[var(--t-line)]"}`}>
+                <span className={`absolute top-0.5 h-3 w-3 rounded-full bg-[var(--t-panel)] transition-all ${includeHistory ? "left-[14px]" : "left-0.5"}`} />
               </span>
-              <span>Full sales history: <span className={includeHistory ? "text-violet-300 font-semibold" : "font-semibold"}>{includeHistory ? "on" : "off"}</span></span>
+              <span>Full sales history: <span className={includeHistory ? "text-[var(--t-accent)] font-semibold" : "font-semibold"}>{includeHistory ? "on" : "off"}</span></span>
             </button>
-            {includeHistory && <span className="text-[9px] text-amber-500/90">needs higher Groq tier</span>}
+            {includeHistory && <span className="text-[12.5px] text-[var(--t-warn)]">needs higher Groq tier</span>}
           </div>
           <div className="flex gap-2 items-end">
             <textarea
@@ -1030,7 +1095,7 @@ ${fleetCtx}
               onKeyDown={handleKey}
               rows={1}
               placeholder="Ask about folders, reorders, forecasts, risks…"
-              className="flex-1 bg-slate-900/80 border border-slate-700/60 focus:border-violet-600/60 rounded-xl px-3 py-2.5 text-[11px] text-slate-200 placeholder-slate-600 focus:outline-none resize-none leading-relaxed transition-colors"
+              className="flex-1 bg-[var(--t-bg)] border border-[var(--t-line2)] focus:border-[var(--t-accent-line)] rounded-xl px-3 py-2.5 text-[14px] text-[var(--t-ink)] placeholder-[var(--t-line2)] focus:outline-none resize-none leading-relaxed transition-colors"
               style={{ minHeight: "38px", maxHeight: "120px", overflowY: "auto" }}
               onInput={e => {
                 e.target.style.height = "auto";
@@ -1040,18 +1105,18 @@ ${fleetCtx}
             <button
               onClick={() => sendMessage()}
               disabled={!input.trim() || loading}
-              className="h-9 w-9 rounded-xl bg-violet-600 hover:bg-violet-500 disabled:bg-slate-800 disabled:cursor-not-allowed flex items-center justify-center transition-all shrink-0"
+              className="h-9 w-9 rounded-xl bg-[var(--t-accent-soft)] hover:bg-[var(--t-accent-soft)] disabled:bg-[var(--t-line)] disabled:cursor-not-allowed flex items-center justify-center transition-all shrink-0"
             >
               {loading ? (
-                <div className="h-3 w-3 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                <div className="h-3 w-3 border-2 border-[var(--t-line2)] border-t-transparent rounded-full animate-spin" />
               ) : (
-                <svg className="h-3.5 w-3.5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <svg className="h-3.5 w-3.5 text-[var(--t-ink)]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
                 </svg>
               )}
             </button>
           </div>
-          <div className="mt-2 text-[10px] text-slate-700 text-center">Enter to send · Shift+Enter for new line · Drag grip to reposition</div>
+          <div className="mt-2 text-[13px] text-[var(--t-soft)] text-center">Enter to send · Shift+Enter for new line · Drag grip to reposition</div>
         </div>
       </div>
     </>

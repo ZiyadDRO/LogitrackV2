@@ -159,7 +159,11 @@ export async function classifyIndustry(text, { apiKey, url, model } = {}) {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
       body: JSON.stringify({
-        model, temperature: 0, max_tokens: 12, seed: 7,
+        // reasoning_effort: gpt-oss models spend max_tokens on internal reasoning
+        // first, and 12 reserved tokens leaves nothing for an answer. See
+        // GROQ_LOW_REASONING in lib/ai.js for the measurement. Falls back to
+        // classifyIndustryLocally either way, so this only restores the AI path.
+        model, temperature: 0, max_tokens: 12, seed: 7, reasoning_effort: "low",
         messages: [{
           role: "user",
           content: `Classify this business into EXACTLY ONE category. Reply with the category key only, no punctuation or explanation.\n\nKeys: ${allowed}\n\nBusiness: ${text}`,
