@@ -281,7 +281,7 @@ ${lines}`
       if (!Object.keys(next).length) { setErr("The AI did not return any usable tags."); setPhase("idle"); return; }
       setClasses(c => ({ ...c, ...next }));
     } catch {
-      setErr("Couldn't reach the AI to read your product descriptions — check the AI key / internet connection.");
+      setErr("Couldn't reach the AI to read your product descriptions. Check your AI key and internet connection.");
       setPhase("idle");
       return;
     }
@@ -292,9 +292,9 @@ ${lines}`
       await saveAttributes(next);
     } catch (e) {
       if (e?.kind === "http") {
-        setErr(`Tags were generated and the backend responded, but rejected the save (HTTP ${e.status}). Check the LogiTrack terminal window for the error trace.`);
+        setErr(`Tags were generated, but the backend rejected the save (HTTP ${e.status}). Check the LogiTrack terminal window for the error.`);
       } else {
-        setErr(`Tags were generated, but the backend at ${api} didn't respond at all — the server isn't running there. Open ${api}/api/health in a tab: if it doesn't load, relaunch with "Start LogiTrack.command" and keep that window open.`);
+        setErr(`Tags were generated, but the backend at ${api} didn't respond, so the server isn't running there. Open ${api}/api/health in a tab. If it doesn't load, relaunch with "Start LogiTrack.command" and keep that window open.`);
       }
     } finally {
       setPhase("idle");
@@ -314,7 +314,7 @@ ${lines}`
       await saveAttributes({ [skuId]: { [key]: null } });
     } catch {
       setClasses(c => ({ ...c, [skuId]: prevAttrs }));
-      setErr("Couldn't remove that tag — is the backend running?");
+      setErr("Couldn't remove that tag. Is the backend running?");
     } finally {
       setPhase("idle");
     }
@@ -330,7 +330,7 @@ ${lines}`
       await saveAttributes({ [skuId]: Object.fromEntries(keys.map(k => [k, null])) });
     } catch {
       setClasses(c => ({ ...c, [skuId]: prevAttrs }));
-      setErr("Couldn't remove those tags — is the backend running?");
+      setErr("Couldn't remove those tags. Is the backend running?");
     } finally {
       setPhase("idle");
     }
@@ -416,7 +416,7 @@ ${lines}`
     }).join("\n");
     const prompt =
 `For each product group below, write ONE short, specific sentence (max ~28 words, plain business English) describing the demand behavior a NEW product would inherit if it borrows this group's forecast. Ground it strictly in the given numbers and seasonal signature — do NOT invent figures. Make every sentence DIFFERENT and specific (name the seasonal behaviour when present; if specific seasonal match is low, say the borrowed behavior is mostly the normal store-wide rhythm). Avoid jargon like "correlation". Use the group title naturally when helpful. Do not mention group numbers, product counts, or backend mechanics.
-Return ONLY a JSON object mapping each group number to its sentence. No prose, no code fences.
+Return ONLY a JSON object mapping each group number to its sentence. No prose, no code fences. Never use em dashes in the sentences.
 
 Groups:
 ${lines}`;
@@ -465,7 +465,7 @@ ${lines}`;
         <div>
           <div style={{ fontSize: embedded ? 26 : 18, fontWeight:700, letterSpacing:"-.03em", color:T.ink }}>Product grouping</div>
           <div style={{ fontSize: embedded ? 14 : fs.body, color:T.soft, marginTop:5, maxWidth:720, lineHeight:1.55 }}>
-            Which products behave alike — so a new or thin product can borrow a forecast from its siblings.
+            Which products sell alike, so a new or short-history product can borrow a forecast from similar ones.
           </div>
         </div>
         <div style={{ display:"flex", alignItems:"center", gap:9, flexShrink:0 }}>
@@ -511,7 +511,7 @@ ${lines}`;
               {fig("Categories", cats, "product families", undefined, 1)}
               {fig("Behaviour groups", bgroups, "shape-similar clusters", undefined, 2)}
               {fig("Pooled forecasts", pooled, "borrow from siblings", pooled ? T.amber : undefined, 3)}
-              {fig("Yearly blends", yearlyPooled, "veterans borrowing annual shape", yearlyPooled ? T.blue : undefined, 4)}
+              {fig("Yearly blends", yearlyPooled, "established products borrowing yearly shape", yearlyPooled ? T.blue : undefined, 4)}
             </div>
           );
         })()}
@@ -546,8 +546,8 @@ ${lines}`;
               <div style={{ padding:"14px 20px 18px", overflowY:"auto",
                 display:"flex", flexDirection:"column", gap:10 }}>
             <div style={{ fontSize:fs.body, color:T.soft, lineHeight:1.6 }}>
-              Paste anything that describes each product — a title, a spec sheet, a line from your catalogue.
-              Products that turn out to share attributes get grouped.
+              Paste anything that describes each product: a title, a spec sheet, a line from your catalogue.
+              Products that share attributes get grouped.
             </div>
 
             {skuList.length > 6 && (
@@ -665,12 +665,12 @@ ${lines}`;
               });
 
               if (!veterans.length && !newcomers.length) {
-                return <div style={{ fontSize:fs.body, color:T.soft }}>No grouping signal yet — add categories on the left.</div>;
+                return <div style={{ fontSize:fs.body, color:T.soft }}>No grouping signal yet. Click Describe products to add categories.</div>;
               }
               const pct = v => v == null ? null : Math.round(v * 100);
               const distPct = coh => coh?.distinctive == null ? null : Math.max(0, Math.round(coh.distinctive * 100));
               const cohColor = d => d == null ? T.faint : d >= 0.6 ? T.green : d >= 0.3 ? T.over : T.red;
-              const cohWord  = d => d == null ? "—" : d >= 0.6 ? "strong" : d >= 0.3 ? "moderate" : "weak";
+              const cohWord  = d => d == null ? "-" : d >= 0.6 ? "strong" : d >= 0.3 ? "moderate" : "weak";
               const linkPct = link => link?.score == null ? null : Math.round(link.score * 100);
               /* Fallbacks mirror router.DISTINCT_THRESHOLD. Scores and thresholds are both
                  the "specific to this group" number now — the one measured after the
@@ -748,9 +748,9 @@ ${lines}`;
                 if (sh.weekend === "high") feats.push("with a sharper weekend lift than most");
                 if (sh.weekend === "low") feats.push("with a flatter weekend than most");
                 const why = feats.join(" ");
-                if (d >= 0.6) return `Strong specific match. These products share a seasonal shape that stands out from the normal store-wide rhythm${why ? ` — ${why}` : ""}. A new product borrowing this forecast inherits that specific shape.`;
+                if (d >= 0.6) return `Strong specific match. These products share a seasonal shape that stands out from the normal store-wide rhythm${why ? `: ${why}` : ""}. A new product borrowing this forecast inherits that specific shape.`;
                 if (d >= 0.3) return `Moderate specific match. A new product borrowing this forecast inherits part of this group's own seasonal shape${why ? ` (${why})` : ""}, layered on top of the normal store-wide rhythm.`;
-                return `Most of the ${pct(coh.avg)}% overlap is the normal store-wide rhythm — weekends, holidays, or broad seasonal lifts. A new product borrowing this forecast mostly inherits that broad rhythm${why ? `, with only a faint shared tilt (${why})` : ""}.`;
+                return `Most of the ${pct(coh.avg)}% overlap is the normal store-wide rhythm (weekends, holidays, broad seasonal lifts). A new product borrowing this forecast mostly inherits that broad rhythm${why ? `, with only a faint shared tilt (${why})` : ""}.`;
               };
 
               /* A product inside a group. The badges each carry one fact and the long
@@ -878,14 +878,14 @@ ${lines}`;
                                         {members.filter(s => !s.usesYearlyPool).map(s => vetRow(s, hSplit))}
                                         {members.some(s => s.usesYearlyPool) && (
                                           <>
-                                            <div style={{ ...cap, color:T.blueFg, marginTop:6 }}>Established — borrowing yearly shape</div>
+                                            <div style={{ ...cap, color:T.blueFg, marginTop:6 }}>Established, borrowing yearly shape</div>
                                             {members.filter(s => s.usesYearlyPool).map(s => vetRow(s, hSplit))}
                                           </>
                                         )}
                                       </div>
                                       {borrowers.length > 0 && (
                                         <div style={{ minWidth:0, display:"flex", flexDirection:"column", gap:6 }}>
-                                          <div style={{ ...cap, color:T.amber }}>New — borrowing this</div>
+                                          <div style={{ ...cap, color:T.amber }}>New, borrowing this</div>
                                           {borrowers.map(s => (
                                             <div key={s.skuId} style={{ padding:"9px 11px", border:`2px solid ${T.amber}44`, background:`${T.amber}0f` }}>
                                               <div style={{ fontSize:fs.row, fontWeight:600, color:T.ink }}>{s.skuName}</div>
@@ -911,9 +911,9 @@ ${lines}`;
                                           </div>
                                           <div>
                                             <div style={cap}>
-                                              <span title="Whether the shared seasonality is special to this group, rather than the normal store rhythm — weekends, holidays, or broad summer/winter lifts.">Specific to this group</span>
+                                              <span title="Whether the shared seasonality is special to this group, rather than the normal store rhythm (weekends, holidays, broad summer/winter lifts).">Specific to this group</span>
                                             </div>
-                                            <div style={{ ...mono, fontSize:22, fontWeight:600, color:cohColor(coh.distinctive), marginTop:4 }}>{distPct(coh) ?? "—"}%</div>
+                                            <div style={{ ...mono, fontSize:22, fontWeight:600, color:cohColor(coh.distinctive), marginTop:4 }}>{distPct(coh) ?? "-"}%</div>
                                           </div>
                                           {/* The weakest pair on the same scale as the headline
                                               figure and the threshold. It used to show the raw
@@ -972,10 +972,10 @@ ${lines}`;
                                      of its own inside this category, which does not stop it borrowing
                                      from the nearest cluster that does cohere. */
                                   const why = s.route === "global"
-                                    ? ["borrowing from the closest group", "This product has no behavioural match of its own here, but it does borrow a pooled forecast from the nearest group in its category that agrees on a shape."]
+                                    ? ["borrowing from the closest group", "No close match of its own here, but it borrows a pooled forecast from the nearest group in its category with a similar sales shape."]
                                     : s.usesYearlyPool
-                                    ? ["borrows yearly shape only", "This product forecasts directly with Prophet, but still borrows yearly seasonality from related products until it has enough annual history."]
-                                    : ["forecasts on its own", "This product has enough of its own history to forecast directly, so it is shown here but does not need to borrow a pooled forecast."];
+                                    ? ["borrows yearly shape only", "Forecasts directly with Prophet, but borrows its yearly pattern from related products until it has enough yearly history."]
+                                    : ["forecasts on its own", "Has enough history of its own to forecast directly, so it doesn't need to borrow a pooled forecast."];
                                   const link = kase.link;
                                   const strong = kase.kind === "near";
                                   /* The no-link cases each say what actually happened. "Nothing
@@ -1030,8 +1030,8 @@ ${lines}`;
                                       whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>{s.skuName}</div>
                                     <div style={{ fontSize:fs.small, color:T.soft, marginTop:3 }}
                                       title={s.clusterBasis
-                                        ? "It was matched to a category peer set, but that set did not produce enough pooled veterans under the current rules, so it uses its own early sales."
-                                        : "Too little own history to infer seasonality, and no eligible multi-product veteran pool was found yet, so it uses its own early sales."}>
+                                        ? "It matched similar products in its category, but not enough established ones to pool with, so it uses its own early sales."
+                                        : "Too little history to see seasonality, and no group of similar established products was found yet, so it uses its own early sales."}>
                                       uses its own early sales
                                     </div>
                                   </div>
@@ -1048,7 +1048,7 @@ ${lines}`;
             })()}
             {!groups?.skus?.length && (
               <div style={{ fontSize:fs.body, color:T.soft, lineHeight:1.6 }}>
-                Paste product info on the left and hit “Classify and apply changes” to see groups here.
+                Click “Describe products”, paste product info, then “Classify and apply changes” to see groups here.
               </div>
             )}
           </div>

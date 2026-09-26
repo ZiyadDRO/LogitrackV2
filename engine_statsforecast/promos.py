@@ -90,12 +90,12 @@ def explain(report: dict) -> str:
         return ""
     r = report.get("reason")
     if r == "held-out":
-        return (f"{report['removed']} promotional days were left out of the forecast so a "
-                f"discount period doesn't become the new baseline. This product's model "
-                f"can't separate promo demand on its own.")
+        return (f"{report['removed']} promotional days were left out so a discount period "
+                f"doesn't become the new baseline. This product's model can't separate promo "
+                f"demand on its own.")
     if r == "promotions-are-the-norm":
         return (f"{report['promoDays']} of {report['remaining']} days were promotional. "
-                f"That's too many to exclude — discounting looks like part of how this "
+                f"That's too many to exclude: discounting looks like part of how this "
                 f"product normally sells, so the forecast includes it.")
     if r == "too-little-left":
         return (f"There are {report['promoDays']} promotional days, but removing them "

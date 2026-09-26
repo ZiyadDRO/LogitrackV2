@@ -257,8 +257,8 @@ def explain(res: dict) -> str:
     if not res or res.get("source") == "none":
         b = (res or {}).get("basis")
         if b == "too-short":
-            return ("Not enough history to see a yearly pattern yet — a full year is "
-                    "needed before seasonality can be told apart from a trend.")
+            return ("Not enough history to see a yearly pattern yet. A full year is "
+                    "needed to tell seasonality apart from a trend.")
         if b == "too-few-months":
             return "Sales are spread over too few months of the year to read a season from."
         if res and res.get("cohortStrength") is not None:

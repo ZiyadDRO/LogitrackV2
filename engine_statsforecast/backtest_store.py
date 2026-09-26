@@ -42,6 +42,27 @@ def enabled() -> bool:
     return os.environ.get("LOGITRACK_PERSIST", "1").strip() not in ("0", "false", "no")
 
 
+def fingerprint_parts(catalog: dict) -> dict:
+    """The STRUCTURE of the data a run was measured against, per product.
+
+    `fingerprint()` hashes this. Keeping the parts addressable as well is what lets a
+    caller ask the more useful question: not "is this different" but "is it different in
+    a way that invalidates a measurement". History gaining a day at the end does not; a
+    product's history being replaced does.
+    """
+    out = {}
+    for sid in sorted(catalog):
+        df = (catalog.get(sid) or {}).get("df")
+        if df is None or not len(df):
+            continue
+        ds = pd.to_datetime(df["ds"])
+        y = pd.to_numeric(df["y"], errors="coerce").fillna(0).sum()
+        out[str(sid)] = {"rows": int(len(df)),
+                         "first": f"{ds.min():%Y-%m-%d}", "last": f"{ds.max():%Y-%m-%d}",
+                         "units": round(float(y), 3)}
+    return out
+
+
 def fingerprint(catalog: dict) -> str:
     """Identify the DATA a run was measured against.
 
@@ -49,15 +70,40 @@ def fingerprint(catalog: dict) -> str:
     backtest result is a product appearing or leaving, its history growing or shrinking,
     its date range shifting, or its units changing. All four show up here. Rounding the
     unit total keeps float noise from inventing a mismatch."""
-    parts = []
-    for sid in sorted(catalog):
-        df = (catalog.get(sid) or {}).get("df")
-        if df is None or not len(df):
-            continue
-        ds = pd.to_datetime(df["ds"])
-        y = pd.to_numeric(df["y"], errors="coerce").fillna(0).sum()
-        parts.append(f"{sid}|{len(df)}|{ds.min():%Y-%m-%d}|{ds.max():%Y-%m-%d}|{round(float(y), 3)}")
+    parts = [f"{sid}|{p['rows']}|{p['first']}|{p['last']}|{p['units']}"
+             for sid, p in fingerprint_parts(catalog).items()]
     return hashlib.sha256("\n".join(parts).encode()).hexdigest()
+
+
+def grew_only(old_parts: dict, new_parts: dict) -> bool:
+    """Did every product's history merely EXTEND, with nothing rewritten?
+
+    This is the question that decides whether a measured protection tier survives a sync,
+    and the old code never asked it — it compared hashes, which differ the moment a single
+    day lands, and threw the measurements away every night. A tier chosen from eight test
+    windows across months does not stop describing a product because yesterday's sales
+    arrived; falling back to a cost-curve estimate there makes the answer WORSE while
+    looking like caution.
+
+    Growth means, for every product already measured: it is still present, it starts on
+    the same day, it has not lost rows or units, and its last day has not moved backwards.
+    New products appearing is growth too — they simply have no measurement yet. Anything
+    else (a product vanishing, a start date moving, units revised down) is a rewrite, and
+    a rewrite genuinely does invalidate the run.
+    """
+    if not old_parts:
+        return False
+    for sid, was in old_parts.items():
+        now = new_parts.get(sid)
+        if now is None:
+            return False                      # a measured product disappeared
+        if now["first"] != was["first"]:
+            return False                      # history re-anchored or replaced
+        if now["last"] < was["last"]:
+            return False                      # the tail moved backwards
+        if now["rows"] < was["rows"] or now["units"] < was["units"] - 1e-6:
+            return False                      # rows or sales were revised away
+    return True
 
 
 def save(state: dict, catalog: dict) -> bool:

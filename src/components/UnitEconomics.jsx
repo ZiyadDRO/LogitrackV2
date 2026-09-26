@@ -20,7 +20,7 @@ import { saveStorage } from '../lib/storage';
  * number landed in skuParams it was indistinguishable from one typed by hand. So
  * every value carries a source, and the precedence is fixed and stated:
  *
- *   your own entry  >  Shopify  >  your sales file  >  nothing
+ *   your own entry  >  a connected store  >  your sales file  >  nothing
  *
  * A hand-typed cost is never overwritten by a later sync. That rule already
  * existed in App.jsx; what is new is that the screen can now say so.
@@ -29,10 +29,16 @@ import { saveStorage } from '../lib/storage';
 export const SOURCES = {
   manual:  { label: "set by you",      tone: "amber" },
   shopify: { label: "Shopify",         tone: "green" },
+  square:  { label: "Square",          tone: "green" },
   sheet:   { label: "your sales file", tone: "blue"  },
   price:   { label: "from sales data", tone: "grey"  },
   none:    { label: "not set",         tone: "grey"  },
 };
+
+/* Every live store, for the copy that distinguishes "synced from a store" from "read out
+   of a spreadsheet". Listing them beats `!== "sheet"` so that a future source has to be
+   named here deliberately rather than silently inheriting Shopify's wording. */
+export const LIVE_SOURCES = new Set(["shopify", "square"]);
 
 const toneOf = (T, tone) => ({
   amber: { fg: T.amber,   bg: `${T.amber}18`,  br: `${T.amber}44` },
@@ -51,6 +57,24 @@ export function SourceChip({ source, T }) {
   );
 }
 
+/** A unit price, with the original struck through when the POS reports a discount.
+    `list` is the undiscounted shelf price; `current` what a customer pays today. */
+export function PriceTag({ current, list, T, size, muted = false }) {
+  const mono = { fontFamily: MONO, fontVariantNumeric: "tabular-nums" };
+  const c = Number(current), l = Number(list);
+  if (!(c > 0) && !(l > 0)) return <span style={{ ...mono, fontSize: size, color: T.faint }}>-</span>;
+  const onSale = c > 0 && l > 0 && c < l - 0.005;
+  if (!onSale) {
+    return <span style={{ ...mono, fontSize: size, color: muted ? T.soft : T.ink }}>${(c > 0 ? c : l).toFixed(2)}</span>;
+  }
+  return (
+    <span style={{ display: "inline-flex", alignItems: "baseline", gap: 6 }}>
+      <s style={{ ...mono, fontSize: size, color: T.faint }}>${l.toFixed(2)}</s>
+      <span style={{ ...mono, fontSize: size, fontWeight: 700, color: T.amber }}>${c.toFixed(2)}</span>
+    </span>
+  );
+}
+
 /** Margin per sale, and the grade the rest of the app already uses for it. */
 export function marginOf(price, cost, fees) {
   const p = Number(price), c = Number(cost), f = Number(fees) || 0;
@@ -62,7 +86,8 @@ export function marginOf(price, cost, fees) {
 }
 
 // ─── the card, for one product ───────────────────────────────────────────────
-export function UnitEconomicsCard({ params = {}, price, onChange, lm = false }) {
+export function UnitEconomicsCard({ params = {}, price, listPrice = null, livePrice = null,
+                                   onChange, lm = false }) {
   const T = terminal(lm);
   const [editing, setEditing] = useState(false);
   const mono = { fontFamily: MONO, fontVariantNumeric: "tabular-nums" };
@@ -73,6 +98,13 @@ export function UnitEconomicsCard({ params = {}, price, onChange, lm = false }) 
   const src = params.unitCostSource || (hasCost ? "manual" : "none");
   const feeSrc = (fees !== "" && fees != null && Number(fees) > 0) ? "manual" : "none";
   const m = marginOf(price, cost, fees);
+  // The POS's own reading of the shelf, when there is one: the source chip says so, and a
+  // discount shows the original struck through beside what customers pay today.
+  const live = livePrice && (livePrice.currentPrice || livePrice.listPrice) ? livePrice : null;
+  const regular = Number(listPrice) > 0 ? Number(listPrice) : null;
+  const onSale = regular != null && Number(price) > 0 && Number(price) < regular - 0.005;
+  const mReg = onSale ? marginOf(regular, cost, fees) : null;
+  const fmtDay = (iso) => { try { return new Date(iso + "T00:00:00").toLocaleDateString(undefined, { month: "short", day: "numeric" }); } catch { return iso; } };
 
   const inp = { ...mono, width: 96, textAlign: "right", background: T.bg, color: T.ink,
     border: `2px solid ${T.line2}`, borderRadius: 2, padding: "5px 8px", fontSize: fs.row, outline: "none" };
@@ -99,12 +131,16 @@ export function UnitEconomicsCard({ params = {}, price, onChange, lm = false }) 
       <div style={{ marginTop: 6 }}>
         <Row label="Selling price">
           <span style={{ display: "flex", alignItems: "center", gap: 7 }}>
-            <SourceChip source="price" T={T} />
-            <span style={{ ...mono, fontSize: fs.num, color: price > 0 ? T.ink : T.faint }}>
-              {price > 0 ? `$${Number(price).toFixed(2)}` : "—"}
-            </span>
+            <SourceChip source={live && SOURCES[live.source] ? live.source : "price"} T={T} />
+            <PriceTag current={price} list={regular} T={T} size={fs.num} />
           </span>
         </Row>
+        {onSale && (
+          <div style={{ fontSize: fs.small, color: T.amber, marginTop: -2, marginBottom: 4, lineHeight: 1.5, textAlign: "right" }}>
+            {live?.discountName || "Discount"}{live?.discountPct ? ` · ${Math.round(live.discountPct)}% off` : ""}
+            {live?.discountUntil ? ` · until ${fmtDay(live.discountUntil)}` : " · no end date set"}
+          </div>
+        )}
 
         <Row label="Unit cost">
           {editing ? (
@@ -152,8 +188,13 @@ export function UnitEconomicsCard({ params = {}, price, onChange, lm = false }) 
             <span style={{ ...mono, fontSize: fs.small, fontWeight: 700, padding: "1px 6px",
               background: m.loss ? T.redBg : T.greenBg, color: m.loss ? T.redFg : T.greenFg }}>{m.grade}</span>
           </span>
-        ) : <span style={{ ...mono, fontSize: fs.num, color: T.faint }}>—</span>}
+        ) : <span style={{ ...mono, fontSize: fs.num, color: T.faint }}>-</span>}
       </div>
+      {mReg && (
+        <div style={{ fontSize: fs.small, color: T.soft, marginTop: 4, textAlign: "right" }}>
+          At the regular ${regular.toFixed(2)}: ${mReg.per.toFixed(2)} ({Math.round(mReg.pct)}%). Protection is sized on this.
+        </div>
+      )}
 
       {/* Why this card exists, said only when it matters. With a cost on file the
           protection tier is chosen from this product's own stockout-vs-holding cost;
@@ -161,9 +202,9 @@ export function UnitEconomicsCard({ params = {}, price, onChange, lm = false }) 
           rather than leave the tier looking equally well-founded either way. */}
       <div style={{ fontSize: fs.small, color: hasCost ? T.faint : T.amber, marginTop: 9, lineHeight: 1.6 }}>
         {!hasCost
-          ? "Protection is running on the margin rule until a cost is here. Add one and this product's level is chosen from its own stockout cost versus buffer holding cost."
-          : src === "shopify" ? "Cost came from Shopify. Type over it any time — your own entry is never overwritten by a later sync."
-          : src === "sheet"   ? "Read from the Cost column of your sales file. Type over it any time — your own entry wins."
+          ? "Protection uses the margin rule until you add a cost. With one, this product's level is set from its own stockout cost vs. buffer holding cost."
+          : LIVE_SOURCES.has(src) ? `Cost came from ${SOURCES[src].label}. Type over it any time; a later sync never overwrites your own entry.`
+          : src === "sheet"   ? "Read from the Cost column of your sales file. Type over it any time; your own entry wins."
           : "Set by you. Nothing overwrites this."}
       </div>
     </div>
@@ -181,6 +222,9 @@ export function CostsSheet({ open, onClose, skuList = [], scorecardRows = [],
 
   const priceBySku = useMemo(
     () => Object.fromEntries((scorecardRows || []).map(r => [r.skuId, r.regularPrice])), [scorecardRows]);
+  const saleBySku = useMemo(
+    () => Object.fromEntries((scorecardRows || []).filter(r => r.onPromoToday && r.promoPrice > 0)
+      .map(r => [r.skuId, r.promoPrice])), [scorecardRows]);
 
   const rows = useMemo(() => {
     const list = (skuList || []).map(s => {
@@ -278,11 +322,10 @@ export function CostsSheet({ open, onClose, skuList = [], scorecardRows = [],
                     {!r.missing && <SourceChip source={r.source} T={T} />}
                   </div>
                 </div>
-                <span style={{ ...mono, textAlign: "right", fontSize: fs.row,
-                  color: r.price > 0 ? T.soft : T.faint }}>
-                  {r.price > 0 ? `$${Number(r.price).toFixed(2)}` : "—"}
+                <span style={{ textAlign: "right" }}>
+                  <PriceTag current={saleBySku[r.id] ?? r.price} list={r.price} T={T} size={fs.row} muted />
                 </span>
-                <input type="number" min="0" step="0.01" placeholder="—" style={inp}
+                <input type="number" min="0" step="0.01" placeholder="-" style={inp}
                   value={r.cost ?? ""}
                   onChange={e => set(r.id, { unitCost: e.target.value === "" ? "" : Number(e.target.value),
                                              unitCostSource: "manual" })} />
@@ -298,7 +341,7 @@ export function CostsSheet({ open, onClose, skuList = [], scorecardRows = [],
                       <span style={{ ...mono, fontSize: fs.small, fontWeight: 700, padding: "1px 5px",
                         background: m.loss ? T.redBg : T.greenBg, color: m.loss ? T.redFg : T.greenFg }}>{m.grade}</span>
                     </span>
-                  ) : <span style={{ ...mono, fontSize: fs.row, color: T.faint }}>—</span>}
+                  ) : <span style={{ ...mono, fontSize: fs.row, color: T.faint }}>-</span>}
                 </span>
               </div>
             );
@@ -308,8 +351,8 @@ export function CostsSheet({ open, onClose, skuList = [], scorecardRows = [],
         <div style={{ padding: "12px 20px", borderTop: `2px solid ${T.line}`, background: T.sunken,
           display: "flex", alignItems: "center", justifyContent: "space-between", gap: 14, flexWrap: "wrap" }}>
           <span style={{ fontSize: fs.small, color: T.soft, lineHeight: 1.6, maxWidth: 560 }}>
-            Saved as you type, and the backtest re-runs itself. A cost you type here is never
-            overwritten by a later Shopify sync or a re-upload.
+            Saves as you type, and the backtest re-runs itself. A store sync or re-upload never
+            overwrites a cost you type here.
           </span>
           <button onClick={onClose} style={{ ...mono, fontSize: fs.body, fontWeight: 600, padding: "8px 16px",
             borderRadius: 2, background: T.btnBg, color: T.btnFg, border: "2px solid transparent",

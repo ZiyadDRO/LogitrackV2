@@ -5,7 +5,95 @@
 export function todayMs() { return Date.now(); }
 export function todayStr() { return new Date().toISOString().split("T")[0]; }
 
-export const DEFAULT_PARAMS = { stock: 500, leadTime: 14, coverage: 30, strategy: "balanced", months: 1 };
+/* stock defaults to 0, NOT 500.
+ *
+ * 500 was indefensible: on a 1.2/day seller it reads as 417 days of cover, so the Fleet
+ * reported "overstocked, nothing to order" for a product nobody had counted — an error
+ * that whispers. 0 is also wrong when the truth is unknown, but it is wrong LOUDLY, and
+ * for inventory that is the safer direction to be wrong in.
+ *
+ * What makes it safe rather than merely loud is `stockSource`. A 0 stamped "unknown"
+ * means "nobody has counted this", and the UI says so instead of demanding an urgent
+ * reorder — which is the failure sanitizeParams below already warns about. A 0 stamped
+ * "live" or "manual" is a real, believable zero and does drive a reorder. */
+/* 50, and it must match ASSUMED_STOCK in main.py. There used to be two answers — the
+   browser assumed 0 and the server assumed 500 — so the same uncounted product read
+   "about to stock out" here and "overstocked" there. Both confident, both invented.
+   The number is a placeholder so the arithmetic has something to chew on; what keeps it
+   honest is stockSource:"unknown", which suppresses every countdown built on it. */
+export const DEFAULT_PARAMS = { stock: 50, stockSource: "unknown", leadTime: 14, coverage: 30,
+                                strategy: "balanced", months: 1 };
+
+/** Where a stock figure came from, and whether it can be trusted to act on. */
+export const STOCK_SOURCES = {
+  manual:  { label: "counted by you",  tone: "amber", trusted: true  },
+  live:    { label: "from your store", tone: "green", trusted: true  },
+  sheet:   { label: "from your file",  tone: "blue",  trusted: true  },
+  unknown: { label: "not counted",     tone: "grey",  trusted: false },
+};
+
+export const stockIsCounted = (p) => STOCK_SOURCES[p?.stockSource || "unknown"]?.trusted === true;
+
+/* ── Live availability, from the hourly stock readings ────────────────────────────────
+ *
+ * The backend samples stock every hour. That is what lets the forecast tell "sold 3
+ * because demand was 3" from "sold 3 because it ran out at 11am" — and the second case,
+ * uncorrected, teaches the model that demand is falling and quietly orders less.
+ *
+ * This turns one product's `/api/availability` row into a dot and, where it earns one, a
+ * few words. Deliberately: the green case gets NO text. Twenty-eight rows each saying "in
+ * stock" is noise, and noise is what stops anyone noticing the one row that says
+ * something. The dot alone carries "this is being watched"; text is reserved for the
+ * exceptions worth reading.
+ */
+export const AVAILABILITY_TONES = {
+  in:      "bg-[var(--t-good)]",
+  wasOut:  "bg-[var(--t-warn)]",
+  out:     "bg-[var(--t-bad)]",
+  unknown: "bg-[var(--t-line2)]",
+};
+
+const _clockTime = (iso) => {
+  if (!iso) return null;
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime())
+    ? null
+    : d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+};
+
+/** → { key, dot, label, title } | null when there is nothing worth drawing. */
+export function availabilityChip(state, { samplerEnabled = true } = {}) {
+  if (!state) return null;
+  if (state.state === "unknown") {
+    // Only worth flagging while sampling is meant to be happening. With it switched off,
+    // "not sampled" is the expected state for every product and says nothing.
+    if (!samplerEnabled) return null;
+    return { key: "unknown", dot: AVAILABILITY_TONES.unknown, label: null,
+             title: "No stock reading yet. The hourly sampler hasn't reached this product." };
+  }
+  const seen = _clockTime(state.lastReadingAt);
+  if (state.state === "out") {
+    const since = _clockTime(state.outSince);
+    return {
+      key: "out",
+      dot: AVAILABILITY_TONES.out,
+      label: since ? `out since ${since}` : "out of stock",
+      // "about" is not hedging for its own sake: readings are hourly, so the true moment
+      // is somewhere in the hour before the first zero. Stating it to the minute would be
+      // precision the data does not have.
+      title: since
+        ? `Out of stock. Last seen with stock before about ${since}; readings are hourly.`
+        : "Out of stock.",
+    };
+  }
+  if (state.wentOutToday) {
+    return { key: "wasOut", dot: AVAILABILITY_TONES.wasOut, label: "was out today",
+             title: `Back in stock (${state.level} units at ${seen}) after hitting zero earlier today. `
+                  + "Today's demand is corrected upward." };
+  }
+  return { key: "in", dot: AVAILABILITY_TONES.in, label: null,
+           title: `In stock: ${state.level} units as of ${seen}.` };
+}
 
 /** A positive integer, or null. `??` is not enough on its own: an empty string is neither
  *  null nor undefined, so `p.leadTime ?? 14` happily yields "" — and `Number("")` is 0,
@@ -36,6 +124,11 @@ export function sanitizeParams(p) {
                 (typeof out.stock === "string" && out.stock.trim() === "");
   const st = blank ? NaN : Math.round(Number(out.stock));
   out.stock = Number.isFinite(st) && st >= 0 ? st : DEFAULT_PARAMS.stock;
+  /* A blank box is not a count of zero, and the difference has to survive the coercion
+     above — otherwise the 0 it lands on is indistinguishable from a counted zero and the
+     tool starts demanding a reorder for a product nobody has looked at. */
+  if (blank) out.stockSource = "unknown";
+  else if (!out.stockSource) out.stockSource = "manual";
   // Per-lane baselines: drop blanks rather than storing "" under a lane key.
   if (out.leadTimes && typeof out.leadTimes === "object") {
     const lanes = {};
@@ -65,7 +158,7 @@ export function formatDate(daysFromToday) {
 }
 
 export function isoToDisplay(iso) {
-  if (!iso) return "—";
+  if (!iso) return "-";
   const d = new Date(iso + "T00:00:00Z");
   return d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric", timeZone: "UTC" });
 }
@@ -115,6 +208,11 @@ export function buildScorecardBody(skuList, skuParams, openPOs, suppliers, trail
     const po = openPOs?.[s.id];
     skus[s.id] = {
       stock: p.stock,
+      /* WHERE that number came from. Without it the server had to guess, and its guess
+         was "assume a default" — which is how an uncounted product got a confident
+         overdue-reorder badge. With it, the server suppresses every figure that is
+         stock-divided-by-demand rather than publishing arithmetic on a placeholder. */
+      stockSource: p.stockSource || "unknown",
       leadTime: planningLeadTime(s.id, p, suppliers, { ignoreOneOff: true }).days,
       coverage: p.coverage,
       unitCost: p.unitCost ?? null,
@@ -159,27 +257,31 @@ export function reorderBands(leadTimeDays) {
 export const SKU_STATES = {
   stockout: {
     label: "stockout risk", title: "Stockout risk", badge: "AT RISK", urgency: "critical",
-    help: "Overdue, or close enough to the reorder point that ordering today may not beat the lead time. The window is half this product's lead time — inside 7 days on a 14-day line, inside 30 on a 60-day sea crossing. Order now.",
+    help: "Overdue, or too close to the reorder point for an order today to beat the lead time. The window is half this product's lead time: 7 days on a 14-day line, 30 on a 60-day sea crossing. Order now.",
   },
   reorder: {
     label: "reorder due soon", title: "Reorder due soon", badge: "REORDER", urgency: "high",
-    help: "The reorder point is between half and one and a half lead times away. Routine: there is still slack, so order in the normal course rather than urgently.",
+    help: "The reorder point is between half and 1.5 lead times away. There is still slack, so order as routine, not urgently.",
   },
   overstock: {
     label: "overstocked", title: "Overstocked", badge: "OVER", urgency: "low",
-    help: "Carrying more than this product's own target cover — its lead time plus its coverage window. A line with a 90-day coverage target is NOT overstocked at 70 days of stock; one with a 30-day target is. Reduce future orders.",
+    help: "More stock than this product's target cover (its lead time plus its coverage window). At 70 days of stock, a 90-day target is fine but a 30-day target is overstocked. Reduce future orders.",
   },
   dead: {
     label: "dead stock", title: "Dead stock", badge: "DEAD", urgency: "low",
-    help: "Barely selling — under 5% of stock moved in the trailing window — while carrying more than three times its target cover. Consider a markdown, promotion, or discontinuing it. A new product is never marked this.",
+    help: "No sales for several times its usual gap between sales, or under 5% of on-hand sold in the trailing window while holding over 3x its target cover. Consider a markdown, promotion, or discontinuing it. New products are never marked dead stock.",
   },
   healthy: {
     label: "healthy", title: "Healthy", badge: null, urgency: "low",
-    help: "Stock sits inside this product's target cover and the reorder point is far enough out to be routine. Nothing to do.",
+    help: "Stock is inside this product's target cover and the reorder point is far enough out to be routine. Nothing to do.",
+  },
+  uncounted: {
+    label: "stock not counted", title: "Stock not counted", badge: "COUNT", urgency: "none",
+    help: "No stock count yet, and your store doesn't report one. Cover, stockout date and order quantity stay hidden until you enter a count on the product page.",
   },
   unrated: {
     label: "not rated", title: "Not rated", badge: null, urgency: "none",
-    help: "No fitted forecast yet, so this product has not been classified. Neither healthy nor unhealthy — just unmeasured. Usually resolves once it has enough sales history.",
+    help: "No fitted forecast yet, so this product is unmeasured, not unhealthy. This usually resolves once it has enough sales history.",
   },
 };
 
@@ -188,7 +290,7 @@ export const SKU_OVERLAYS = { onOrder: "on order", new: "new" };
 
 export const SC_STATUS_KEY = {
   "Stockout risk": "stockout", "Dead stock": "dead", "Overstocked": "overstock",
-  "Reorder due": "reorder", "Healthy": "healthy",
+  "Reorder due": "reorder", "Healthy": "healthy", "Stock not counted": "uncounted",
 };
 
 /** Backend status string -> the shared label/title/help entry, so the scorecard's
@@ -236,11 +338,33 @@ export function urgencyLevel(daysUntilReorder, hasOpenPO, leadTimeDays = null) {
   return skuState({ daysUntilReorder }, null, false, leadTimeDays).urgency;
 }
 
+/* Three grades, ordinal, in plain language. The server no longer emits CONFLICTING — it
+   covered three unrelated causes, told a reader nothing on its own, and was over a third
+   of the possible inputs. Its causes moved to `statusReason` below, on whichever grade
+   each actually deserves. The entry is kept only so a stale cached payload still renders. */
 export const STATUS_CONFIG = {
-  FORECAST_ELIGIBLE: { dot: "bg-emerald-400", label: "Eligible"       },
-  LOW_CONFIDENCE:    { dot: "bg-amber-400",   label: "Low Confidence" },
-  CONFLICTING:       { dot: "bg-orange-400",  label: "Conflicting"    },
-  INSUFFICIENT:      { dot: "bg-rose-400",    label: "Insufficient"   },
+  FORECAST_ELIGIBLE: { dot: "bg-emerald-400", label: "Ready to plan"  },
+  LOW_CONFIDENCE:    { dot: "bg-amber-400",   label: "Directional"    },
+  INSUFFICIENT:      { dot: "bg-rose-400",    label: "Not enough data" },
+  CONFLICTING:       { dot: "bg-orange-400",  label: "Directional"    },  // deprecated
+};
+
+/** Why a product got its grade. Short enough to sit next to the grade as a chip. */
+export const REASON_LABELS = {
+  established:         "measured",
+  partial_history:     "short history",
+  short_history:       "needs more days",
+  few_selling_days:    "too few sale days",
+  low_volume:          "too few units",
+  new_product:         "new product",
+  intermittent_demand: "sells in bursts",
+  dormant:             "no recent sales",
+};
+
+/** How predictable the demand is, independent of how much history exists. */
+export const PREDICTABILITY_LABELS = {
+  steady: "steady", variable: "variable", occasional: "occasional",
+  dormant: "dormant", unknown: "",
 };
 
 // Urgency styles — dark mode only (used in sidebar/fleet where lm is passed)
@@ -770,19 +894,19 @@ export function leadTimeBasis(skuId, params, suppliers, opts = {}) {
     const delta = plan.days - normal;
     out.normal = normal;
     out.delta = delta;
-    out.label = `${plan.days}d — one-off`;
+    out.label = `${plan.days}d (one-off)`;
     out.detail = delta === 0
       ? `Flagged for the next order${plan.reason ? `: ${plan.reason}` : ""}.`
-      : `${Math.abs(delta)}d ${delta > 0 ? "longer" : "shorter"} than this lane's ${normal}d${plan.reason ? ` — ${plan.reason}` : ""}.`;
+      : `${Math.abs(delta)}d ${delta > 0 ? "longer" : "shorter"} than this lane's ${normal}d${plan.reason ? `: ${plan.reason}` : ""}.`;
     return out;
   }
   if (plan.source === "manual") {
-    out.label = `${plan.days}d — set by you`;
+    out.label = `${plan.days}d (set by you)`;
     out.detail = `Used instead of ${lane.toLowerCase()} delivery history.`;
     return out;
   }
   if (plan.source === "measured") {
-    out.label = `${plan.days}d — ${lane} P80`;
+    out.label = `${plan.days}d (${lane} P80)`;
     out.detail = `80% of ${st.n} ${lane.toLowerCase()} ${st.n === 1 ? "delivery" : "deliveries"} arrived within ${plan.days}d; the average was ${st.avg}d.`;
     return out;
   }
@@ -793,7 +917,7 @@ export function leadTimeBasis(skuId, params, suppliers, opts = {}) {
   const fromSupplier = !ownSet && supBase != null && supBase === plan.days;
   const supName = supplierOf(skuId, suppliers)?.name || "the supplier";
   out.estimate = true;
-  out.label = `${plan.days}d — ${lane} estimate`;
+  out.label = `${plan.days}d (${lane} estimate)`;
   out.detail = fromSupplier
     ? `${supName}'s figure for ${lane.toLowerCase()}. Nothing measured for this product yet.`
     : `Your figure for ${lane.toLowerCase()}. Nothing measured yet.`;
@@ -803,7 +927,7 @@ export function leadTimeBasis(skuId, params, suppliers, opts = {}) {
     out.disagrees = Math.abs(st.avg - plan.days) >= Math.max(2, plan.days * 0.15);
     const need = Math.max(0, LEAD_TIME_MIN_DELIVERIES - st.n);
     out.detail = `${st.n} ${st.n === 1 ? "delivery has" : "deliveries have"} averaged ${st.avg}d`
-      + (out.disagrees ? ` — the estimate says ${plan.days}d. ` : `. `)
+      + (out.disagrees ? `, but the estimate says ${plan.days}d. ` : `. `)
       + (need ? `${need} more and this switches to measured.` : "");
   }
   return out;

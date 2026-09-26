@@ -17,6 +17,7 @@ Heavy libs (prophet, statsforecast) are imported lazily inside fit(), so this
 module imports cleanly even where they aren't installed, and tests can stub them.
 """
 from __future__ import annotations
+import os
 import numpy as np
 import pandas as pd
 
@@ -27,6 +28,107 @@ UID = "series"
 # the pooled global engine — how a ramping new product's trend is projected.
 # Code-only lever — only change it if REAL data shows a consistent bias.
 MIN_TREND_DAYS = 21    # need ≥3 weeks of own sales before trusting a growth slope
+# Prophet's trend is a straight line: whatever slope the last stretch of history had is
+# carried forward for the whole horizon. After a spike (a World Cup, a launch, a viral
+# week) that slope is the fall back to normal, and the forecast kept falling for months
+# after sales had levelled off. Past the last day the slope is DAMPED: each day keeps
+# this share of the previous day's trend change, so a recent rise or fall still counts
+# for the next few weeks and then levels off (at 0.97 the whole projected change is
+# about a month's worth of the current slope). Env LOGITRACK_PROPHET_DAMP overrides it.
+PROPHET_TREND_DAMP = float(os.environ.get("LOGITRACK_PROPHET_DAMP", "0.97"))
+# CHECKED AGAINST ITS OWN LAST FOUR WEEKS. Prophet's straight-line trend and fixed-size
+# weekly swings are fine for a product selling at a steady rhythm, and badly wrong for
+# one whose level just changed (a jersey after a World Cup: forecast 1 a day while it
+# sold 3). Before each forecast, recent 4-week stretches are hidden one at a time and
+# forecast twice from the history before them: by Prophet and by a recent-sales model
+# (_recent_level_forecast: a smoothed recent level times the weekday pattern). The final
+# forecast leans on each in proportion to how well it did: where Prophet called those
+# weeks well it stays mostly Prophet, where it missed badly it is mostly recent sales.
+# Env LOGITRACK_RECENT_CHECK=0 switches it off. (An automatic ETS model was tried first:
+# as accurate, but on some days it moved a 30-day forecast by more than 100%.)
+# Only for products WITHOUT their own yearly seasonality (under 450 days, the same switch
+# as `_yearly_native`). There Prophet is just a trend line plus a weekly pattern, which is
+# exactly what goes wrong after a jump or a drop. With a year and a quarter of history
+# Prophet also knows the annual pattern and ETS does not: a quiet October that both
+# called equally well would otherwise flatten the December peak by half.
+RECENT_CHECK_DAYS = int(os.environ.get("LOGITRACK_RECENT_CHECK", "28"))
+# Days of its own history before Prophet fits a yearly pattern. With exactly a year every
+# month has been seen once, so a product that simply grew all year reads as "December is
+# always busy". About 15 months lets the first months repeat and pins the pattern down.
+YEARLY_MIN_DAYS = int(os.environ.get("LOGITRACK_YEARLY_MIN_DAYS", "450"))
+RECENT_CHECK_MIN_TRAIN = 56
+# How many back-to-back 4-week stretches are tested (as many as the history allows, up to
+# this). One stretch let a single odd week swing the mix; three average it out, the same
+# way the slow-seller engine picks its model.
+RECENT_CHECK_WINDOWS = int(os.environ.get("LOGITRACK_RECENT_CHECK_WINDOWS", "3"))
+
+
+def _damp_trend(fc, last_date, phi=None):
+    """yhat from a Prophet prediction frame with the trend damped after `last_date`."""
+    phi = PROPHET_TREND_DAMP if phi is None else phi
+    y = fc["yhat"].to_numpy(dtype=float).copy()
+    if not (0.0 < phi < 1.0) or "trend" not in fc.columns:
+        return y
+    fut = (fc["ds"] > last_date).to_numpy()
+    past = np.where(~fut)[0]
+    if not fut.any() or not len(past):
+        return y
+    tr = fc["trend"].to_numpy(dtype=float)
+    t0 = tr[past[-1]]
+    k = (fc["ds"][fut] - fc["ds"].iloc[past[-1]]).dt.days.to_numpy(dtype=float)
+    slope = (tr[fut][0] - t0) / max(k[0], 1.0)
+    damped = t0 + slope * phi * (1.0 - phi ** k) / (1.0 - phi)
+    mult = (fc["multiplicative_terms"].to_numpy(dtype=float)[fut]
+            if "multiplicative_terms" in fc.columns else 0.0)
+    y[fut] = y[fut] + (damped - tr[fut]) * (1.0 + mult)
+    return y
+
+
+# Days for a day's weight in the recent level to halve. Tested on 36 simulated products
+# under 450 days (steady, growing, fading, spike-then-normal, seasonal, promoted): 7 was
+# the most accurate but moved more day to day, 14 the steadiest; 10 sits between (weekly
+# error 35.0% against Prophet alone at 39.2%, worst day-to-day move 16% against 32%).
+RECENT_HALF_LIFE = 10
+RECENT_PROFILE_DAYS = 56   # the weekday pattern comes from the last 8 weeks
+
+
+def _recent_level_forecast(frame, h, half_life=None):
+    """What "sales lately" says: a recent level times this product's usual weekday pattern,
+    held flat. The level is an average of recent days in which each day's weight halves
+    every RECENT_HALF_LIFE days, so a single busy or quiet day moves it a few percent, not
+    the whole forecast. The weekday pattern comes from the last 8 weeks and scales with
+    the level (it can't push a quiet day below zero). Clipped at 0, never negative."""
+    hl = float(half_life or RECENT_HALF_LIFE)
+    d = frame[["ds", "y"]].sort_values("ds")
+    y = np.clip(d["y"].to_numpy(dtype=float), 0.0, None)
+    wd = pd.to_datetime(d["ds"]).dt.weekday.to_numpy()
+    if not len(y):
+        return np.zeros(int(h))
+    tail = slice(max(0, len(y) - RECENT_PROFILE_DAYS), len(y))
+    yt, wt = y[tail], wd[tail]
+    mu = float(yt.mean())
+    prof = np.ones(7)
+    if mu > 0:
+        for i in range(7):
+            v = yt[wt == i]
+            if len(v):
+                n = float(v.sum())
+                prof[i] = 1.0 + (float(v.mean()) / mu - 1.0) * n / (n + 20.0)
+        prof = prof / prof.mean()
+    z = y / prof[wd]
+    a = 1.0 - 0.5 ** (1.0 / hl)
+    lvl = float(z[: min(len(z), 28)].mean())
+    for v in z:
+        lvl += a * (v - lvl)
+    last = pd.to_datetime(d["ds"]).max()
+    fwd = (pd.date_range(last + pd.Timedelta(days=1), periods=int(h), freq="D").weekday).to_numpy()
+    return np.clip(lvl * prof[fwd], 0.0, None)
+
+
+# The recent-sales side of the 4-week check (named for what it does in the details).
+_ets_forecast = _recent_level_forecast
+
+
 TREND_DAMP     = 0.90  # daily damping; projected momentum fades over ~2 weeks
 TREND_MIN_FRAC = 0.15  # ignore slopes whose 30-day projection is <15% of level (noise)
 
@@ -63,7 +165,7 @@ def _future_dates(last_date, horizon):
 # new/thin SKUs; ProphetEngine BLENDS it in for "established but under a year"
 # SKUs, which Prophet itself can't give annual seasonality to (see fit()).
 POOLED_FADE_START   = 180   # ESTABLISHED_DAYS: full pooled yearly weight at/under this
-POOLED_YEARLY_DAYS  = 450   # matches Prophet's yearly_seasonality cutoff; weight → 0 here
+POOLED_YEARLY_DAYS  = YEARLY_MIN_DAYS   # matches Prophet's yearly_seasonality cutoff; weight → 0 here
 BLEND_MIN_RELATIVES = 2     # need a real pool, not a singleton, to borrow an annual shape
 BLEND_MIN_COHESION  = 0.35  # siblings must actually agree on a shape (mirror router's gate)
 
@@ -196,9 +298,17 @@ class ProphetEngine:
     method = "prophet"
     model_label = "Prophet"
 
-    def fit(self, df, today, has_price, has_promo, last_price, events, related=None, **_):
+    def fit(self, df, today, has_price, has_promo, last_price, events, related=None,
+            price_bounds=None, price_range=None, **_):
         from prophet import Prophet  # lazy
         self.today = pd.Timestamp(today)
+        # (lo, hi): scheduled prices are forecast as if clamped into this range. Outside
+        # it the price response was never observed, and the regressor is linear, so it
+        # would extrapolate without limit. See forecast_engine.price_bounds.
+        self.price_bounds = price_bounds
+        # (lo, hi) of the prices actually sold at for 30+ days. Inside it the price effect
+        # is interpolated; outside it, extrapolated — and marked as less certain.
+        self.price_range = price_range
         self.has_price, self.has_promo = has_price, has_promo
         self.last_price, self.events = last_price, (events or [])
         df = df.sort_values("ds").reset_index(drop=True)
@@ -214,22 +324,77 @@ class ProphetEngine:
         # follows a recent rise/fall. 0.05 is Prophet's default. LOWER = flatter, less
         # trend-chasing (steadier, less over/under-shoot); HIGHER = more reactive.
         # Code-only lever — only change it if REAL data shows a consistent bias.
-        self._yearly_native = days >= 450
-        m = Prophet(yearly_seasonality=self._yearly_native, weekly_seasonality=days >= 14,
-                    daily_seasonality=False, interval_width=0.80,
-                    changepoint_prior_scale=0.05)
-        if has_price: m.add_regressor("price", standardize=True)
-        if has_promo: m.add_regressor("on_promotion", standardize=False)
+        self._yearly_native = days >= YEARLY_MIN_DAYS
+
+        def _build(with_price):
+            mm = Prophet(yearly_seasonality=self._yearly_native, weekly_seasonality=days >= 14,
+                         daily_seasonality=False, interval_width=0.80,
+                         changepoint_prior_scale=0.05)
+            # Price enters as log(price / today's price), MULTIPLYING the forecast. A 10%
+            # price change then moves demand by the same percentage on a quiet Tuesday
+            # and a busy Saturday, which is how shoppers respond. As a plain additive
+            # regressor it moved every day by the same number of units, so the effect
+            # was too small on busy days and too large on quiet ones, and the measured
+            # response came out about a quarter too weak.
+            if with_price: mm.add_regressor("price", mode="multiplicative", standardize=True)
+            if has_promo: mm.add_regressor("on_promotion", standardize=False)
+            return mm
 
         fit_df = df[["ds", "y"]].copy()
-        if has_price: fit_df["price"] = df["price"].ffill().fillna(last_price or 0)
+        _raw = df["price"].ffill().fillna(last_price or 0) if has_price else None
+        self._pref = float(last_price or 0) or (float(_raw.median()) if _raw is not None else 0.0) or 1.0
+        if has_price: fit_df["price"] = self._log_price(_raw)
         if has_promo: fit_df["on_promotion"] = df["on_promotion"].fillna(0).clip(0, 1)
+        m = _build(has_price)
         m.fit(fit_df)
+
+        # ── Does the fitted price effect point the right way? ─────────────────
+        # Prophet fits the price coefficient with NO sign constraint. On sparse data a
+        # coincidence — a discount that happened to land in a quiet stretch — becomes
+        # "cheaper means fewer sales", and every price event then moves the forecast
+        # BACKWARDS: cut the price, demand drops; raise it, demand climbs. Measured on a
+        # reproduction of exactly that, a 20% cut took a 30-day forecast from 155 units
+        # to 45 and a 20% rise took it to 265.
+        #
+        # uplift.price_elasticity has refused a positive relationship for a long time
+        # ("positive-elasticity-ignored") — but only on the non-Prophet path, which is not
+        # the one that applies price. This holds Prophet to the same standard, tested on
+        # the thing that matters rather than on an internal coefficient: predict the same
+        # window at today's price and 10% above it. If the dearer price sells MORE, the
+        # relationship this data taught the model is backwards, so the model is refitted
+        # without price. That does not make price effects right — it makes them neutral,
+        # which is the honest answer when the data cannot tell us which way they go.
+        self._price_inverted = None
+        if has_price:
+            lp = float(last_price or 0) or float(fit_df["price"].median() or 0)
+            if lp > 0:
+                probe = m.make_future_dataframe(periods=30, freq="D")
+                lo, hi = probe.copy(), probe.copy()
+                lo["price"], hi["price"] = lp, lp * 1.10
+                if has_promo:
+                    lo["on_promotion"] = 0; hi["on_promotion"] = 0
+                y_lo = float(m.predict(self._tx(lo)).tail(30)["yhat"].clip(lower=0).sum())
+                y_hi = float(m.predict(self._tx(hi)).tail(30)["yhat"].clip(lower=0).sum())
+                if y_hi > y_lo + 1e-6:
+                    self._price_inverted = {
+                        "at": round(lp, 2), "unitsAtPrice": round(y_lo, 1),
+                        "unitsAt10pctHigher": round(y_hi, 1),
+                        "changePct": round((y_hi - y_lo) / y_lo * 100, 1) if y_lo > 0 else None,
+                    }
+                    has_price = False
+                    self.has_price = False
+                    fit_df = fit_df.drop(columns=["price"])
+                    m = _build(False)
+                    m.fit(fit_df)
         self._model = m
         self._fit_df = fit_df
 
         # In-sample residuals → conformal band + safety-stock sigma.
         resid = fit_df["y"].to_numpy() - m.predict(fit_df)["yhat"].to_numpy()
+        try:
+            self._recent_check(fit_df, _build, self.has_price)
+        except Exception:                                   # noqa: BLE001 — never fail a fit over it
+            self._ets_w, self._ets_future, self._recent = 0.0, None, None
         self.residual_std = float(np.std(resid))
         self.residual_cv = self.residual_std / max(float(fit_df["y"].mean()), 1.0)
         self._q_lo, self._q_hi = conformal_offsets(resid, self.residual_std)
@@ -262,40 +427,171 @@ class ProphetEngine:
         self.forecast_df = self._predict(self.events)
         return self
 
+    def _log_price(self, prices):
+        return np.log(np.clip(np.asarray(prices, dtype=float), 0.01, None) / float(getattr(self, "_pref", 1.0) or 1.0))
+
+    def _tx(self, frame):
+        """A frame of real prices, as the model sees them (log of price / today's price)."""
+        if not self.has_price or "price" not in frame.columns:
+            return frame
+        out = frame.copy()
+        out["price"] = self._log_price(out["price"])
+        return out
+
     def _future_exog(self, events, price_override=None, force_no_promo=False):
         f = self._model.make_future_dataframe(periods=self.horizon, freq="D")
         if self.has_price:
-            f["price"] = price_override if price_override is not None else (self.last_price or 0.0)
-            if price_override is None:
-                for ev in events:
-                    if ev.get("type") in ("price_change_permanent", "price_change_temporary"):
-                        s = pd.to_datetime(ev["date"]); np_ = float(ev.get("new_price", self.last_price or 0))
-                        if ev["type"] == "price_change_permanent":
-                            f.loc[f["ds"] >= s, "price"] = np_
-                        else:
-                            e = pd.to_datetime(ev.get("end_date", ev["date"]))
-                            f.loc[(f["ds"] >= s) & (f["ds"] <= e), "price"] = np_
+            if price_override is not None:
+                f["price"] = float(price_override)
+            else:
+                # Same rules as every other engine: shelf price from price changes, then
+                # the deepest overlapping promotion as a discount, then the hard limits.
+                from forecast_engine import scheduled_prices
+                prices, _ = scheduled_prices(f["ds"].tolist(), events, self.last_price or 0.0,
+                                             bounds=getattr(self, "price_bounds", None),
+                                             promotions=not force_no_promo)
+                f["price"] = prices
+            if getattr(self, "price_bounds", None) is not None:
+                lo, hi = self.price_bounds
+                f["price"] = f["price"].astype(float).clip(lower=float(lo), upper=float(hi))
         if self.has_promo:
             f["on_promotion"] = 0
-            if not force_no_promo:
-                for ev in events:
-                    if ev.get("type") == "promotion":
-                        s = pd.to_datetime(ev["date"]); e = pd.to_datetime(ev.get("end_date", ev["date"]))
-                        msk = (f["ds"] >= s) & (f["ds"] <= e)
-                        f.loc[msk, "on_promotion"] = 1
-                        if self.has_price and ev.get("discount_pct"):
-                            f.loc[msk, "price"] = (f.loc[msk, "price"] * (1 - float(ev["discount_pct"]) / 100)).round(2)
         return f
+
+    def _yhat(self, frame):
+        """Prophet's prediction for `frame` (history + future), with the trend damped past
+        the last day of history (see PROPHET_TREND_DAMP). Returns (yhat array, raw frame)."""
+        fc = self._model.predict(self._tx(frame))
+        return _damp_trend(fc, self.last_date), fc
+
+    def _recent_check(self, fit_df, build, with_price):
+        """Hide recent 4-week stretches one at a time, forecast each with Prophet and with
+        ETS from only the history before it, and weight ETS by how much better it did over
+        all of them (see RECENT_CHECK_DAYS / RECENT_CHECK_WINDOWS)."""
+        self._ets_w, self._ets_future, self._recent = 0.0, None, None
+        H = RECENT_CHECK_DAYS
+        if getattr(self, "_yearly_native", False):
+            return
+        if H <= 0 or len(fit_df) < H + RECENT_CHECK_MIN_TRAIN or not self.horizon:
+            return
+        n = len(fit_df)
+        # Judged week by week, not day by day: orders cover weeks, and single days of a
+        # lumpy seller are so noisy that a model a third too low and one spot on miss by
+        # about the same per day.
+        miss_p, miss_e, windows = [], [], []
+        for k in range(1, RECENT_CHECK_WINDOWS + 1):
+            cut = n - k * H
+            if cut < RECENT_CHECK_MIN_TRAIN:
+                break
+            train, test = fit_df.iloc[:cut], fit_df.iloc[cut:cut + H]
+            mh = build(with_price)
+            mh.fit(train)
+            frame = pd.concat([train.tail(1), test]).drop(columns=["y"])
+            yp = np.clip(_damp_trend(mh.predict(frame), train["ds"].max())[1:], 0.0, None)
+            ye = _ets_forecast(train, H)[:len(test)]
+            act = test["y"].to_numpy(dtype=float)
+            wk = np.arange(len(act)) // 7
+            wa = np.bincount(wk, act)
+            miss_p += list(np.abs(wa - np.bincount(wk, yp)))
+            miss_e += list(np.abs(wa - np.bincount(wk, ye)))
+            windows.append({"actual": round(float(act.sum()), 1), "prophet": round(float(yp.sum()), 1),
+                            "ets": round(float(ye.sum()), 1)})
+        if not windows:
+            return
+        err_p, err_e = float(np.mean(miss_p)) / 7.0, float(np.mean(miss_e)) / 7.0
+        if err_p + err_e <= 0:
+            return
+        w = err_p ** 2 / (err_p ** 2 + err_e ** 2)
+        self._recent = {"days": H, "windows": len(windows), "prophetMissPerDay": round(err_p, 2),
+                        "etsMissPerDay": round(err_e, 2), "etsWeight": round(w, 2),
+                        "tests": windows, **windows[0]}
+        if w < 0.02:
+            return
+        self._ets_future = _ets_forecast(fit_df, self.horizon)
+        self._ets_w = float(w)
+        if w >= 0.5:
+            self.model_label = "Prophet, adjusted to recent sales"
 
     def _predict(self, events, price_override=None, force_no_promo=False):
         f = self._future_exog(events, price_override, force_no_promo)
-        fc = self._model.predict(f)
-        fc = fc[fc["ds"] > self.last_date]
-        band = _band(fc["ds"].values, fc["yhat"].to_numpy(), self._q_lo, self._q_hi)
+        _y, fc = self._yhat(f)
+        keep = (fc["ds"] > self.last_date).to_numpy()
+        yhat = _y[keep]
+        x_sd = np.zeros(len(yhat))
+        ref = None
+        # Price events move this forecast through a LINEAR regressor, which extrapolates
+        # without limit. Compare every day against the same day at today's price: cap the
+        # ratio, and measure how much of the day is a price effect so its uncertainty can
+        # be carried into the band and the safety stock.
+        if self.has_price and price_override is None and (self.last_price or 0) > 0:
+            ref_f = f.copy()
+            ref_f["price"] = float(self.last_price)
+            ref = np.clip(self._yhat(ref_f)[0][keep], 0, None)
+            prices = f["price"].to_numpy(dtype=float)[keep]
+            moved = np.abs(prices - float(self.last_price)) > 1e-9
+            if moved.any():
+                from forecast_engine import (MAX_PRICE_LIFT, MIN_PRICE_RATIO, PRICE_MAX_ELASTICITY,
+                                             extrapolation_distance, extrapolation_uncertainty,
+                                             taper_beyond_edge)
+                rng = getattr(self, "price_range", None)
+                # OUTSIDE THE PRICES SOLD AT, RESPOND IN PERCENTAGES, NOT A STRAIGHT LINE.
+                # The regressor is linear: every dollar moves the same number of units. That
+                # is fine between prices the product has sold at, and wrong past them. A line
+                # fitted between $40 and $50 runs out of sales around $70, so a 20% rise
+                # forecast almost half the demand gone. Past the known range the response is
+                # continued at the elasticity the model shows across that range: each 1% of
+                # price moves demand by the same %, which bends instead of hitting zero.
+                if rng and float(rng[1]) > float(rng[0]):
+                    lo_p, hi_p = float(rng[0]), float(rng[1])
+                    out_lo = moved & (prices < lo_p - 1e-9)
+                    out_hi = moved & (prices > hi_p + 1e-9)
+                    if out_lo.any() or out_hi.any():
+                        f_lo, f_hi = f.copy(), f.copy()
+                        f_lo["price"], f_hi["price"] = lo_p, hi_p
+                        y_lo = np.clip(self._yhat(f_lo)[0][keep], 0, None)
+                        y_hi = np.clip(self._yhat(f_hi)[0][keep], 0, None)
+                        ok = (y_lo > 1e-9) & (y_hi > 1e-9)
+                        with np.errstate(divide="ignore", invalid="ignore"):
+                            el = np.where(ok, np.log(np.where(ok, y_lo / np.where(ok, y_hi, 1), 1))
+                                          / np.log(lo_p / hi_p), 0.0)
+                        el = np.clip(el, -PRICE_MAX_ELASTICITY, 0.0)
+                        with np.errstate(divide="ignore", invalid="ignore"):
+                            raw_lo = y_lo * np.power(np.clip(prices, 1e-9, None) / lo_p, el)
+                            raw_hi = y_hi * np.power(np.clip(prices, 1e-9, None) / hi_p, el)
+                        # ...and ease it toward the limits instead of stopping at them.
+                        yhat = np.where(out_lo, taper_beyond_edge(y_lo, raw_lo, ref), yhat)
+                        yhat = np.where(out_hi, taper_beyond_edge(y_hi, raw_hi, ref), yhat)
+                y = np.clip(yhat, 0, None)
+                capped = np.where(ref > 0, np.clip(y, MIN_PRICE_RATIO * ref, MAX_PRICE_LIFT * ref), y)
+                yhat = np.where(moved, capped, yhat)
+                self._price_lift_capped = bool(np.any(moved & (np.abs(capped - y) > 1e-9)))
+                if rng:
+                    u = np.array([extrapolation_uncertainty(extrapolation_distance(p, rng[0], rng[1]))
+                                  for p in prices])
+                    x_sd = np.where(moved, np.abs(np.clip(yhat, 0, None) - ref) * u, 0.0)
+        w_e = getattr(self, "_ets_w", 0.0)
+        ets = getattr(self, "_ets_future", None)
+        if w_e > 0 and ets is not None and len(ets) >= len(yhat):
+            # ETS knows nothing of price, so it takes the same price effect as Prophet's
+            # forecast shows day by day (1 where the price is today's).
+            ratio = np.ones(len(yhat))
+            if self.has_price and (self.last_price or 0) > 0:
+                if ref is None:
+                    _rf = f.copy(); _rf["price"] = float(self.last_price)
+                    _ref = np.clip(self._yhat(_rf)[0][keep], 0, None)
+                else:
+                    _ref = ref
+                ratio = np.where(_ref > 1e-9, np.clip(yhat, 0, None) / np.where(_ref > 1e-9, _ref, 1.0), 1.0)
+            mixed = (1.0 - w_e) * np.clip(yhat, 0, None) + w_e * ets[:len(yhat)] * ratio
+            with np.errstate(divide="ignore", invalid="ignore"):
+                x_sd = np.where(np.clip(yhat, 0, None) > 1e-9, x_sd * mixed / np.clip(yhat, 1e-9, None), x_sd)
+            yhat = mixed
+        band = _band(fc["ds"].values[keep], yhat, self._q_lo, self._q_hi)
         if getattr(self, "_blend_w", 0.0) > 0 and getattr(self, "_blend_mo", None) is not None:
             band = apply_pooled_yearly(band, self._blend_mo, self._blend_w,
                                        resid_std_norm=self._blend_resid_std,
                                        level=self._blend_level)
+        band["x_sd"] = x_sd
         return band
 
     def predict_baseline(self, regular_price):
@@ -307,23 +603,45 @@ class ProphetEngine:
                 "weekly": True, "yearly": True, "blended": True,
                 "blendWeight": round(float(self._blend_w), 2),
                 "poolSize": self._n_pool_relatives,
-                "text": (f"Weekly seasonality is learned from this product's own history. It doesn't yet "
-                         f"have a full year of sales, so its yearly seasonality is blended "
+                "text": (f"Weekly seasonality is learned from this product's own history. With under a "
+                         f"full year of sales, its yearly seasonality is blended "
                          f"{round(self._blend_w * 100)}% from {self._n_pool_relatives} closely-matched related "
-                         f"products, fading out as it builds up its own annual history."),
+                         f"products, fading out as its own history builds."),
             }
         elif getattr(self, "_yearly_native", True):
             seasonality = {"weekly": True, "yearly": True, "blended": False,
                            "text": "Prophet models this product's own weekly and yearly seasonality directly."}
         else:
             seasonality = {"weekly": True, "yearly": False, "blended": False,
-                           "text": ("Prophet models this product's own weekly seasonality; it doesn't yet have "
-                                    "a full year of history (or a close enough pool of related products) to "
-                                    "establish a yearly cycle.")}
-        return {"seasonality": seasonality,
+                           "text": ("Prophet models this product's own weekly seasonality. A yearly cycle needs "
+                                    "about 15 months of history (or a close enough group of similar products).")}
+        rc = getattr(self, "_recent", None)
+        recent = None
+        if rc:
+            share = round(rc["etsWeight"] * 100)
+            _p, _e, _a = round(rc["prophet"]), round(rc["ets"]), round(rc["actual"])
+            _nw = int(rc.get("windows") or 1)
+            _also = (f" Over {_nw} back-to-back 4-week tests like this one" if _nw > 1 else " So")
+            recent = {**rc, "text": (
+                (f"Tested on its last 4 weeks: Prophet would have forecast {_p}, a model that follows "
+                 f"recent sales {_e}, and it sold {_a}.{_also}, the forecast comes out {share}% the "
+                 f"recent-sales model and {100 - share}% Prophet.")
+                if share >= 2 else
+                (f"Tested on its last 4 weeks: Prophet would have forecast {_p}, a model that follows "
+                 f"recent sales {_e}, and it sold {_a}. Prophet called {'these tests' if _nw > 1 else 'it'} "
+                 f"better, so the forecast is Prophet's."))}
+        return {"seasonality": seasonality, "recentCheck": recent,
                 "price": {"used": bool(self.has_price), "sensitivity": None,
-                          "text": ("Price and promotions are inputs, so changing them shifts the forecast."
-                                   if self.has_price else "No price data was provided.")}}
+                          "inverted": getattr(self, "_price_inverted", None),
+                          "text": (
+                              "Price is an input, so price changes and promotions (counted as price cuts) shift the forecast."
+                              if self.has_price else
+                              ("Price isn't an input for this product. Its lower-priced days happened "
+                               "to sell less, which is almost certainly coincidence, so price is switched "
+                               "off rather than applied backwards. Price changes won't move this forecast "
+                               "until the data shows a normal relationship."
+                               if getattr(self, "_price_inverted", None) else
+                               "No price data was provided."))}}
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -442,7 +760,7 @@ class GlobalPooledEngine:
                                    f"(~{abs(self._trend):.2f} units/day, seasonally adjusted); a damped growth "
                                    f"trend is applied and fades over ~2 weeks."
                                    if self._trend else
-                                   "No meaningful growth trend detected — volume is held flat.")}}
+                                   "No meaningful growth trend, so volume is held flat.")}}
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -489,7 +807,12 @@ class IntermittentEngine:
         if CrostonSBA is not None:
             cands["CrostonSBA"] = CrostonSBA()
         if _sub != "low_volume_regular":
-            cands["TSB"] = TSB(alpha_d=0.2, alpha_p=0.2)
+            # How often it sells (alpha_p) moves half as fast as how many it sells per sale.
+            # At 0.2 a single sale after a quiet fortnight took a one-a-week product from
+            # 0.9 to 9 a month overnight (and back down over the next two weeks). At 0.1
+            # the same sale moves it 2.4 to 6.2. On a real store's slow sellers that cost
+            # 8% in accuracy and cut the worst overnight swing from 13x to under 5x.
+            cands["TSB"] = TSB(alpha_d=0.2, alpha_p=0.1)
         # Use as many CV windows as the history affords (up to 3) — a single window
         # made the Croston-vs-TSB pick hostage to one stretch of noise. And require
         # the challenger to beat the default by a real margin (2% MAE) to displace
@@ -553,13 +876,13 @@ class IntermittentEngine:
         _regular = getattr(self, "sparse_subtype", "") == "low_volume_regular"
         return {"seasonality": {"weekly": False, "yearly": False,
                                 "text": ("This product sells on some days and not others, so it's modelled as a "
-                                         "steady underlying RATE (units per day) rather than a seasonal curve. "
-                                         "Expected demand is fractional per day — orders are sized by summing "
-                                         "that rate across the lead time and coverage window."
+                                         "steady rate (units per day), not a seasonal curve. That rate is often "
+                                         "fractional per day, so orders are sized by summing it across the lead "
+                                         "time and coverage window."
                                          if _regular else
                                          "Intermittent demand is modeled by the size and timing of sporadic sales, not seasonal curves.")},
                 "price": {"used": False, "sensitivity": None,
-                          "text": "Price isn't used — intermittent demand has too sparse a signal to estimate it."}}
+                          "text": "Price isn't used: intermittent demand is too sparse to estimate it."}}
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -568,7 +891,7 @@ class IntermittentEngine:
 # ═════════════════════════════════════════════════════════════════════════════
 class MovingAverageEngine:
     method = "abstain"
-    model_label = "Moving average — LAST RESORT (no history, no relatives)"
+    model_label = "Moving average: last resort (no history, no relatives)"
 
     def fit(self, df, today, **_):
         self.today = pd.Timestamp(today)
@@ -589,5 +912,5 @@ class MovingAverageEngine:
 
     def explain_bits(self):
         return {"seasonality": {"weekly": False, "yearly": False,
-                                "text": "Not enough data to model seasonality — this is a flat recent-average placeholder."},
+                                "text": "Not enough data to model seasonality, so this is a flat recent-average placeholder."},
                 "price": {"used": False, "sensitivity": None, "text": "Price isn't used in the fallback estimate."}}

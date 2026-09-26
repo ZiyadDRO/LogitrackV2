@@ -152,7 +152,7 @@ export function groqHealthMessage(h) {
   if (!h || h.ok) return null;
   const list = h.missing.join(" and ");
   return `Groq no longer offers ${list}. AI features will fail until the model is changed `
-       + `in src/lib/ai.js — check https://console.groq.com/docs/deprecations for the replacement.`;
+       + `in src/lib/ai.js. See https://console.groq.com/docs/deprecations for the replacement.`;
 }
 
 // ── What did that request actually cost? ──────────────────────────────────────

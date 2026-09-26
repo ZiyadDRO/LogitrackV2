@@ -32,6 +32,10 @@ from __future__ import annotations
 
 import math
 
+from forecast_engine import MAX_PRICE_LIFT, MIN_PRICE_RATIO, scheduled_prices, taper_beyond_edge
+
+import pandas as _pd
+
 # Below this many promotional days, a product's own lift is mostly noise.
 MIN_PROMO_DAYS = 3
 
@@ -137,6 +141,49 @@ def cohort_promo_lift(frames, *, value_col="y", promo_col="on_promotion"):
     return round(num / den, 3)
 
 
+# Days at the less common price needed, within months that saw both, before a
+# same-season comparison replaces the whole-history one.
+MIN_WITHIN_MONTH_DAYS = 30
+
+
+def _within_month_elasticity(df, value_col="y", price_col="price"):
+    """Elasticity from price levels compared inside the same calendar month (month fixed
+    effects, zero days included, weighted by days). None when too few months were sold at
+    more than one price."""
+    if "ds" not in getattr(df, "columns", []):
+        return None
+    try:
+        d = _pd.DataFrame({"m": _pd.to_datetime(df["ds"]).dt.month,
+                           "p": _pd.to_numeric(df[price_col], errors="coerce").round(2),
+                           "q": _pd.to_numeric(df[value_col], errors="coerce")}).dropna()
+    except Exception:                                   # noqa: BLE001
+        return None
+    d = d[(d["p"] > 0) & (d["q"] >= 0)]
+    if d.empty:
+        return None
+    cells = d.groupby(["m", "p"])["q"].agg(["count", "mean"]).reset_index()
+    cells = cells[(cells["count"] >= 3) & (cells["mean"] > 0)]
+    num = den = 0.0
+    months = 0
+    minority = 0
+    for _, g in cells.groupby("m"):
+        if len(g) < 2:
+            continue
+        w = g["count"].to_numpy(float)
+        x = [math.log(v) for v in g["p"]]
+        y = [math.log(v) for v in g["mean"]]
+        W = w.sum()
+        mx = sum(wi * xi for wi, xi in zip(w, x)) / W
+        my = sum(wi * yi for wi, yi in zip(w, y)) / W
+        num += sum(wi * (xi - mx) * (yi - my) for wi, xi, yi in zip(w, x, y))
+        den += sum(wi * (xi - mx) ** 2 for wi, xi in zip(w, x))
+        months += 1
+        minority += int(w.sum() - w.max())
+    if months == 0 or den <= 0 or minority < MIN_WITHIN_MONTH_DAYS:
+        return None
+    return {"elasticity": num / den, "months": months}
+
+
 def price_elasticity(df, *, value_col="y", price_col="price"):
     """How demand responds to price, as a log-log elasticity.
 
@@ -151,38 +198,71 @@ def price_elasticity(df, *, value_col="y", price_col="price"):
         out["basis"] = "no-price-data"
         return out
 
-    pairs = []
+    # A day that sold at two different prices is evidence of neither: its price is a
+    # blend no customer paid. Measure the response from single-price days only.
+    if "price_mixed" in df.columns:
+        try:
+            df = df[df["price_mixed"].fillna(0).astype(float) < 1]
+        except (TypeError, ValueError, AttributeError):
+            pass
+    # MEASURED FROM EACH PRICE'S AVERAGE DAILY SALES, ZERO DAYS INCLUDED.
+    # This used to regress units on price over sale days only. For a slow seller that
+    # misses most of the response: at a higher price it mostly sells on FEWER days, not
+    # fewer units per sale, and the days it didn't sell were thrown away. In a simulated
+    # slow seller with a true elasticity of -1.2, a 16% rise moved the forecast by 3%.
+    # Averaging every day at each price, zeros included, sees the whole effect.
+    rows = []
     for p, q in zip(df[price_col].tolist(), df[value_col].tolist()):
         try:
             p, q = float(p), float(q)
         except (TypeError, ValueError):
             continue
-        if p > 0 and q > 0:      # log of zero is undefined; zero-sale days carry no price signal
-            pairs.append((p, q))
-    out["points"] = len(pairs)
-    if len(pairs) < MIN_PRICE_POINTS:
+        if p > 0 and q == q and q >= 0:
+            rows.append((round(p, 2), q))
+    sale_days = sum(1 for _, q in rows if q > 0)
+    out["points"] = sale_days
+    if sale_days < MIN_PRICE_POINTS:
         out["basis"] = "too-few-points"
         return out
-
-    prices = [p for p, _ in pairs]
+    levels = {}
+    for p, q in rows:
+        n_, s_ = levels.get(p, (0, 0.0))
+        levels[p] = (n_ + 1, s_ + q)
+    lv = [(p, n_, s_ / n_) for p, (n_, s_) in levels.items() if n_ >= 3 and s_ > 0]
+    if len(lv) < 2:
+        out["basis"] = "price-never-varied"
+        return out
+    prices = [p for p, _, _ in lv]
     lo, hi = min(prices), max(prices)
     spread = (hi - lo) / hi if hi else 0.0
     out["spread"] = round(spread, 4)
     if spread < MIN_PRICE_SPREAD:
-        # The price never really moved, so nothing in this data reveals elasticity.
         out["basis"] = "price-never-varied"
         return out
-
-    lx = [math.log(p) for p, _ in pairs]
-    ly = [math.log(q) for _, q in pairs]
-    mx, my = _mean(lx), _mean(ly)
-    var = sum((x - mx) ** 2 for x in lx)
+    wts = [n_ for _, n_, _ in lv]
+    lx = [math.log(p) for p, _, _ in lv]
+    ly = [math.log(m) for _, _, m in lv]
+    W = float(sum(wts))
+    mx = sum(w_ * x for w_, x in zip(wts, lx)) / W
+    my = sum(w_ * y for w_, y in zip(wts, ly)) / W
+    var = sum(w_ * (x - mx) ** 2 for w_, x in zip(wts, lx))
     if var <= 0:
         out["basis"] = "price-never-varied"
         return out
-    cov = sum((x - mx) * (y - my) for x, y in zip(lx, ly))
-    raw = cov / var
+    raw = sum(w_ * (x - mx) * (y - my) for w_, x, y in zip(wts, lx, ly)) / var
+    # SAME SEASON FIRST. Comparing each price's average across the whole history confuses
+    # price with season: a discount run in the quiet months looks like it barely sold, and
+    # the response comes out far too weak (a true -1.4 read as -0.7 in simulation). When
+    # the same calendar months were sold at more than one price, compare within those
+    # months only. Otherwise the whole-history comparison above stands.
+    within = _within_month_elasticity(df, value_col, price_col)
+    if within is not None:
+        out["acrossMonths"] = round(raw, 3)
+        raw = within["elasticity"]
+        out["basisDetail"] = "same-month comparison"
+        out["monthsCompared"] = within["months"]
     out["raw"] = round(raw, 3)
+    out["levels"] = len(lv)
 
     if raw > 0:
         # Demand rising with price is almost always confounding — a premium line, or
@@ -191,7 +271,8 @@ def price_elasticity(df, *, value_col="y", price_col="price"):
         out["basis"] = "positive-elasticity-ignored"
         return out
 
-    n = len(pairs)
+    pairs = rows
+    n = sale_days
     w = n / (n + ELASTICITY_SHRINK_K)
     shrunk = raw * w
     capped = max(-MAX_ELASTICITY, shrunk)
@@ -200,6 +281,84 @@ def price_elasticity(df, *, value_col="y", price_col="price"):
     out["basis"] = "measured"
     out["weight"] = round(w, 3)
     return out
+
+
+# Similar products needed before their price response is borrowed.
+MIN_BORROW_PEERS = 2
+
+_peer_cache: dict = {}
+
+
+def frame_key(df):
+    """A cheap fingerprint of a sales frame, for caching per-frame measurements."""
+    try:
+        return (len(df), str(df["ds"].min())[:10], str(df["ds"].max())[:10], round(float(df["y"].sum()), 3),
+                round(_col_sum(df, "price"), 3))
+    except Exception:                                   # noqa: BLE001
+        return None
+
+
+def _col_sum(df, col):
+    if col not in getattr(df, "columns", []):
+        return 0.0
+    try:
+        return float(df[col].fillna(0).astype(float).sum())
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _last_price(df):
+    v = _pd.to_numeric(df["price"], errors="coerce").dropna()
+    v = v[v > 0]
+    return float(v.iloc[-1]) if len(v) else None
+
+
+def peer_price_response(df):
+    """One peer's own price response, only when its history clears the price gate.
+    Returns {elasticity, lo, hi, current, days} or None. Cached per frame."""
+    from forecast_engine import price_evidence
+    key = frame_key(df)
+    if key is not None and key in _peer_cache:
+        return _peer_cache[key]
+    out = None
+    try:
+        if df is not None and "price" in df.columns and len(df):
+            ev = price_evidence(df)
+            if ev.get("usable"):
+                el = price_elasticity(df)
+                cur = _last_price(df)
+                if el.get("basis") == "measured" and el.get("elasticity", 0) < 0 and cur:
+                    out = {"elasticity": float(el["elasticity"]), "lo": float(ev["rangeLo"]),
+                           "hi": float(ev["rangeHi"]), "current": float(cur),
+                           "days": int(el.get("points") or 0)}
+    except Exception:                                   # noqa: BLE001
+        out = None
+    if key is not None:
+        if len(_peer_cache) > 5000:
+            _peer_cache.clear()
+        _peer_cache[key] = out
+    return out
+
+
+def pooled_elasticity(frames):
+    """Price response borrowed from similar products, for a product whose own history
+    can't show one yet (a new product, or one that has only ever sold at one price).
+
+    Only peers that clear the same 30-day gate count, and at least MIN_BORROW_PEERS of
+    them must. The typical (median) response is used, and the range of prices those peers
+    have actually sold at, relative to their current price, becomes the "known" range for
+    this product: inside it the borrowed response applies, past it the same taper eases
+    it off. Returns None when there's nothing to borrow."""
+    got = [r for r in (peer_price_response(f) for f in (frames or []) if hasattr(f, "columns")) if r]
+    if len(got) < MIN_BORROW_PEERS:
+        return None
+    els = sorted(r["elasticity"] for r in got)
+    med = els[len(els) // 2] if len(els) % 2 else 0.5 * (els[len(els) // 2 - 1] + els[len(els) // 2])
+    rel_lo = sorted(r["lo"] / r["current"] for r in got)
+    rel_hi = sorted(r["hi"] / r["current"] for r in got)
+    mid = len(got) // 2
+    return {"elasticity": round(med, 3), "peers": len(got), "relLo": min(rel_lo[mid], 1.0),
+            "relHi": max(rel_hi[mid], 1.0), "spread": round(els[-1] - els[0], 3), "basis": "borrowed"}
 
 
 def price_multiplier(elasticity, base_price, new_price):
@@ -213,62 +372,53 @@ def price_multiplier(elasticity, base_price, new_price):
     return round((n / b) ** float(elasticity), 4)
 
 
-def future_price_path(future_dates, events, base_price, *, price_override=None):
-    """The price each future day is expected to sell at.
+def future_price_path(future_dates, events, base_price, *, price_override=None, bounds=None):
+    """The price each future day is expected to sell at: {date: price}.
 
-    Reads the SAME events Prophet reads — `price_change_permanent` applies from its date
-    onward, `price_change_temporary` only within its window, and a promotion carrying a
-    `discount_pct` discounts that window. Parity matters: a price change entered once
-    should move every product's forecast, whichever engine happens to be behind it.
+    Built by forecast_engine.scheduled_prices, the same rules the Prophet route uses:
+    price changes set the shelf price, the deepest overlapping promotion discounts it,
+    and the hard limits hold it. A price change entered once means the same thing
+    whichever engine is behind the product.
     """
-    try:
-        base = float(base_price)
-    except (TypeError, ValueError):
-        base = None
     if price_override is not None:
         try:
             return {str(d)[:10]: float(price_override) for d in future_dates}
         except (TypeError, ValueError):
             pass
-    if base is None or base <= 0:
+    try:
+        base = float(base_price)
+    except (TypeError, ValueError):
         return {}
+    if base <= 0:
+        return {}
+    prices, _ = scheduled_prices(future_dates, events, base, bounds=bounds)
+    return {str(d)[:10]: p for d, p in zip(future_dates, prices)}
 
-    path = {str(d)[:10]: base for d in future_dates}
-    for ev in sorted(events or [], key=lambda e: str(e.get("date", ""))):
-        t = ev.get("type")
-        start = str(ev.get("date", ""))[:10]
-        if not start:
-            continue
-        end = str(ev.get("end_date") or start)[:10]
-        if t == "price_change_permanent":
-            try:
-                np_ = float(ev.get("new_price"))
-            except (TypeError, ValueError):
-                continue
-            for d in path:
-                if d >= start:
-                    path[d] = np_
-        elif t == "price_change_temporary":
-            try:
-                np_ = float(ev.get("new_price"))
-            except (TypeError, ValueError):
-                continue
-            for d in path:
-                if start <= d <= end:
-                    path[d] = np_
-        elif t == "promotion" and ev.get("discount_pct"):
-            try:
-                pct = float(ev["discount_pct"])
-            except (TypeError, ValueError):
-                continue
-            for d in path:
-                if start <= d <= end:
-                    path[d] = round(path[d] * (1 - pct / 100.0), 2)
-    return path
+
+def price_response(elasticity, base_price, new_price, known_range=None):
+    """Demand multiplier for selling at `new_price` instead of `base_price`.
+
+    Percentage response throughout (constant elasticity). Past the prices this product
+    has sold at, the extra response is eased toward the limits (taper_beyond_edge), then
+    held inside them as a last safety net.
+    """
+    m = price_multiplier(elasticity, base_price, new_price)
+    try:
+        p = float(new_price)
+    except (TypeError, ValueError):
+        return 1.0
+    if known_range and elasticity:
+        lo, hi = float(known_range[0]), float(known_range[1])
+        edge = lo if p < lo else hi if p > hi else None
+        if edge is not None:
+            m_edge = price_multiplier(elasticity, base_price, edge)
+            m = float(taper_beyond_edge(m_edge, m, 1.0))
+    return min(max(m, MIN_PRICE_RATIO), MAX_PRICE_LIFT)
 
 
 def future_multipliers(future_dates, events, lift: float, *,
-                       elasticity: float = 0.0, base_price=None, planned_price=None):
+                       elasticity: float = 0.0, base_price=None, planned_price=None,
+                       bounds=None, known_range=None):
     """One multiplier per future day.
 
     Promo lift where a promotion is scheduled, price response wherever the expected price
@@ -288,11 +438,12 @@ def future_multipliers(future_dates, events, lift: float, *,
             if start <= ds <= (end or start):
                 promo_days.add(ds)
 
-    path = future_price_path(future_dates, events, base_price, price_override=planned_price)
+    path = future_price_path(future_dates, events, base_price, price_override=planned_price,
+                             bounds=bounds)
     out = []
     for d in future_dates:
         ds = str(d)[:10]
-        pm = price_multiplier(elasticity, base_price, path.get(ds)) if path else 1.0
+        pm = price_response(elasticity, base_price, path.get(ds), known_range) if path else 1.0
         out.append(round((lift if ds in promo_days else 1.0) * pm, 4))
     return out
 
@@ -329,7 +480,7 @@ def explain(lift_report: dict, elast_report: dict | None = None) -> str:
                     f"lift similar products see. It'll switch to its own once it has "
                     f"{MIN_PROMO_DAYS} promotional days.")
     elif lr.get("basis") == "too-few-promo-days" and lr.get("promoDays"):
-        bits.append(f"Only {lr['promoDays']} promotional days on record — too few to "
+        bits.append(f"Only {lr['promoDays']} promotional days on record, too few to "
                     f"measure a lift, so scheduled promotions don't raise the forecast yet.")
 
     er = elast_report or {}

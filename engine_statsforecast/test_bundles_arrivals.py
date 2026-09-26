@@ -165,7 +165,7 @@ over = [S(1, 0, 10), S(2, 0, 610)]
 do = A.detect(over, [{"id": "p2", "skuId": "A", "qty": 500, "orderedDate": "2026-07-10",
                       "expectedDate": "2026-08-02"}])
 check("an over-delivery is flagged too", do[0]["over"] is True, str(do[0]))
-check("...with a cautious message", "possibly this delivery plus something else" in do[0]["message"])
+check("...with a cautious message", "possibly this delivery plus something else" in do[0]["message"].lower())
 check("both need review", A.summarise(dp + do)["needsReview"] == 2, str(A.summarise(dp + do)))
 
 print("\n— the right order among several in flight —")

@@ -22,11 +22,13 @@ from contextlib import asynccontextmanager
 from zoneinfo import ZoneInfo
 from dateutil.relativedelta import relativedelta
 
-from forecast_engine import analyse_price, classify_demand, compute_safe_price_range, fill_daily_gaps, sparse_subtype
+from forecast_engine import (analyse_price, daily_price_rollup, price_evidence, price_bounds, extrapolation_distance, extrapolation_uncertainty, cap_price_ratio, MAX_PRICE_LIFT, PRICE_EXTRAP_FLOOR, PRICE_EXTRAP_CEIL, PRICE_EFFECT_UNC, BORROWED_EFFECT_UNC, STORE_BORROWED_EFFECT_UNC, classify_demand, compute_safe_price_range, fill_daily_gaps,
+                             sparse_subtype, is_dormant as _FE_is_dormant)
 import router as R
 import datetime as _dt
 import forecast_log as _FL
 import stock_log as _SL
+import today_sales as _TS
 import censoring as _CEN
 import promos as _PROMO
 import uplift as _UP
@@ -35,6 +37,9 @@ import bundles as _BUN
 import arrivals as _ARR
 import catalog_store as _STORE
 import backtest_store as _BTSTORE
+import sources as _SRC            # the live-store registry (Shopify, Square, …)
+import scheduler as _SCHED        # when the nightly sync runs
+import connections as _CONN       # saved credentials, so a token is entered once
 
 # Bundle component map, {bundle_sku: {component_sku: qty}}. Session state like the rest of
 # the catalogue — the real product reads this from Shopify's bundle definitions.
@@ -46,15 +51,43 @@ _bundle_map: dict = {}
 # have looked wired while silently doing nothing.
 _flog = _FL.ForecastLog()
 _slog = _SL.StockLog()
+# The day in progress, kept OUT of the catalogue on purpose — see today_sales.py.
+_today_sales = _TS.TodaySales()
+# What each product's shelf says right now, straight from the POS — see live_prices.py.
+import live_prices as _LP
+_live = _LP.LivePrices()
+import holiday_calendar as _HOL
+_holidays = _HOL.HolidaySettings()
 import exports
 from engines import ProphetEngine, GlobalPooledEngine, IntermittentEngine, MovingAverageEngine
+import engines as _ENGINES
+# Days before Prophet fits a yearly pattern (engines.YEARLY_MIN_DAYS); read softly so a
+# stand-in engines module in the tests still imports.
+YEARLY_MIN_DAYS = int(getattr(_ENGINES, "YEARLY_MIN_DAYS", 450))
 
 
 @asynccontextmanager
 async def _lifespan(app):
     # Replaces the deprecated @app.on_event("startup") hook.
     warmup()
+    # The nightly sync is what makes the tool current without anyone asking. It is a daemon
+    # thread, so it lives and dies with this process — which is the honest limit: keep the
+    # backend running (a real box, or launchd on a Mac) or drive /api/sync/now from cron.
+    _sync.start()
+    st = _sync.status()
+    if st["enabled"]:
+        print(f"Nightly sync armed for {st['at']} {st['timezone']} (next: {st['nextRunAt']}).")
+    # Hourly inventory readings. Started after the sync so a cold boot does its restore
+    # first, and reported separately because a missed reading is unrecoverable while a
+    # missed sync is merely late.
+    _sampler.start()
+    sst = _sampler.status()
+    if sst["enabled"]:
+        _mins = int(sst["intervalSeconds"] // 60)
+        print(f"Stock sampling every {_mins} min (last filed: {sst['lastFiledAt'] or 'never'}).")
     yield
+    _sampler.stop()
+    _sync.stop()
 
 
 app = FastAPI(lifespan=_lifespan)
@@ -99,6 +132,57 @@ def health():
 
 # ─── State ───────────────────────────────────────────────────────────────────
 _sku_cache: dict[str, dict] = {}          # sku_id → forecast cache entry (frontend reads this)
+# THE stock figure used when nobody has counted one. There used to be two different
+# answers to this and they contradicted each other: the forecast path assumed 0 units and
+# the scorecard path assumed 500, so the SAME product came back "about to stock out" on
+# one screen and "overstocked" on the other. Both were confident, both were invented.
+#
+# 50 is deliberately unremarkable — small enough not to read as a warehouse, large enough
+# not to read as an emergency. It exists so the arithmetic has something to chew on, and
+# every surface that shows it must say it is synthetic. What actually protects the user is
+# not the number: it is that an UNCOUNTED product publishes no stockout date, no reorder
+# countdown and no order quantity, because all three would be fiction.
+ASSUMED_STOCK = 50
+
+
+# ── The catalogue is PUBLISHED, never edited in place ───────────────────────────────
+#
+# _rebuild used to write `_sku_cache[sku_id] = entry` one product at a time. The readers
+# that aggregate across the catalogue — /api/skus, the Fleet summary, the Scorecard,
+# grouping, the exports — deliberately do NOT take _state_lock, because a full refit holds
+# it for minutes and blocking every page load for that long is worse than the bug it fixes.
+#
+# The consequence, once the nightly sync started running on a background thread: a refit
+# landing under a reader served a HALF-SWAPPED catalogue. Some products refit, some not,
+# and totals summed across both. Silent, rare, and unreproducible after the fact — the
+# worst shape a bug can have.
+#
+# So the catalogue is now immutable once published. A writer copies it, edits the copy,
+# and rebinds the name in a single statement; a reader binds it ONCE through _cache() and
+# reads from that snapshot for the rest of its work. A reader therefore sees the whole old
+# catalogue or the whole new one, never a mixture, and never waits for a refit.
+#
+# The rule, for anything added later: never mutate the dict _cache() hands you, and never
+# read _sku_cache twice in one request — the second read may be a different catalogue.
+# `x in _cache()` followed by `_cache()[x]` is two catalogues and can raise KeyError.
+# At a few hundred products the copy is a pointer copy: microseconds, once per refit.
+def _cache() -> dict[str, dict]:
+    """The current catalogue, as a consistent snapshot. Bind once, then read from it."""
+    return _sku_cache
+
+
+def _publish_cache(new: dict[str, dict]) -> None:
+    """Swap a newly-built catalogue in, atomically. _state_lock is reentrant, so this is
+    correct whether or not the caller already holds it."""
+    global _sku_cache
+    with _state_lock:
+        _sku_cache = new
+
+
+# How often a COLD boot publishes partial progress. Only ever used when the catalogue
+# started empty, where there is no old-vs-new mixture to create and showing products as
+# they arrive is what makes a restore feel alive instead of broken.
+_PUBLISH_EVERY = 25
 _catalog:  dict[str, dict] = {}           # sku_id → {df, attrs, sku_name, mode, filename, events}
 # ── Backtest state — session-scoped by design ────────────────────────────────
 # Nothing here is written to disk or restored. Every launch starts clean: load a sheet,
@@ -106,6 +190,11 @@ _catalog:  dict[str, dict] = {}           # sku_id → {df, attrs, sku_name, mod
 # never be contaminated by a previous one, and there are no stale files to reason about.
 _backtest_tier_cache: dict[str, dict] = {}  # "sku|lead|coverage" → measured protection tier
 _sheet_costs: dict[str, float] = {}         # sku_id → unit cost seen at ingest (sheet/Shopify)
+# Where each of those costs came from ("sheet", "shopify", "square", …). Computed at
+# ingest and then THROWN AWAY, which is why every restart re-labelled a Square cost as
+# coming from a spreadsheet — on the one screen whose job is saying where a number came
+# from. Persisted alongside the costs so the label survives a restart with them.
+_cost_sources: dict[str, str] = {}          # sku_id → provenance of _sheet_costs[sku_id]
 _backtest_inputs: dict = {}                 # the economics the last run was measured with
 _session_holding_pct: int = 25              # set from the dashboard; used by EVERY run
 _last_backtest_rows = None                  # scored windows, so cost edits re-price instantly
@@ -126,6 +215,7 @@ def _persist_catalog():
     successful upload into a failed one, so this reports and moves on."""
     try:
         extras = {"sheet_costs": {k: float(v) for k, v in _sheet_costs.items()},
+                  "cost_sources": {k: str(v) for k, v in _cost_sources.items()},
                   "holding_pct": int(_session_holding_pct)}
         _STORE.save(_catalog, extras)
     except Exception as e:                                   # noqa: BLE001
@@ -137,12 +227,16 @@ def _persist_catalog():
 # measured on data no longer loaded — the exact contamination the on-disk fingerprint
 # prevents, happening one level up.
 _backtest_fingerprint: str | None = None
+# The same snapshot, addressable per product. `grew_only` needs the parts, not the hash:
+# "different" and "invalidated" are not the same question.
+_backtest_parts: dict = {}
 
 
 def _persist_backtest():
     """Snapshot the completed run, stamped with the data it was measured against."""
     try:
         globals()["_backtest_fingerprint"] = _BTSTORE.fingerprint(_catalog)
+        globals()["_backtest_parts"] = _BTSTORE.fingerprint_parts(_catalog)
         _BTSTORE.save({"report": _last_backtest, "rows": _last_backtest_rows,
                        "combos": _last_backtest_combos, "tiers": _backtest_tier_cache,
                        "exclusions": _backtest_exclusions, "inputs": _backtest_inputs},
@@ -165,6 +259,7 @@ def _restore_backtest():
     globals()["_backtest_exclusions"] = saved.get("exclusions") or {}
     _backtest_inputs.clear(); _backtest_inputs.update(saved.get("inputs") or {})
     globals()["_backtest_fingerprint"] = _BTSTORE.fingerprint(_catalog)
+    globals()["_backtest_parts"] = _BTSTORE.fingerprint_parts(_catalog)
     return True
 
 
@@ -176,6 +271,7 @@ def _drop_backtest_state(why: str) -> None:
     globals()["_backtest_tier_cache"] = {}
     globals()["_backtest_exclusions"] = {}
     globals()["_backtest_fingerprint"] = None
+    globals()["_backtest_parts"] = {}
     _backtest_inputs.clear()
     _BTSTORE.clear()
     print(f"Measured protection levels dropped — {why}. Estimates apply until a new test runs.")
@@ -302,9 +398,9 @@ DEMAND_LABELS = {
 
 def _conformal_text(q_lo, q_hi, calibrated):
     if calibrated:
-        return (f"The shaded range is an 80% band from this engine's backtest errors — historically about "
+        return (f"The shaded range is an 80% band built from this engine's backtest errors: about "
                 f"8 in 10 actual daily sales land inside it (≈ +{q_hi:.1f} / {q_lo:.1f} units around the line). "
-                f"Built the same way for every product.")
+                f"Every product's band is built the same way.")
     return (f"The shaded range is an 80% band from a standard statistical estimate "
             f"(±{q_hi:.1f} units around the line).")
 
@@ -373,8 +469,7 @@ def volatility_label(d):
 def _volatility_tip(d, rate):
     base = ("Swing in daily sales, measured against the randomness any product this size "
             "carries anyway. 1.0x is as steady as that sales volume permits; past 2.0x it "
-            "moves more than its size explains. Shown this way because a raw percentage "
-            "mostly tracks how few units a day something sells, not how erratic it is.")
+            "moves more than its size explains.")
     if d is None:
         return "Too few sales in the measured window to judge volatility. " + base
     return f"This one swings {d:.1f}x that floor{'' if not rate else f', on about {rate:.1f} a day'}. " + base
@@ -396,15 +491,14 @@ def _consistency_text(label, dispersion, ref_mean):
     """Say what the verdict rests on. Selling three a day and swinging by two is not
     erratic, it is what selling three a day looks like; the old wording quoted a raw
     ratio that made every small product sound out of control."""
-    tail = ("The safety buffer is sized from how far the forecast actually misses over a full "
-            "lead-time window, which captures clumpy stretches, not just this day-to-day swing.")
+    tail = ("The safety buffer is sized from how far the forecast misses over a full "
+            "lead-time window, so it covers clumpy stretches too.")
     if dispersion is None:
-        return "There have been too few sales in the measured window to judge how steady demand is. " + tail
+        return "Too few sales in the measured window to judge how steady demand is. " + tail
     rate = "" if not ref_mean else f" (about {ref_mean:.1f} a day)"
     if dispersion <= DISPERSION_STEADY:
         return (f"Day-to-day demand is {label}. Its swing is {dispersion:.1f}x the smallest possible at "
-                f"this sales volume{rate}, so most of the movement is ordinary counting noise rather "
-                f"than real unpredictability. " + tail)
+                f"this sales volume{rate}, so most of the movement is ordinary counting noise. " + tail)
     return (f"Day-to-day demand is {label}. Its swing is {dispersion:.1f}x the smallest possible at this "
             f"sales volume{rate}, so it moves more than its size alone explains. " + tail)
 
@@ -416,7 +510,7 @@ def _make_details(method, reason, model_label, demand_class, residual_cv, q_lo, 
     cons = dispersion_label(dispersion)
     calibrated = method in ("prophet", "global", "croston")
     details = {
-        "model": {"name": method, "label": model_label, "summary": f"{model_label} — {d_label.lower()}"},
+        "model": {"name": method, "label": model_label, "summary": f"{model_label}: {d_label.lower()}"},
         "demand": {"class": demand_class, "label": d_label, "description": d_desc},
         "route": method, "routeLabel": R.ROUTE_LABELS.get(method, method),
         "whyChosen": reason,
@@ -431,33 +525,27 @@ def _make_details(method, reason, model_label, demand_class, residual_cv, q_lo, 
     }
     if method == "abstain":
         details["caution"] = (
-            "Last-resort estimate. This product has too little sales history of its own AND no similar "
-            "products to borrow from, so the numbers below are a flat moving-average placeholder — not a "
-            "real forecast. It will switch to a proper method once it builds up history or is grouped with "
-            "similar products in the Categorize panel.")
+            "Last-resort estimate. This product has too little sales history, and too few closely "
+            "matching products to borrow a seasonal pattern from, so its everyday level is a flat "
+            "recent average. Holidays and price changes still apply where similar products show them. "
+            "It switches to a proper method once it builds history or is grouped with similar "
+            "products in the Grouping tab.")
     details.update(bits or {})          # seasonality / price / (level) from the engine
     return details
 
 
-def _effective_price(last_price, events, today):
-    """Price in force today(): last historical price, overridden by a permanent
-    change dated on/before today, then a temporary change whose window covers
-    today. Mirrors the scorecard's logic so 'Current price' tracks logged events."""
-    if last_price is None:
-        return None
-    price = float(last_price)
-    perms = sorted([e for e in (events or [])
-                    if e.get("type") == "price_change_permanent" and e.get("new_price") is not None
-                    and pd.to_datetime(e["date"]) <= today],
-                   key=lambda e: pd.to_datetime(e["date"]))
-    if perms:
-        price = float(perms[-1]["new_price"])
-    for e in (events or []):
-        if e.get("type") == "price_change_temporary" and e.get("new_price") is not None:
-            s = pd.to_datetime(e["date"]); en = pd.to_datetime(e.get("end_date", e["date"]))
-            if s <= today <= en:
-                price = float(e["new_price"])
-    return price
+def _effective_price(last_price, events=None, today=None):
+    """The current price: the last price a day actually SOLD at, on its own.
+
+    This used to be overridden by any logged event dated on or before today, so typing a
+    price change into the forecast tool rewrote what the page reported as the price you
+    are charging — a planning input editing the record of what happened. Events are for
+    the forecast only. What was charged comes from recorded sales and nothing else; if an
+    event and the register disagree, the register is right about the past.
+
+    `events` and `today` are accepted and ignored so no caller can reintroduce the old
+    behaviour by accident."""
+    return None if last_price is None else float(last_price)
 
 
 # How many rolling 45-day holdout windows the self-calibration averages over per SKU.
@@ -523,9 +611,248 @@ def _cohort_promo_lift(related):
         return None
 
 
+def _levels_text(ev) -> str:
+    lv = (ev or {}).get("levels") or []
+    if not lv:
+        return "no single-price days yet"
+    return ", ".join(f"${t['price']:.2f} ({t['days']} day{'s' if t['days'] != 1 else ''}, {t['quality']})"
+                     for t in sorted(lv, key=lambda t: -t["days"]))
+
+
+def _price_response(method, eng, has_price, price_varied, elast, evidence=None, bounds=None,
+                    borrowed=None, borrowed_range=None, borrowed_bounds=None) -> dict:
+    """Will a price change move THIS product's forecast — and if not, why not?
+
+    There are two unrelated mechanisms behind "price affects the forecast", one per kind
+    of engine, and each can decline for its own reasons. Before this, declining was
+    SILENT: you added a price cut, saved, and nothing happened, with no way to tell a
+    deliberate refusal from a bug. Every refusal below is a real, defensible decision;
+    the failure was only that none of them was ever said out loud.
+
+    Returns {applies, reason, text, ...}. `applies` is the one bit the UI needs to decide
+    whether to warn; `text` is the sentence it shows.
+    """
+    if not has_price:
+        return {"applies": False, "reason": "no-price-data",
+                "text": "No price data for this product, so price changes can't affect its forecast."}
+    ev = evidence or {}
+    mixed = int(ev.get("mixedDays") or 0)
+    mixed_note = (f" {mixed} day{'s' if mixed != 1 else ''} sold at more than one price and "
+                  f"{'aren' if mixed != 1 else 'isn'}'t counted.") if mixed else ""
+    own_backwards = bool(ev.get("usable")) and (elast or {}).get("basis") == "borrowed"
+    _who = ("other products in the store" if (borrowed or {}).get("scope") == "store"
+            else "similar products")
+    _ob = (elast or {}).get("ownBasis")
+    _why_own = ("Its own prices have too few days with sales to show how demand responds."
+                if _ob == "too-few-points" else
+                "This one sold more at its higher price, so something other than price drove its "
+                "sales and its own prices can't be used.")
+    if borrowed and ((evidence is not None and not ev.get("usable")) or own_backwards):
+        el = float(borrowed["elasticity"])
+        lift = round(((0.9 ** el) - 1) * 100)
+        need_d = ev.get("minDays", 30); need_n = ev.get("levelsRequired", 2)
+        rng = ((f" It has sold at ${borrowed_range[0]:.2f} to ${borrowed_range[1]:.2f}; past that the "
+                f"response eases off the further you go.") if (borrowed_range and ev.get("usable")) else
+               (f" Those products have sold at ${borrowed_range[0]:.2f} to ${borrowed_range[1]:.2f} in "
+                f"today's terms; past that the response eases off the further you go.")
+               if borrowed_range else "")
+        return {"applies": True, "reason": "borrowed", "elasticity": el, "peers": borrowed["peers"],
+                "bounds": list(borrowed_bounds) if borrowed_bounds else None, "levels": ev.get("levels"),
+                "knownRange": list(borrowed_range) if borrowed_range else None,
+                "mixedDays": mixed,
+                "scope": borrowed.get("scope") or "category",
+                "text": ((f"Borrowed from {borrowed['peers']} {_who}. {_why_own} "
+                          f"A 10% price cut lifts units about {lift}%. "
+                          f"The band is wider because it's borrowed.{rng}") if own_backwards else
+                         (f"Borrowed from {borrowed['peers']} {_who}, because this one doesn't have "
+                          f"{need_n} prices with {need_d}+ days yet: a 10% price cut lifts units about {lift}%. "
+                          f"The band is wider because it's borrowed.{rng}"))}
+    if evidence is not None and not ev.get("usable"):
+        need_d = ev.get("minDays", 30); need_n = ev.get("levelsRequired", 2)
+        if ev.get("reason") == "levels-too-close":
+            return {"applies": False, "reason": "levels-too-close", "levels": ev.get("levels"),
+                    "mixedDays": mixed,
+                    "text": (f"Price isn't used yet. The prices with {need_d}+ days "
+                             f"({_levels_text({'levels': ev.get('qualifying')})}) are too close "
+                             f"together to show how demand responds.{mixed_note}")}
+        return {"applies": False, "reason": "too-few-price-levels", "levels": ev.get("levels"),
+                "mixedDays": mixed, "need": need_d, "levelsNeeded": need_n,
+                "text": (f"Price isn't used yet. It needs {need_n} prices with {need_d}+ days each. "
+                         f"So far: {_levels_text(ev)}.{mixed_note}")}
+    clamp_note = ""
+    if bounds is not None and ev.get("rangeLo") is not None:
+        clamp_note = (f" Known range: ${ev['rangeLo']:.2f} to ${ev['rangeHi']:.2f}. Outside it the response is "
+                      f"extrapolated in percentages and eases off the further you go, approaching "
+                      f"{MAX_PRICE_LIFT:g}× on cuts and -80% on rises, with more safety stock. Prices below "
+                      f"${bounds[0]:.2f} or above ${bounds[1]:.2f} count as those limits.")
+    # Only when Prophet was actually given price. It isn't when the product's own prices
+    # read backwards (_own_price_ok in build_entry); that case is answered below, the same
+    # way on every route.
+    if method == "prophet" and (getattr(eng, "has_price", False) or getattr(eng, "_price_inverted", None)):
+        inv = getattr(eng, "_price_inverted", None)
+        if inv:
+            return {"applies": False, "reason": "inverted", "detail": inv,
+                    "text": ("Price isn't used. This product sold more at its higher prices, so "
+                             "something other than price drove its sales, and no other product in the "
+                             "store has a price history to borrow from yet.")}
+        if not price_varied:
+            return {"applies": False, "reason": "price-never-varied",
+                    "text": ("Price isn't used: it has never changed in this product's sales "
+                             "history, so there's nothing to learn from.")}
+        return {"applies": True, "reason": "modelled", "bounds": list(bounds) if bounds else None,
+                "levels": ev.get("levels"), "mixedDays": mixed,
+                "text": ("Price is an input to this product's model, so this change shifts the forecast."
+                         + clamp_note)}
+
+    e = elast or {}
+    basis = e.get("basis") or "none"
+    if basis == "measured" and e.get("elasticity"):
+        el = float(e["elasticity"])
+        lift = round(((0.9 ** el) - 1) * 100)
+        return {"applies": True, "reason": "measured", "elasticity": el,
+                "bounds": list(bounds) if bounds else None, "levels": ev.get("levels"),
+                "mixedDays": mixed,
+                "text": (f"Measured from {e.get('points')} single-price days with sales: a 10% price "
+                         f"cut lifts units about {lift}%, and this change shifts the forecast to match."
+                         + clamp_note)}
+    need = getattr(_UP, "MIN_PRICE_POINTS", 30)
+    if basis == "too-few-points":
+        return {"applies": False, "reason": basis, "points": e.get("points"), "need": need,
+                "text": (f"Price isn't used yet. Only {e.get('points', 0)} days with sales carry a "
+                         f"price, and {need} are needed to measure how demand responds.")}
+    if basis == "price-never-varied":
+        return {"applies": False, "reason": basis,
+                "text": ("Price isn't used: it has barely changed in this product's sales "
+                         "history, so there's nothing to learn from.")}
+    if basis == "positive-elasticity-ignored":
+        return {"applies": False, "reason": basis,
+                "text": ("Price isn't used. This product sold more at its higher prices, so "
+                         "something other than price drove its sales, and no other product in the "
+                         "store has a price history to borrow from yet.")}
+    return {"applies": False, "reason": basis,
+            "text": "This product's forecast doesn't respond to price changes."}
+
+
+def _holiday_report(effects, assign, df, today, held_days, has_price, settings):
+    """What the product page shows under Holidays: for every period checked, what this
+    product's own sales did in each past year, the lift the forecast uses (with its
+    day-by-day shape), where it came from, and when it next applies. Periods switched off
+    for this product are listed as such."""
+    t = pd.Timestamp(today).date()
+    first = df["ds"].min().date() if len(df) else t
+    rows = []
+    for k in _HOL.selected_keys(settings) + list((settings or {}).get("exclude") or []):
+        e = effects.get(k) or {}
+        name = e.get("name") or _HOL.name_of(k, settings)
+        nxt = None
+        runs = [r for r in _HOL.occurrences(assign, k) if r[1] >= t]
+        if runs:
+            nxt = {"start": runs[0][0].isoformat(), "end": runs[0][1].isoformat()}
+        elif k not in (settings or {}).get("exclude", []):
+            w = [x for x in _HOL.windows_for(k, t, t + datetime.timedelta(days=400), settings) if x[1] >= t]
+            if w:
+                nxt = {"start": w[0][0].isoformat(), "end": w[0][1].isoformat()}
+        m = float(e.get("multiplier") or 1.0)
+        n, peers, src = e.get("occurrences", 0), e.get("peers", 0), e.get("source")
+        applied = bool(e.get("applied")) and src != "none"
+        _scope = "other products in the store" if e.get("peerScope") == "store" else "similar products"
+        if k in ((settings or {}).get("exclude") or []):
+            status, why = "off", "Switched off for this product. Its dates are treated like any other day."
+        elif not e:
+            status = "unseen"
+            why = ("Not in this product's sales history yet, and similar products don't show it either."
+                   if first > t - datetime.timedelta(days=330) else
+                   "Not enough sales on these dates to tell, and no similar products to compare with.")
+        elif src == "none":
+            status = "discounted"
+            why = (f"Every past {name} was discounted and no price response is known, so the holiday "
+                   f"can't be told apart from the deal. Not applied.")
+        elif applied:
+            status = "applied"
+            why = (f"From {n} past year{'s' if n != 1 else ''} of this product's sales." if src == "own" else
+                   f"Not in this product's own history yet, so this comes from {peers} {_scope}."
+                   if src == "peers" else
+                   f"From {n} past year{'s' if n != 1 else ''} of its own sales, combined with {peers} {_scope}.")
+        else:
+            status = "none"
+            _yrs = e.get("years") or []
+            if _yrs and max(abs(y["pct"]) for y in _yrs) >= 10:
+                why = ("Past years moved, but not clearly enough on this many sales to rule out chance. "
+                       "Forecast as ordinary days, with the possibility covered by safety stock.")
+            elif n:
+                why = "Past years don't show a change on these dates, so they're forecast as ordinary days."
+            else:
+                why = f"{'Other products in the store' if e.get('peerScope') == 'store' else 'Similar products'} don't show a clear change on these dates."
+        days = []
+        sh = e.get("shape") if applied else None
+        if sh and nxt:
+            d0 = datetime.date.fromisoformat(nxt["start"])
+            off0 = assign.offsets.get(d0, (0, len(sh)))[0] if hasattr(assign, "offsets") else 0
+            for i, f in enumerate(sh[off0:]):
+                d = d0 + datetime.timedelta(days=i)
+                days.append({"date": d.isoformat(), "pct": round((m * f - 1) * 100)})
+        rows.append({"key": k, "name": name, "status": status, "active": status == "applied",
+                     "multiplier": round(m, 3), "pct": round((m - 1) * 100) if status == "applied" else 0,
+                     "source": src, "occurrences": n, "peers": peers, "skipped": e.get("skipped", 0),
+                     "measuredPct": (round((e["rawOwn"] - 1) * 100) if e.get("rawOwn") else None),
+                     "years": e.get("years") or [], "days": days, "custom": _HOL.is_custom(k),
+                     "next": nxt, "text": why})
+    order = {"applied": 0, "discounted": 1, "none": 2, "unseen": 3, "off": 4}
+    rows.sort(key=lambda r: (order[r["status"]], (r["next"] or {}).get("start") or "9999"))
+    notes = []
+    if held_days:
+        notes.append(f"On {held_days} past days, the holiday's lift is taken back out before the everyday level "
+                     f"and season are learned, so a spike never inflates ordinary weeks. It is added back on its own dates.")
+    if not has_price:
+        notes.append("No prices are on file, so a holiday's lift includes any deals you ran then. "
+                     "Don't also enter those same deals as events.")
+    return {"effects": rows, "heldDays": int(held_days), "notes": notes, "applied": False,
+            "checked": len(rows),
+            "windows": [{"key": r["key"], "name": r["name"], "start": r["next"]["start"],
+                         "end": r["next"]["end"], "pct": r["pct"]}
+                        for r in rows if r["active"] and r["next"]]}
+
+
+def _with_future(forecast, future_fc, last_actual):
+    """`forecast` with its future rows replaced by `future_fc`, so every later step —
+    calibration's re-slice, the product page, the scorecard — sees the same numbers."""
+    past = forecast[forecast["ds"] <= last_actual]
+    return pd.concat([past, future_fc], ignore_index=True, sort=False)
+
+
+def _effect_sd(fc):
+    """Per-day uncertainty of the price and holiday effects, combined."""
+    tot = pd.Series(0.0, index=fc.index)
+    for c in ("x_sd", "h_sd"):
+        if c in fc.columns:
+            tot = tot + pd.to_numeric(fc[c], errors="coerce").fillna(0.0) ** 2
+    return np.sqrt(tot)
+
+
+def _widen_for_extrapolation(fc, last_actual):
+    """Add the uncertainty of price and holiday effects (x_sd, h_sd) to the band in
+    quadrature."""
+    if fc is None or not ({"x_sd", "h_sd"} & set(fc.columns)) or not {"yhat_lower", "yhat_upper"}.issubset(fc.columns):
+        return fc
+    fc = fc.copy()
+    _sd = _effect_sd(fc)
+    fut = (fc["ds"] > last_actual) & (_sd > 0)
+    if not fut.any():
+        return fc
+    z80 = 1.2816
+    xs = _sd[fut].astype(float) * z80
+    y = fc.loc[fut, "yhat"].astype(float)
+    hi_w = (fc.loc[fut, "yhat_upper"].astype(float) - y).clip(lower=0)
+    lo_w = (y - fc.loc[fut, "yhat_lower"].astype(float)).clip(lower=0)
+    fc.loc[fut, "yhat_upper"] = y + np.sqrt(hi_w ** 2 + xs ** 2)
+    fc.loc[fut, "yhat_lower"] = (y - np.sqrt(lo_w ** 2 + xs ** 2)).clip(lower=0)
+    return fc
+
+
 def build_entry(sku_id, sku_name, df_clean, mode, filename, today, events, related, n_relatives,
                 pool_cohesion=None,
-                calibrate=True, calib_windows=None, force_route=None, availability=None):
+                calibrate=True, calib_windows=None, force_route=None, availability=None,
+                live_price=None, holidays=None, peers=None, store_peers=None, peer_scope="category"):
     events = events or []
     df = df_clean[df_clean["ds"] <= today].copy()
     # Sales are not demand on a day you ran out. Dropping those days outright — the old
@@ -538,7 +865,143 @@ def build_entry(sku_id, sku_name, df_clean, mode, filename, today, events, relat
 
     price_varied, price_well, last_price, tiers, warn_level, warn_msg = analyse_price(df)
     has_price = "price" in df.columns and bool(df["price"].notna().any())
+    # THE GATE. Price may move this forecast only when two different prices each have
+    # 30+ single-price days behind them. Below that, a price event does nothing and says
+    # why; above it, scheduled prices are clamped near the range actually observed.
+    p_evidence = price_evidence(df) if has_price else None
+    price_usable = bool(p_evidence and p_evidence.get("usable"))
+    p_bounds = price_bounds(p_evidence, df, last_price) if price_usable else None
+    p_range = ((p_evidence["rangeLo"], p_evidence["rangeHi"]) if price_usable else None)
     has_promo = "on_promotion" in df.columns and bool(df["on_promotion"].notna().any())
+
+    # HOLIDAYS. The store's picked periods (Settings). Their days are kept out of every
+    # baseline, season and price estimate below, so a Black Friday spike can't pass for
+    # ordinary demand, a strong December or a price response. Each holiday's own lift is
+    # learned from this product's past years and its peers', then applied to the upcoming
+    # windows. With nothing picked, all of this is a no-op.
+    # Every calendar period plus the store's own is checked for every product, minus any
+    # switched off for this one. Peers are always measured against the full calendar.
+    _hglobal = _holidays.get() if holidays is None else (holidays or {})
+    _hset = _HOL.for_sku(_hglobal, sku_id)
+    _hpeer = _HOL.for_sku(_hglobal, None)
+    # An uploaded sheet may have been moved so its last row lands on yesterday; holidays
+    # are looked up on the dates its sales really happened (one shift for the whole
+    # catalogue, 0 for a live store).
+    _hshift = int((_catalog.get(sku_id) or {}).get("date_shift_days") or 0)
+    _hver = json.dumps(_hpeer, sort_keys=True) + f"|{_hshift}"
+    h_assign = (_HOL.history_assign(df, _hset, horizon_end=df["ds"].max() + pd.Timedelta(days=800),
+                                    shift=_hshift)
+                if len(df) else {})
+    # Who a holiday lift or a price response is borrowed from: the category (see
+    # R.category_peers), falling back to the behavioural relatives.
+    # Only what was known on `today`: a calibration or backtest cutoff must not learn a
+    # peer's Black Friday that hadn't happened yet.
+    _peers_full = [r for r in (peers if peers is not None else (related or []))
+                   if hasattr(r, "columns") and len(r)]
+    _store_full = [r for r in (store_peers or []) if hasattr(r, "columns") and len(r)]
+
+    def _borrow(cat_frames, moving_keys):
+        """The price response similar products show; when too few in the category have a
+        price history, the whole store's (the same fallback holidays use), with more
+        safety stock because a store-wide typical response is a looser match."""
+        b = _UP.pooled_elasticity(cat_frames)
+        if b is not None:
+            b = {**b, "scope": peer_scope or "category"}
+        if b is None and _store_full:
+            _sc = [(_HOL.strip(r[r["ds"] <= today], _HOL.applied_assign(_HOL.history_assign(r, _hpeer, shift=_hshift),
+                                                                       moving_keys))
+                    if moving_keys else r[r["ds"] <= today]) for r in _store_full]
+            b = _UP.pooled_elasticity(_sc)
+            if b is not None:
+                b = {**b, "scope": "store"}
+        return b
+
+    def _price_side(moving):
+        """Own and borrowed price response, measured with the days of the holidays that
+        move this product taken out (a Black Friday spike at a discount would otherwise
+        pass for a price response). Only those: stripping every checked period would
+        throw away a third of the history for nothing."""
+        _k = {k: {"applied": True} for k in (moving or ())}
+        _own = _HOL.strip(df, _HOL.applied_assign(h_assign, _k)) if moving else df
+        _pc = [(_HOL.strip(r[r["ds"] <= today], _HOL.applied_assign(_HOL.history_assign(r, _hpeer, shift=_hshift), _k))
+                if moving else r[r["ds"] <= today]) for r in _peers_full]
+        _b = (_borrow(_pc, _k)
+              if (has_price and last_price and not _own_price_ok(_own)) else None)
+        return _own, _pc, _b
+
+    def _own_price_ok(own_frame):
+        """Whether this product's OWN prices give a response the forecast can use: enough
+        days at two prices (the gate) AND a measurement that points the normal way. A
+        product that clears the gate but reads backwards (its dearer days sold more, from
+        a season or a launch, not the price) has no usable response of its own, exactly
+        like one that hasn't cleared the gate, so both borrow from similar products."""
+        if not price_usable:
+            return False
+        _eh = _UP.price_elasticity(own_frame)
+        return _eh.get("basis") == "measured" and float(_eh.get("elasticity") or 0.0) < 0
+
+    def _el(own_frame, borrowed_):
+        if _own_price_ok(own_frame):
+            return float(_UP.price_elasticity(own_frame)["elasticity"])
+        return float(borrowed_["elasticity"]) if borrowed_ else 0.0
+
+    def _learn(el):
+        def _peer_price(f):
+            r = _UP.peer_price_response(f)
+            return (r["elasticity"], r["current"]) if r else (0.0, None)
+
+        eff = _HOL.learn(df, _peers_full, _hset, assign=h_assign, elasticity=el,
+                         ref_price=last_price, price_fn=_peer_price, version=_hver, as_of=today,
+                         store=[r for r in (store_peers or []) if hasattr(r, "columns") and len(r)],
+                         shift=_hshift)
+        return eff
+
+    # First with every day in, then again with the days of the holidays found to move this
+    # product left out, when that changes the price response the lifts were measured with.
+    df_nohol, peers_clean, borrowed = _price_side(())
+    h_effects = {}
+    if h_assign:
+        _el0 = _el(df_nohol, borrowed)
+        h_effects = _learn(_el0)
+        _moving0 = sorted(k for k, e in h_effects.items() if e.get("applied"))
+        if _moving0:
+            df_nohol, peers_clean, borrowed = _price_side(_moving0)
+            _el1 = _el(df_nohol, borrowed)
+            if abs(_el1 - _el0) > 0.05:
+                h_effects = _learn(_el1)
+
+    # BORROWED PRICE RESPONSE. A product that hasn't sold at two prices for 30+ days can't
+    # show how its demand responds, but similar products that have can. Their typical
+    # response stands in, so a price change or promotion on a new product still moves its
+    # forecast, with a wider band because it's borrowed. The same goes for a product whose
+    # own prices read backwards (see _own_price_ok).
+    own_price_ok = _own_price_ok(df_nohol)
+    # Only the RESPONSE is borrowed. A product that has sold at enough prices (whose own
+    # reading just couldn't be used) keeps its own known range and limits: those are
+    # prices it has really sold at.
+    if own_price_ok or (price_usable and borrowed):
+        eff_range, eff_bounds = p_range, p_bounds
+    elif borrowed:
+        _lp = float(last_price)
+        eff_range = (round(_lp * borrowed["relLo"], 2), round(_lp * borrowed["relHi"], 2))
+        eff_bounds = (round(min(eff_range[0] * PRICE_EXTRAP_FLOOR, _lp), 2),
+                      round(max(eff_range[1] * PRICE_EXTRAP_CEIL, _lp), 2))
+    else:
+        eff_range = eff_bounds = None
+
+    if h_assign:
+        # What the models train on: each applied lift divided back out of its own days
+        # (holiday_calendar.deflate). Periods with no clear effect stay as recorded.
+        df_imp = _HOL.deflate(df, h_assign, h_effects)
+    else:
+        df_imp = df
+    # Similar products' histories feed the pooled season. The periods that move this
+    # product are taken out of theirs, so a peer's Black Friday can't pass for November.
+    _moving = {k for k, e in h_effects.items() if e.get("applied")}
+    related_clean = [(_HOL.strip(r, _HOL.applied_assign(_HOL.history_assign(r, _hpeer, shift=_hshift),
+                                                         {k: {"applied": True} for k in _moving}))
+                      if hasattr(r, "columns") and _moving else r)
+                     for r in (related or [])]
 
     days = (df["ds"].max() - df["ds"].min()).days if len(df) > 1 else 0
     sales = int(df["y"].sum())
@@ -556,24 +1019,83 @@ def build_entry(sku_id, sku_name, df_clean, mode, filename, today, events, relat
     # Price is only actually modeled on the Prophet route; global/croston/MA ignore it.
     price_modeled = (method == "prophet") and has_price
     effective_price = _effective_price(last_price, events, today)
+    regular_price = effective_price
+    # The POS's live price, when there is one, is the truth about TODAY: what the shelf
+    # says and whether a discount is on. It becomes the displayed current price and a
+    # forecast input from the first day without sales. It never touches the history.
+    # Only ever passed by _rebuild for the real today — never by a backtest cutoff or a
+    # calibration window, which must not see a discount that started after them.
+    pos_events = []
+    if live_price and len(df):
+        _first = (df["ds"].max() + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        _last = (df["ds"].max() + pd.Timedelta(days=800)).strftime("%Y-%m-%d")
+        pos_events = _LP.forecast_events(live_price, _first, _last, recorded_price=last_price)
+        effective_price = float(live_price.get("currentPrice") or effective_price or 0) or effective_price
+        regular_price = float(live_price.get("listPrice") or regular_price or 0) or regular_price
+    # POS-derived inputs go FIRST: they start today, so a change you scheduled for later
+    # still overrides them from its own date onward.
+    fc_events = pos_events + list(events)
 
     # Prophet takes on_promotion as a regressor and subtracts the lift itself. The other
     # three routes have no promo input at all, so for them a discount week is
     # indistinguishable from a real step up in demand — and those are exactly the routes
     # new products and intermittent sellers take, which is where launch promos live.
-    fit_df, promo_report = _PROMO.hold_out(df, method)
+    # Discounted days stay in the training data only when price can explain them (Prophet
+    # with a usable price). Otherwise they're held out so the baseline is the regular-price
+    # rate, and any scheduled discount is applied as a price change on top.
+    fit_df, promo_report = _PROMO.hold_out(
+        df, method if (method != "prophet" or own_price_ok) else "prophet-without-price")
+    # Picked-holiday days leave the training data too (see HOLIDAYS above). Kept when
+    # removing them would leave too little to fit.
+    # Picked-holiday days train as ordinary days (their units replaced by the ordinary
+    # level around them, see HOLIDAYS above), on every route.
+    holiday_days_held = 0
+    if h_assign and df_imp is not df and len(fit_df):
+        _imp = df_imp.set_index("ds")
+        _hm = _HOL.holiday_mask(fit_df, _HOL.applied_assign(h_assign, h_effects))
+        if _hm.any():
+            fit_df = fit_df.copy()
+            _vals = _imp["y"].reindex(fit_df["ds"]).to_numpy(float)
+            fit_df["y"] = np.where(_hm & np.isfinite(_vals), _vals, fit_df["y"].to_numpy(float))
+            holiday_days_held = int(_hm.sum())
+
+    # Routes without a price input learn a level from history. When part of that history
+    # sold at a different price, the level is off: a stretch at a lower price makes today's
+    # rate look higher than it is. With a measured response, restate each past day at
+    # today's price before fitting, so the baseline is "demand at the current price" and
+    # price events move it from there. (Prophet takes price as an input and needs none.)
+    _elast_pre = None
+    if method != "prophet" and price_usable and last_price:
+        _elast_pre = _UP.price_elasticity(df_nohol)
+        _e = float(_elast_pre.get("elasticity") or 0.0) if _elast_pre.get("basis") == "measured" else 0.0
+        if _e and "price" in fit_df.columns:
+            _p = pd.to_numeric(fit_df["price"], errors="coerce").fillna(float(last_price)).clip(lower=0.01)
+            _adj = (float(last_price) / _p) ** _e
+            fit_df = fit_df.copy()
+            fit_df["y"] = fit_df["y"] * _adj.clip(0.5, 2.0)
 
     if method == "prophet":
         # `related` lets an established-but-under-a-year SKU (yearly seasonality off)
         # blend in a pooled annual shape from its cohesive peers; a no-op otherwise.
-        eng = ProphetEngine().fit(fit_df, today, has_price, has_promo, last_price, events,
-                                  related=related)
+        # has_promo=False: a promotion is a price cut, carried by the price input. Learning a
+        # separate "promotion boost" from the same discounted days counted one effect twice.
+        eng = ProphetEngine().fit(fit_df, today, own_price_ok, False, last_price, fc_events,
+                                  related=related_clean, price_bounds=p_bounds, price_range=p_range)
     elif method == "global":
-        eng = GlobalPooledEngine().fit(fit_df, today, related=related)
+        eng = GlobalPooledEngine().fit(fit_df, today, related=related_clean)
     elif method == "croston":
         eng = IntermittentEngine().fit(fit_df, today)
     else:
         eng = MovingAverageEngine().fit(fit_df, today)
+
+    # The engine may have REFUSED price after fitting — Prophet now switches it off when
+    # the fitted effect points backwards (dearer = more sales). Whatever it decided is
+    # the truth about whether price moves this forecast, so the flag follows the engine
+    # rather than the route; otherwise the page would promise price sensitivity the model
+    # no longer has, and a price event would quietly do nothing under a label saying it
+    # would.
+    if method == "prophet":
+        price_modeled = bool(getattr(eng, "has_price", False))
 
     # Prophet worked the price/promo effect out while fitting. The other routes can't, so
     # measure it separately and apply it as an explicit multiplier. Without this a
@@ -586,21 +1108,54 @@ def build_entry(sku_id, sku_name, df_clean, mode, filename, today, events, relat
     # year of it, otherwise from its peers.
     season_report = None
     if method in ("croston", "abstain"):
-        _peers = [r for r in (related or []) if hasattr(r, "columns")]
-        _sea = _SEAS.resolve(df, _peers)
+        _peers = [r for r in related_clean if hasattr(r, "columns")]
+        _sea = _SEAS.resolve(df_imp, _peers)
         if _sea.get("source") != "none":
             # The rate was measured over whichever months the history covers. If that
             # window sat in the busy season the rate is ALREADY elevated, and applying a
             # peak index on top would order twice over. Divide that context back out.
-            _sea["coverage"] = round(_SEAS.coverage_factor(df, _sea["index"]), 4)
+            _sea["coverage"] = round(_SEAS.coverage_factor(df_imp, _sea["index"]), 4)
             season_report = {**_sea, "text": _SEAS.explain(_sea)}
 
     uplift_report = None
-    if method != "prophet":
-        _lift = _UP.promo_lift(df, cohort_lift=_cohort_promo_lift(related))
-        _elast = _UP.price_elasticity(df)
+    # Prices reach the forecast one of two ways: inside Prophet's model when it takes price
+    # as an input, or as explicit multipliers on top of any other forecast (every other
+    # route, and a Prophet product priced from its peers' response).
+    prophet_prices = method == "prophet" and bool(getattr(eng, "has_price", False))
+    prophet_refused = method == "prophet" and bool(getattr(eng, "_price_inverted", None))
+    if prophet_refused and not borrowed and has_price and last_price:
+        # Prophet's own fit read price backwards, so it switched price off. Similar
+        # products stand in, as they do for any product with no usable response of its own.
+        borrowed = _borrow(peers_clean, {k: {"applied": True} for k, e in h_effects.items() if e.get("applied")})
+        if borrowed:
+            eff_range, eff_bounds = p_range, p_bounds      # Prophet only gets price when usable
+    if not prophet_prices and (not prophet_refused or borrowed):
+        # Promotions are price cuts now, so there is no separate promotion boost to learn or
+        # borrow from similar products. A promotion's discount moves the forecast through the
+        # price response below, and a promotion with no discount doesn't move it at all.
+        _lift = {"multiplier": 1.0, "basis": "promotions-are-price-changes", "promoDays": 0}
+        _elast = _elast_pre if _elast_pre is not None else _UP.price_elasticity(df_nohol)
+        if not price_usable and _elast.get("elasticity"):
+            # Measurable in principle, but the price levels behind it don't clear the
+            # gate. Keep the diagnostic, apply nothing.
+            _elast = {**_elast, "elasticity": 0.0, "basis": "too-few-price-levels",
+                      "measuredButGated": _elast.get("elasticity")}
+        if borrowed and (not own_price_ok or prophet_refused):
+            _elast = {**_elast, "elasticity": borrowed["elasticity"], "basis": "borrowed",
+                      "peers": borrowed["peers"],
+                      "ownBasis": "inverted" if prophet_refused else _elast.get("basis")}
         uplift_report = {"promo": _lift, "price": _elast,
                          "text": _UP.explain(_lift, _elast)}
+
+    price_response = _price_response(method, eng, has_price, price_varied,
+                                     (uplift_report or {}).get("price"),
+                                     evidence=p_evidence, bounds=p_bounds,
+                                     borrowed=borrowed if (uplift_report or {}).get("price", {}).get("basis") == "borrowed" else None,
+                                     borrowed_range=eff_range, borrowed_bounds=eff_bounds)
+    # Whether a price event moves this forecast, whichever engine is behind it. This used
+    # to be "is the route Prophet", so a product with a measured elasticity on another
+    # route was shown "price changes won't affect this forecast" while they did.
+    price_modeled = bool(price_response.get("applies"))
 
     forecast = eng.forecast_df.copy()
     # Split history vs forecast at the SKU's LAST ACTUAL date, not the calendar
@@ -616,32 +1171,77 @@ def build_entry(sku_id, sku_name, df_clean, mode, filename, today, events, relat
             season_report["index"], coverage=season_report.get("coverage", 1.0))
         if any(abs(m - 1.0) > 1e-9 for m in _sm):
             future_fc = _UP.apply(future_fc, _sm)
+            forecast = _with_future(forecast, future_fc, last_actual)
             season_report["applied"] = True
             season_report["peakMultiplier"] = round(max(_sm), 3)
             season_report["troughMultiplier"] = round(min(_sm), 3)
 
     if uplift_report and len(future_fc):
         _mults = _UP.future_multipliers(
-            future_fc["ds"].dt.strftime("%Y-%m-%d").tolist(), events,
+            future_fc["ds"].dt.strftime("%Y-%m-%d").tolist(), fc_events,
             uplift_report["promo"]["multiplier"],
             elasticity=uplift_report["price"]["elasticity"],
-            base_price=last_price)
+            base_price=last_price, bounds=eff_bounds, known_range=eff_range)
         if any(abs(m - 1.0) > 1e-9 for m in _mults):
             future_fc = _UP.apply(future_fc, _mults)
             uplift_report["applied"] = True
             uplift_report["daysLifted"] = sum(1 for m in _mults if m > 1.0)
+            # How much of each day is a price effect, and how far outside the observed
+            # prices it was extrapolated — the same uncertainty Prophet's route carries.
+            _el = uplift_report["price"]["elasticity"]
+            if eff_range and _el:
+                _floor = ((STORE_BORROWED_EFFECT_UNC if (borrowed or {}).get("scope") == "store"
+                           else BORROWED_EFFECT_UNC) if uplift_report["price"].get("basis") == "borrowed"
+                          else PRICE_EFFECT_UNC)
+                _dates = future_fc["ds"].dt.strftime("%Y-%m-%d").tolist()
+                _path = _UP.future_price_path(_dates, fc_events, last_price, bounds=eff_bounds)
+                _xs = []
+                for _d, _y in zip(_dates, future_fc["yhat"].clip(lower=0).tolist()):
+                    _p = _path.get(_d)
+                    if _p is None or abs(_p - float(last_price or 0)) < 1e-9:
+                        _xs.append(0.0); continue
+                    _pm = _UP.price_response(_el, last_price, _p, eff_range)
+                    _u = extrapolation_uncertainty(extrapolation_distance(_p, *eff_range), floor=_floor)
+                    _xs.append(abs(_y - _y / _pm) * _u if _pm > 0 else 0.0)
+                future_fc["x_sd"] = _xs
+        # The scorecard reads future_fc, the product page re-derives it from `forecast`.
+        # These multipliers used to reach only the first, so on every non-Prophet route a
+        # price change or promotion moved the scorecard's order but not the product page.
+        forecast = _with_future(forecast, future_fc, last_actual)
+
+    # Holiday lifts on the upcoming windows. Applied last among the multipliers (they all
+    # multiply, so order doesn't change the result), and the price uncertainty on those
+    # days scales with them. h_sd is how unsure the lift itself is, in units.
+    holiday_report = None
+    if h_assign:
+        holiday_report = _holiday_report(h_effects, h_assign, df, today, holiday_days_held, has_price, _hset)
+    if h_effects and len(future_fc):
+        _hm_f, _hse_f, _hk_f = _HOL.future_multipliers(future_fc["ds"].dt.date.tolist(), h_effects, h_assign)
+        if any(abs(m - 1.0) > 1e-9 for m in _hm_f) or any(x > 0 for x in _hse_f):
+            _marr = np.asarray(_hm_f, dtype=float)
+            future_fc = _UP.apply(future_fc, _hm_f)
+            if "x_sd" in future_fc.columns:
+                future_fc["x_sd"] = pd.to_numeric(future_fc["x_sd"], errors="coerce").fillna(0.0) * _marr
+            future_fc["h_sd"] = future_fc["yhat"].clip(lower=0).to_numpy(float) * np.asarray(_hse_f, dtype=float)
+            future_fc["holiday"] = _hk_f
+            future_fc["h_mult"] = _marr
+            forecast = _with_future(forecast, future_fc, last_actual)
+            holiday_report["applied"] = True
 
     # Price range + safe extrapolation (model-agnostic; carries over).
     p_min = p_max = p_safe_min = p_safe_max = None; gap_warn = None
     if has_price and tiers:
-        seen = sorted(t["price"] for t in tiers); p_min, p_max = seen[0], seen[-1]
-        fit_df = df[["ds", "y"]].copy(); fit_df["price"] = df["price"].ffill().fillna(last_price or 0)
-        p_safe_min, p_safe_max = compute_safe_price_range(fit_df, tiers, p_min, p_max, eng.residual_std, None)
+        # Trained range = the QUALIFYING levels when there are any; the safe range is the
+        # exact clamp the forecast applies, so the warning and the behaviour agree.
+        _q = (p_evidence or {}).get("qualifying") or tiers
+        seen = sorted(t["price"] for t in _q); p_min, p_max = seen[0], seen[-1]
+        if p_bounds is not None:
+            p_safe_min, p_safe_max = p_bounds
         if len(seen) >= 2:
             gaps = [seen[i + 1] - seen[i] for i in range(len(seen) - 1)]; mg = max(gaps); rng = p_max - p_min
             if rng > 0 and mg / rng > 0.25:
                 i = gaps.index(mg)
-                gap_warn = (f"Large untested gap: ${seen[i]:.2f}–${seen[i+1]:.2f} (${mg:.2f}, "
+                gap_warn = (f"Large untested gap: ${seen[i]:.2f} to ${seen[i+1]:.2f} (${mg:.2f}, "
                             f"{round(mg/rng*100)}% of trained range). Linear price sensitivity is assumed across it.")
 
     # ── Self-calibrating safety-stock σ ───────────────────────────────────────
@@ -678,7 +1278,8 @@ def build_entry(sku_id, sku_name, df_clean, mode, filename, today, events, relat
                     break
                 cal = build_entry(sku_id, sku_name, df_clean, mode, filename, cutoff_cal,
                                   events, related, n_relatives, calibrate=False,
-                                  availability=availability)
+                                  availability=availability, holidays=_hglobal, peers=peers,
+                                  store_peers=store_peers)
                 tend = cutoff_cal + pd.Timedelta(days=WIN)
                 hold = (df[(df["ds"] > cutoff_cal) & (df["ds"] <= tend)][["ds", "y"]]
                         .merge(cal["forecast"][["ds", "yhat"]], on="ds", how="inner"))
@@ -745,28 +1346,61 @@ def build_entry(sku_id, sku_name, df_clean, mode, filename, today, events, relat
             ref_mean = float(_tail.mean()); ref_units = float(_tail.sum())
     eng.residual_dispersion = demand_dispersion(sigma_observed, ref_mean, ref_units)
 
+    # Days whose price was extrapolated beyond what this product has sold at get a wider
+    # band. Done last, so neither calibration step above can overwrite it.
+    forecast = _widen_for_extrapolation(forecast, last_actual)
+    future_fc = forecast[forecast["ds"] > last_actual].copy().reset_index(drop=True)
+
     details = _make_details(method, reason, eng.model_label, demand_class, eng.residual_cv,
                             eng._q_lo, eng._q_hi, eng.explain_bits(), len(df),
                             dispersion=eng.residual_dispersion, ref_mean=ref_mean)
     details["relatives"] = int(n_relatives)
+    # The engine describes its own inputs; a price response applied on top of it (measured
+    # or borrowed) is not the engine's, so say what actually happens.
+    # One verdict on price, said the same way everywhere: whenever Prophet isn't carrying
+    # price itself, the price response decides what the details say (the engine alone
+    # would say "no price data" for a product whose prices simply can't be used).
+    if not prophet_prices and price_response.get("text"):
+        details["price"] = {**(details.get("price") or {}), "used": bool(price_response.get("applies")),
+                            "text": price_response.get("text")}
+    if holiday_report:
+        _act = [r for r in holiday_report["effects"] if r["active"]]
+        details["holidays"] = {
+            "count": len(_act),
+            "text": ((f"{holiday_report['checked']} holidays and sales periods checked automatically. Sales history "
+                      f"shows: " + ", ".join(f"{r['name']} {_HOL.pct_text(r['multiplier'])}" for r in _act[:6])
+                      + (f", and {len(_act) - 6} more" if len(_act) > 6 else "") + ". Each is added on its own dates.")
+                     if _act else
+                     f"{holiday_report['checked']} holidays and sales periods checked automatically. None shows a "
+                     f"clear effect on this product yet.")}
 
     return {
         "engine": eng, "df_train": df, "forecast": forecast, "future_fc": future_fc,
         "mode": mode, "filename": filename, "sku_name": sku_name,
-        "active_yearly": days >= 450, "active_weekly": days >= 14,
+        "active_yearly": days >= YEARLY_MIN_DAYS, "active_weekly": days >= 14,
         "has_price": has_price, "has_promo": has_promo,
         "price_varied": price_varied, "price_well_sampled": price_well, "last_price": last_price,
         "price_tiers": tiers, "price_trained_min": p_min, "price_trained_max": p_max,
+        "price_usable": price_usable, "price_mixed_days": int((p_evidence or {}).get("mixedDays") or 0),
+        "last_recorded_date": (df["ds"].max().strftime("%Y-%m-%d") if len(df) else None),
         "price_safe_min": p_safe_min, "price_safe_max": p_safe_max, "price_gap_warning": gap_warn,
         "price_warn_level": warn_level, "price_warn_msg_upload": warn_msg,
         "stockout_rows_dropped": stockout_dropped, "censoring": censor,
         "promo_handling": promo_report, "uplift": uplift_report,
+        "price_response": price_response, "holidays": holiday_report,
+        "borrowed_price": borrowed if (uplift_report or {}).get("price", {}).get("basis") == "borrowed" else None,
         "seasonality_applied": season_report,
         "residual_cv": eng.residual_cv, "residual_std": eng.residual_std, "oos_residuals": oos_resid,
         "residual_dispersion": eng.residual_dispersion, "residual_ref_mean": ref_mean,
         "residual_sigma_observed": sigma_observed,
-        "sigma_calibrated": calib_ran, "events": events,
+        "sigma_calibrated": calib_ran, "events": events, "pos_events": pos_events,
+        "live_price": live_price, "regular_price": regular_price,
         "winning_model": eng.model_label, "demand_class": demand_class,
+        # Has it simply stopped selling? Computed here, on the SAME series the models were
+        # fitted to, so the badge, the routing and the forecast can never disagree about
+        # it. Only meaningful now that zero-fill runs to the window end — before that a
+        # live-sourced series could not end in a zero and this was always False.
+        "dormant": bool(_FE_is_dormant(df["y"].to_numpy(dtype=float))) if len(df) else False,
         "route": method, "route_reason": reason, "explain": details,
         "price_modeled": price_modeled, "effective_price": effective_price,
     }
@@ -815,6 +1449,13 @@ def _rebuild(today, only: str | None = None, record_switches: bool = False):
     _baseline = R.catalog_baseline(pool_catalog)
     clusters = R.cluster_catalog(groups, pool_catalog, baseline=_baseline)   # behavioural sub-clusters per category
     targets = [only] if only else list(_catalog.keys())
+    # Build into a copy, publish at the end. A refit of an already-populated catalogue
+    # publishes exactly once: any intermediate publish would recreate the old/new mixture
+    # this whole arrangement exists to prevent. A cold boot starts from nothing, so there
+    # is no mixture to make and it may publish as it goes.
+    staged = dict(_sku_cache)
+    incremental = not staged
+    built = 0
     for sku_id in targets:
         c = _catalog[sku_id]
         try:
@@ -841,11 +1482,22 @@ def _rebuild(today, only: str | None = None, record_switches: bool = False):
                 _avail = None
             entry = build_entry(sku_id, c["sku_name"], c["df"], c["mode"], c["filename"],
                                 today, c.get("events", []), rels, n_rel,
-                                pool_cohesion=pool_coh, availability=_avail)
+                                pool_cohesion=pool_coh, availability=_avail,
+                                live_price=_live.get(sku_id),
+                                peers=R.category_peers(sku_id, groups, pool_catalog),
+                                store_peers=R.category_peers(sku_id, {}, pool_catalog, limit=40),
+                                # With no category, or no other product in it, "similar
+                                # products" is already the whole store: say so.
+                                peer_scope=("category" if groups.get(sku_id) is not None and any(
+                                    m != sku_id and gg == groups.get(sku_id) and m in pool_catalog
+                                    for m, gg in groups.items()) else "store"))
             entry["cluster_info"] = cluster_info
             entry["group_info"] = group_meta.get(sku_id)
-            _sku_cache[sku_id] = entry
+            staged[sku_id] = entry
             _last_rebuild_errors.pop(sku_id, None)
+            built += 1
+            if incremental and built % _PUBLISH_EVERY == 0:
+                _publish_cache(dict(staged))
             # Log a forecast-model switch (e.g. global→Prophet) for the overview banner.
             _record_route(sku_id, c["sku_name"], entry["route"], entry["route_reason"], log_event=record_switches)
         except Exception as ex:
@@ -855,8 +1507,9 @@ def _rebuild(today, only: str | None = None, record_switches: bool = False):
             # save or re-categorize failed), KEEP the previous entry rather than
             # making the SKU vanish from the dashboard. Only brand-new SKUs (first
             # fit, nothing to fall back to) stay absent — reported via errors.
-            if sku_id not in _sku_cache:
+            if sku_id not in staged:
                 pass  # nothing to preserve; the upload response reports the error
+    _publish_cache(staged)
 
 
 def warmup():
@@ -866,11 +1519,12 @@ def warmup():
     global _backtest_tier_cache, _backtest_exclusions, _last_backtest
     _backtest_tier_cache, _backtest_exclusions, _last_backtest = {}, {}, None
     _sheet_costs.clear()
+    _cost_sources.clear()
     _backtest_inputs.clear()
     globals()["_last_backtest_rows"] = None
     globals()["_last_backtest_combos"] = []
     with _state_lock:
-        _catalog.clear(); _sku_cache.clear()
+        _catalog.clear(); _publish_cache({})
 
     saved, extras = _STORE.load()
     restored_tiers = 0
@@ -886,6 +1540,7 @@ def warmup():
     with _state_lock:
         _catalog.update(saved)
         _sheet_costs.update({k: float(v) for k, v in (extras.get("sheet_costs") or {}).items()})
+        _cost_sources.update({k: str(v) for k, v in (extras.get("cost_sources") or {}).items()})
         if extras.get("holding_pct") is not None:
             globals()["_session_holding_pct"] = int(extras["holding_pct"])
     # Before the refit, not after: the tier cache is keyed to the DATA, not to the fitted
@@ -933,22 +1588,33 @@ def list_skus():
     the user typed is never overwritten by the sheet.
     """
     out = []
-    for sku_id, e in _sku_cache.items():
+    for sku_id, e in _cache().items():
         df = e["df_train"]
         # Latest non-null units_in_stock on or before today, mirroring _ingest's own rule.
-        last_stock = None
+        last_stock, stock_src = None, None
         try:
             if df is not None and "units_in_stock" in df.columns:
                 ss = pd.to_numeric(df["units_in_stock"], errors="coerce").dropna()
                 if len(ss):
-                    last_stock = int(ss.iloc[-1])
+                    last_stock, stock_src = int(ss.iloc[-1]), "sheet"
         except Exception:
             last_stock = None
+        if last_stock is None:
+            # A LIVE source carries inventory ALONGSIDE the sales, never inside them, so a
+            # synced catalog has no units_in_stock column and this used to return null —
+            # which the browser then "seeded" over an empty slot with the 500-unit default.
+            # That is the exact regression handleUploadSuccess already documents having
+            # fixed once for costs. StockLog is the timestamped record of on-hand and it
+            # survives a restart, so it is the right thing to read back.
+            logged = _slog.latest(sku_id)
+            if logged is not None:
+                last_stock, stock_src = int(round(logged)), "live"
         out.append({"id": sku_id, "name": e["sku_name"] or sku_id, "mode": e["mode"], "filename": e["filename"],
                     "daysOfHistory": int((df["ds"].max() - df["ds"].min()).days) if df is not None else 0,
                     "totalUnitsSold": int(df["y"].sum()) if df is not None else 0,
-                    "lastKnownStock": last_stock,
-                    "lastKnownCost": _sheet_costs.get(str(sku_id))})
+                    "lastKnownStock": last_stock, "stockSource": stock_src,
+                    "lastKnownCost": _sheet_costs.get(str(sku_id)),
+                    "costSource": _cost_sources.get(str(sku_id))})
     return out
 
 
@@ -971,7 +1637,7 @@ def fleet_summary(payload: dict = Body(default={})):
     r_units = r_value = r_known = r_n = 0
     inv_value = inv_known = inv_n = dead_value = dead_n = 0
     cats: dict[str, int] = {}; patt: dict[str, int] = {}
-    for sid, e in list(_sku_cache.items()):
+    for sid, e in _cache().items():
         p = params.get(sid) or {}
         stock = int(p.get("stock") or 0); lt = int(p.get("leadTime") or 14); cov = int(p.get("coverage") or 30)
         oo = int(p.get("onOrder") or 0); fees = float(p.get("fees") or 0.0)
@@ -1022,9 +1688,10 @@ def fleet_summary(payload: dict = Body(default={})):
 @app.delete("/api/skus/{sku_id}")
 def delete_sku(sku_id: str):
     with _state_lock:
-        if sku_id not in _sku_cache and sku_id not in _catalog:
+        if sku_id not in _cache() and sku_id not in _catalog:
             raise HTTPException(404, "SKU not found.")
-        _sku_cache.pop(sku_id, None); _catalog.pop(sku_id, None)
+        _publish_cache({k: v for k, v in _sku_cache.items() if k != sku_id})
+        _catalog.pop(sku_id, None)
         # Relatedness/pooling was computed WITH this SKU in the catalog — rebuild so
         # remaining SKUs stop borrowing from (or counting) the deleted product.
         try:
@@ -1240,7 +1907,8 @@ def _merge_sku_history(sid: str, new_df: pd.DataFrame, new_shift: int) -> tuple[
 
 def _ingest(df_raw, filename: str, stock_override: dict | None = None,
             cost_override: dict | None = None, append: bool = False,
-            auto_backtest: bool = True, reanchor: bool = True):
+            auto_backtest: bool = True, reanchor: bool = True,
+            cost_source: str = "shopify"):
     """Shared ingestion for ANY raw sales DataFrame — an uploaded file OR a live source
     like Shopify. Normalizes/dedups, optionally re-anchors, builds the per-SKU catalog,
     refits, and returns the same payload the upload endpoint always has. `stock_override` /
@@ -1265,7 +1933,7 @@ def _ingest(df_raw, filename: str, stock_override: dict | None = None,
     bad_dates      = int(df_raw["date"].isna().sum())
     missing_sales  = int(df_raw["units_sold"].isna().sum())     # blanks → treated as 0
     df_raw["units_sold"] = df_raw["units_sold"].fillna(0).clip(lower=0)
-    for c in ("price", "on_promotion", "units_in_stock"):
+    for c in ("price", "price_mixed", "on_promotion", "units_in_stock"):
         if c in df_raw.columns:
             df_raw[c] = pd.to_numeric(df_raw[c], errors="coerce")
     # A Cost / Unit_Cost column seeds the dashboard's unit-cost field (like stock),
@@ -1307,8 +1975,24 @@ def _ingest(df_raw, filename: str, stock_override: dict | None = None,
         for c in df_raw.columns:
             if c in key:
                 continue
-            agg[c] = "sum" if c == "units_sold" else ("max" if c == "on_promotion" else "last")
-        df_raw = df_raw.groupby(key, as_index=False).agg(agg).sort_values("date").reset_index(drop=True)
+            agg[c] = "sum" if c == "units_sold" else ("max" if c in ("on_promotion", "price_mixed") else "last")
+        _pr = None
+        if "price" in df_raw.columns:
+            # Same-day transactions at different prices: a units-weighted day price and a
+            # mixed-day flag, not whichever row came last. Same rule as the live sources.
+            _pr = daily_price_rollup(df_raw[key + ["units_sold", "price"]], keys=tuple(key))
+        df_raw = df_raw.groupby(key, as_index=False).agg(agg)
+        if _pr is not None:
+            _pr = _pr[key + ["price", "price_mixed"]].rename(
+                columns={"price": "_rp", "price_mixed": "_rm"})
+            df_raw = df_raw.merge(_pr, on=key, how="left")
+            df_raw["price"] = df_raw["_rp"].where(df_raw["_rp"].notna(), df_raw["price"])
+            prev = df_raw["price_mixed"] if "price_mixed" in df_raw.columns else 0
+            df_raw["price_mixed"] = pd.concat(
+                [pd.Series(prev, index=df_raw.index).fillna(0), df_raw["_rm"].fillna(0)],
+                axis=1).max(axis=1).astype(int)
+            df_raw = df_raw.drop(columns=["_rp", "_rm"])
+        df_raw = df_raw.sort_values("date").reset_index(drop=True)
     duplicate_rows_merged = rows_in - bad_dates - len(df_raw)
     data_quality = {
         "rowsIn": rows_in, "rowsUsed": len(df_raw),
@@ -1355,10 +2039,22 @@ def _ingest(df_raw, filename: str, stock_override: dict | None = None,
     # "Replace" has to actually replace. This used to only upsert per SKU, so every SKU
     # from a previous upload survived every subsequent one — and got scored alongside the
     # new file's products in the backtest.
+    # A LIVE STORE'S RE-SYNC KEEPS WHAT THE PERSON SET. The nightly sync re-imports the
+    # whole store as a replace, which used to wipe every product's planned price changes
+    # and promotions (and any category set by hand) at 00:15 each night. Those describe
+    # the future or the product, not the sales, so a product that comes back from its own
+    # store keeps them. A spreadsheet upload still replaces everything: its product ids
+    # and dates may mean something else entirely.
+    carried: dict = {}
+    if not append and not reanchor:
+        carried = {sid: {"events": list(c.get("events") or []), "attrs": dict(c.get("attrs") or {}),
+                         "attrs_set": list(c.get("attrs_set") or [])}
+                   for sid, c in _catalog.items() if c.get("live_source")}
     if not append:
         _catalog.clear()
-        _sku_cache.clear()
+        _publish_cache({})
         _sheet_costs.clear()
+        _cost_sources.clear()
 
     loaded, errors = [], []
     last_stock = {}   # sid -> units_in_stock on the most recent dated row (<= today)
@@ -1366,14 +2062,22 @@ def _ingest(df_raw, filename: str, stock_override: dict | None = None,
     missing_days_filled = 0
     rows_appended = overlap_rows = 0      # append-mode accounting, reported back
     added_skus, extended = [], []
+    # The last date anywhere in this import. Every product's calendar is filled out to
+    # here, so a product that stopped selling in June carries real zeros through to the
+    # end of the data instead of a series that simply stops — which is what let a dead
+    # product keep being forecast at its old rate. See fill_daily_gaps.
+    try:
+        _data_end = max(pd.to_datetime(g["date"]).max() for g, _ in groups_iter.values())
+    except (ValueError, KeyError, TypeError):
+        _data_end = None
     for sid, (grp, sname) in groups_iter.items():
-        keep = ["date", "units_sold"] + [c for c in ("price", "on_promotion", "units_in_stock") if c in grp.columns]
+        keep = ["date", "units_sold"] + [c for c in ("price", "price_mixed", "on_promotion", "units_in_stock") if c in grp.columns]
         dfc = grp[keep].rename(columns={"date": "ds", "units_sold": "y"}).copy()
         dfc["ds"] = pd.to_datetime(dfc["ds"])
         # Sheets that only carry a row per SALE day would otherwise hide every
         # zero-sale day from the model (over-forecasting + broken intermittency
         # detection). Reindex to a continuous daily calendar, same as Shopify.
-        dfc, n_filled = fill_daily_gaps(dfc)
+        dfc, n_filled = fill_daily_gaps(dfc, end=_data_end)
         missing_days_filled += n_filled
         # Allow brand-new products in (as few as 2 rows). Thin SKUs are handled
         # honestly downstream: < 7 own-days → "establishing baseline" (forecast held),
@@ -1406,8 +2110,9 @@ def _ingest(df_raw, filename: str, stock_override: dict | None = None,
             overlap_rows += overlap
             if added or overlap:
                 extended.append(sid)
+            _hand = set(prev.get("attrs_set") or [])
             prev["attrs"] = {**(prev.get("attrs") or {}),
-                             **{k: v for k, v in attrs.items() if v is not None}}
+                             **{k: v for k, v in attrs.items() if v is not None and k not in _hand}}
             prev["sku_name"] = sname or prev.get("sku_name")
             prev["mode"] = "uploaded"
             prev["filename"] = filename
@@ -1420,27 +2125,49 @@ def _ingest(df_raw, filename: str, stock_override: dict | None = None,
         else:
             if append:
                 added_skus.append(sid)
+            _kept = carried.get(sid) or {}
+            if _kept:
+                # The store's values fill in and update; what a person set by hand wins,
+                # including a category they cleared on purpose.
+                _hand = set(_kept.get("attrs_set") or [])
+                attrs = {**_kept.get("attrs", {}), **{k: v for k, v in attrs.items() if v is not None}}
+                for k in _hand:
+                    if _kept.get("attrs", {}).get(k) is None:
+                        attrs.pop(k, None)
+                    else:
+                        attrs[k] = _kept["attrs"][k]
             _catalog[sid] = {"df": dfc, "attrs": attrs, "sku_name": sname,
-                             "mode": "uploaded", "filename": filename, "events": [],
+                             "mode": "uploaded", "filename": filename,
+                             "events": list(_kept.get("events") or []),
+                             "attrs_set": list(_kept.get("attrs_set") or []),
                              "sources": [filename], "date_shift_days": date_shift_days,
                              # Kept separate from `mode`, which the dashboard reads to decide
                              # whether "Clear all data" is offered. This flag is only about
                              # whether the dates may be moved.
                              "live_source": (not reanchor)}
 
-    if stock_override:                       # live inventory (Shopify) → prefill current stock
+    # Where a stock figure came from travels with it, exactly as cost provenance does.
+    # "unknown" is a real, distinct answer: a product the store does not inventory-track
+    # returns no count, and showing that as a number — any number — is the failure mode.
+    stock_src: dict[str, str] = {sid: "sheet" for sid, v in last_stock.items() if v is not None}
+    if stock_override:                       # live inventory → prefill current stock
         for sid in groups_iter:
             if last_stock.get(sid) is None and stock_override.get(sid) is not None:
                 last_stock[sid] = int(stock_override[sid])
-    # Which source a cost came from travels with it. A number pulled from Shopify and
+                stock_src[sid] = "live"
+    # Which source a cost came from travels with it. A number pulled from a live store and
     # one read out of a spreadsheet column deserve different trust, and the product
     # page now shows which it was — it cannot work that out from the value alone.
+    # `cost_source` names the platform ("shopify", "square", …) rather than assuming one:
+    # a Square cost labelled "shopify" is a lie told quietly, on the one screen whose whole
+    # job is saying where a number came from. Defaults to "shopify" so any caller that
+    # hasn't been updated keeps its old behaviour exactly.
     cost_src: dict[str, str] = {sid: "sheet" for sid in last_cost}
-    if cost_override:                        # live unit costs (Shopify) → prefill unit cost
+    if cost_override:                        # live unit costs → prefill unit cost
         for sid in groups_iter:
             if last_cost.get(sid) is None and cost_override.get(sid) is not None:
                 last_cost[sid] = round(float(cost_override[sid]), 2)
-                cost_src[sid] = "shopify"
+                cost_src[sid] = cost_source
 
     if not any(s in _catalog for s in groups_iter):
         raise HTTPException(400, "No valid SKUs could be loaded. " + " ".join(errors))
@@ -1465,10 +2192,13 @@ def _ingest(df_raw, filename: str, stock_override: dict | None = None,
         if sid in _last_rebuild_errors:
             errors.append(f"{sid}: could not be modeled and was skipped ({_last_rebuild_errors[sid]}).")
 
+    # The catalogue _rebuild just published, bound once — the response is built from a
+    # single snapshot rather than re-reading a name another thread may have swapped.
+    _cache_snap = _cache()
     for sid in groups_iter:
-        if sid not in _sku_cache:
+        if sid not in _cache_snap:
             continue
-        e = _sku_cache[sid]; dt = e["df_train"]
+        e = _cache_snap[sid]; dt = e["df_train"]
         loaded.append({"id": sid, "name": e["sku_name"], "rows": len(dt),
                        "stockoutRowsDropped": e["stockout_rows_dropped"],
         # What the censoring correction did, so an adjusted forecast is never silent.
@@ -1488,6 +2218,7 @@ def _ingest(df_raw, filename: str, stock_override: dict | None = None,
                       })})(e.get("censoring")), "hasPrice": e["has_price"],
                        "priceVaried": e["price_varied"], "route": e["route"], "winningModel": e["winning_model"],
                        "lastKnownStock": last_stock.get(sid), "lastKnownCost": last_cost.get(sid),
+                       "stockSource": stock_src.get(sid, "unknown"),
                        "costSource": cost_src.get(sid),
                        "dateRange": {"start": dt["ds"].min().strftime("%B %d, %Y"), "end": dt["ds"].max().strftime("%B %d, %Y")}})
     # Start the measured recommendation straight away. Nobody should have to know the
@@ -1496,6 +2227,7 @@ def _ingest(df_raw, filename: str, stock_override: dict | None = None,
     # Costs come from the sheet's Cost column if it has one; the dashboard re-runs later
     # with Scorecard costs if the user enters better ones.
     _sheet_costs.update({str(sid): float(c) for sid, c in last_cost.items()})
+    _cost_sources.update({str(sid): cost_src.get(sid, "sheet") for sid in last_cost})
 
     # A live feed syncs constantly, and a full replay per sync is both untenable and
     # almost always pointless: cutoffs sit `step` days apart, so on 27 days out of 28 no
@@ -1507,11 +2239,27 @@ def _ingest(df_raw, filename: str, stock_override: dict | None = None,
     live_source = not reanchor
     backtest_started = False
     if live_source and _backtest_tier_cache:
-        # Skipping the run is only safe while the measurements still describe THIS data.
+        # Does the measurement still describe this data? Three answers, not two.
+        #
+        # This used to compare hashes, which differ the instant a single day of sales
+        # lands — so every nightly sync threw the measured tiers away and the tool fell
+        # back to cost-curve estimates until the NEXT sync happened to find an empty cache
+        # and re-ran. Protection levels alternated night to night for no reason connected
+        # to demand. A tier chosen from several test windows across months does not stop
+        # describing a product because yesterday's sales arrived.
+        new_parts = _BTSTORE.fingerprint_parts(_catalog)
         if _backtest_fingerprint and _BTSTORE.fingerprint(_catalog) == _backtest_fingerprint:
             print("Live sync — data unchanged for testing purposes; automatic backtest skipped.")
+        elif _BTSTORE.grew_only(_backtest_parts, new_parts):
+            # History extended and nothing was rewritten. Keep the measurements and let
+            # them age; the weekly refresh (or one of the auto-run conditions) replaces
+            # them on purpose rather than by accident.
+            globals()["_backtest_fingerprint"] = _BTSTORE.fingerprint(_catalog)
+            globals()["_backtest_parts"] = new_parts
+            print("Live sync — history grew; measured protection levels kept (they will be "
+                  "re-measured on the weekly refresh).")
         else:
-            _drop_backtest_state("the sync changed the sales history they were measured on")
+            _drop_backtest_state("the sync rewrote the sales history they were measured on")
     elif auto_backtest and _catalog:
         backtest_started = _run_backtest_job(
             {"horizon": 44, "n_cutoffs": "auto", "step": 28, "lead": 14, "coverage": 30,
@@ -1528,34 +2276,818 @@ def _ingest(df_raw, filename: str, stock_override: dict | None = None,
             "errors": errors, "dateShiftDays": date_shift_days, "dataQuality": data_quality}
 
 
-@app.post("/api/upload/shopify")
-def upload_shopify(payload: dict = Body(default={})):
-    """Pull live sales from a Shopify store and load them into the dashboard exactly as if a
-    sheet had been uploaded. Body: { shop, token, apiVersion?, days? }. Read-only token with
-    scope read_orders (read_all_orders for >60 days of history)."""
-    import shopify_source as SH
+# ═════════════════════════════════════════════════════════════════════════════
+#  LIVE STORE CONNECTIONS  (Shopify, Square, …)
+#
+#  One code path per operation, not one per platform. `sources.py` holds the registry;
+#  everything below looks a source up by key and never learns its name. See that module
+#  for why "add a second `if source == 'square'` branch" was the wrong answer.
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _resolve_connection(payload: dict) -> tuple:
+    """Turn a request body into (source_key, creds, connection_id, saved_label).
+
+    Three shapes are accepted, in priority order:
+      1. {"connectionId": "abc"}      — a saved connection; the token never left the server
+      2. {"source": "square", "creds": {...}}
+      3. {"shop": ..., "token": ...}  — the original flat Shopify body, still honoured so an
+                                        older frontend bundle keeps working
+
+    Anything else in the body (a different `days`, a narrower location list) layers on top
+    of a saved connection's credentials, so "use my saved store but pull only 30 days"
+    works without re-entering the token.
+    """
+    payload = payload or {}
+    cid = payload.get("connectionId") or payload.get("connection_id")
+    if cid:
+        saved = _CONN.get(cid)
+        if not saved:
+            raise HTTPException(404, "That saved connection no longer exists. Reconnect the store.")
+        creds = dict(saved.get("creds") or {})
+        creds.update({k: v for k, v in (payload.get("creds") or {}).items() if v not in (None, "")})
+        # The saved label travels with it: a catalog imported from "Cousin's store" should
+        # say so, not fall back to the generic platform name.
+        return saved.get("source"), creds, cid, saved.get("label")
+
+    source = (payload.get("source") or "").strip().lower()
+    creds = dict(payload.get("creds") or {})
+    if not source:
+        if payload.get("shop") or payload.get("token"):          # legacy flat Shopify body
+            source = "shopify"
+            creds = {"shop": payload.get("shop"), "token": payload.get("token"),
+                     "apiVersion": payload.get("apiVersion")}
+        else:
+            raise HTTPException(400, "No store connection given. Pick a saved account or enter credentials.")
+    # Legacy flat shape WITH an explicit source ({"source": "shopify", "shop": …}). Only
+    # applies when the body has no `creds` key at all — an explicitly empty creds dict means
+    # "use this source's environment variables", and must not be back-filled from the body,
+    # or {"source": x, "creds": {}} would resolve to creds={"creds": {}}.
+    if not creds and "creds" not in payload:
+        creds = {k: v for k, v in payload.items()
+                 if k not in ("source", "days", "save", "label", "connectionId", "connection_id")}
+    return source, creds, None, None
+
+
+def _source_error(source_key: str):
+    """The source's own exception type, so a clean 'your token is wrong' message survives
+    instead of being flattened into a 500."""
     try:
-        raw = SH.fetch_sales(shop=payload.get("shop"), token=payload.get("token"),
-                             api_version=payload.get("apiVersion"), days=payload.get("days"))
-    except SH.ShopifyError as e:
+        return _SRC.error_class(source_key)
+    except Exception:                                    # noqa: BLE001
+        return Exception
+
+
+@app.get("/api/sources")
+def list_sources():
+    """What the dashboard needs to render a connect form for each platform, including which
+    fields are secret. Adding a platform gives it a working form with no frontend change."""
+    return {"sources": _SRC.catalogue()}
+
+
+@app.get("/api/connections")
+def list_connections():
+    """Saved store connections — the 'accounts' you pick instead of re-pasting a token.
+
+    Browser-safe by construction: connections.public() strips every secret field and leaves
+    a masked hint. The token itself never leaves this process.
+    """
+    return {"connections": _CONN.list_all()}
+
+
+@app.post("/api/connections")
+def save_connection(payload: dict = Body(default={})):
+    """Create or update a saved connection. Body: { source, label, creds, id? }.
+
+    A secret that isn't resent is kept, so renaming a connection — or changing which
+    locations it pulls — doesn't require the token the browser never had.
+    """
+    source = (payload.get("source") or "").strip().lower()
+    try:
+        _SRC.get(source)
+    except KeyError as e:
         raise HTTPException(400, str(e))
-    except Exception as e:
-        raise HTTPException(400, f"Shopify fetch failed: {e}")
-    # Category (product_type) + current inventory via GraphQL — best-effort: if the token
-    # lacks read_products or the call fails, the sales still import (just without them).
-    stock_map = cost_map = None
+    creds = payload.get("creds") or {}
+    label = (payload.get("label") or "").strip() or _SRC.describe(source, creds)
+    return _CONN.upsert(source, label, creds, connection_id=payload.get("id"))
+
+
+@app.delete("/api/connections/{connection_id}")
+def delete_connection(connection_id: str):
+    if not _CONN.delete(connection_id):
+        raise HTTPException(404, "No such connection.")
+    return {"success": True, "deleted": connection_id}
+
+
+@app.post("/api/connections/test")
+def test_connection(payload: dict = Body(default={})):
+    """Check credentials WITHOUT importing anything, and report what they can see.
+
+    This exists because the alternative — discovering the token is wrong halfway through a
+    two-year pull that has already replaced the catalog — is a bad way to find out. For
+    Square it also returns the locations, which is what the location picker reads.
+    """
+    source, creds, cid, saved_label = _resolve_connection(payload)
     try:
-        meta = SH.fetch_catalog_meta(shop=payload.get("shop"), token=payload.get("token"), api_version=payload.get("apiVersion"))
+        info = {"source": source, "ok": True,
+                "label": saved_label or _SRC.describe(source, creds)}
+        if source == "square":
+            import square_source as SQ
+            info["locations"] = SQ.fetch_locations(
+                access_token=creds.get("accessToken") or creds.get("access_token"),
+                environment=creds.get("environment") or "production",
+                api_version=creds.get("apiVersion"))
+        else:
+            info["products"] = len(_SRC.fetch_catalog_meta(source, creds) or {})
+    except _source_error(source) as e:
+        raise HTTPException(400, str(e))
+    except HTTPException:
+        raise
+    except Exception as e:                               # noqa: BLE001
+        raise HTTPException(400, f"Could not reach {source}: {e}")
+    if cid:
+        _CONN.touch(cid)
+    return info
+
+
+@app.post("/api/upload/source")
+def upload_from_source(payload: dict = Body(default={})):
+    """Pull live sales from any connected store and load them exactly as if a sheet had been
+    uploaded.
+
+    Body: { connectionId } or { source, creds }, plus optional { days, save, label }.
+    `save: true` stores the credentials as a reusable connection and returns it, so the next
+    import is one click and the hourly tick can run with nobody present.
+    """
+    source, creds, cid, saved_label = _resolve_connection(payload)
+    days = payload.get("days")
+    if days in ("", "all"):
+        days = None
+
+    try:
+        raw = _SRC.fetch_sales(source, creds, days=days)
+    except _source_error(source) as e:
+        raise HTTPException(400, str(e))
+    except HTTPException:
+        raise
+    except Exception as e:                               # noqa: BLE001
+        raise HTTPException(400, f"{source.title()} fetch failed: {e}")
+
+    # Category + current inventory + unit cost — best-effort by design: if the token lacks
+    # the product scope, or the platform simply doesn't expose costs (Square gates them
+    # behind Retail Premium), the sales still import. They just arrive without the prefill.
+    stock_map = cost_map = None
+    meta_error = None
+    try:
+        meta = _SRC.fetch_catalog_meta(source, creds)
         if meta:
-            raw["category"] = raw["sku"].map(lambda s: (meta.get(s) or {}).get("category"))
+            if "category" not in raw.columns or raw["category"].isna().all():
+                raw["category"] = raw["sku"].map(lambda s: (meta.get(s) or {}).get("category"))
             stock_map = {s: m["stock"] for s, m in meta.items() if m.get("stock") is not None}
             cost_map = {s: m["cost"] for s, m in meta.items() if m.get("cost") is not None}
-    except Exception:
-        pass
-    shop = (payload.get("shop") or "store").replace(".myshopify.com", "").strip()
+            # The shelf price and any discount on now — filed BEFORE ingesting, so the
+            # rebuild inside _ingest already forecasts with it.
+            try:
+                _live.record(meta, source)
+            except Exception as exc:                     # noqa: BLE001 — never fail an import over it
+                print(f"Could not file live prices ({exc}).")
+    except Exception as e:                               # noqa: BLE001
+        meta_error = str(e)
+
+    # An explicit label wins, then the saved connection's own name, then the platform's
+    # generic description. Without the middle one a catalog pulled from a saved account
+    # gets filed as "Square" rather than as the name its owner gave it.
+    # ── Don't let a hiccup replace a good catalog ────────────────────────────
+    # An import REPLACES everything. That is fine when a person clicked it and can see the
+    # result; it is not fine at 00:15 with nobody watching, because a partial response —
+    # a truncated page, a token that lost a scope, a location that went quiet — would
+    # silently swap 28 products for 3 and every forecast would follow the smaller set.
+    # Scheduled syncs therefore refuse a drastic shrink and keep yesterday's data, which
+    # is stale but correct. A manual import does not set this: you asked, you can see.
+    if payload.get("guardCatalogShrink"):
+        with _state_lock:
+            existing = len(_catalog)
+        incoming = int(raw["sku"].nunique()) if "sku" in getattr(raw, "columns", []) else 0
+        floor = max(1, int(existing * SYNC_MIN_SKU_RATIO))
+        if existing and incoming < floor:
+            return {"success": False, "guardBlocked": True, "source": source,
+                    "existingSkus": existing, "incomingSkus": incoming,
+                    "errors": [f"Sync refused: the store reported {incoming} products but the "
+                               f"catalog holds {existing}, so the existing data was kept. "
+                               f"Re-import by hand if the drop is real."]}
+
+    label = (payload.get("label") or "").strip() or saved_label or _SRC.describe(source, creds)
+
+    # Import statistics the source chose to report — how many register-typed line items were
+    # dropped, how many products have no SKU set. Surfaced rather than swallowed, because
+    # "3,000 rows imported" quietly hides "and 400 line items weren't products".
+    source_stats = dict(getattr(raw, "attrs", {}).get(source) or {})
+
+    # File the reading BEFORE ingesting. StockLog is the only thing that remembers on-hand
+    # across a restart, and an import is a perfectly good reading — waiting for the hourly
+    # tick would leave a fresh catalog with no inventory at all until the browser next
+    # happened to be open.
+    if stock_map:
+        try:
+            _slog.record({str(k): v for k, v in stock_map.items()})
+        except Exception as exc:                         # noqa: BLE001 — never fail an import over it
+            print(f"Could not log inventory reading ({exc}).")
+
     with _state_lock:
-        return _ingest(raw, f"Shopify · {shop}", stock_override=stock_map, cost_override=cost_map,
-                       reanchor=False)   # live dates are the real dates
+        res = _ingest(raw, label, stock_override=stock_map, cost_override=cost_map,
+                      reanchor=False,   # live dates are the real dates
+                      cost_source=source)
+
+    res["source"] = source
+    if source_stats:
+        res.setdefault("dataQuality", {}).update(
+            {f"source_{k}": v for k, v in source_stats.items()})
+    if meta_error:
+        res.setdefault("errors", []).append(
+            f"Stock and category prefill unavailable ({meta_error}). Sales imported fine.")
+    res["costsAvailable"] = bool(cost_map)
+
+    if payload.get("save") or cid:
+        saved = _CONN.upsert(source, label, creds, connection_id=cid)
+        _CONN.touch(saved["id"])
+        res["connection"] = saved
+    return res
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  THE NIGHTLY SYNC
+#
+#  Everything above this point waits to be asked. Nothing re-imported on a schedule, so a
+#  catalog was only ever as fresh as the last time someone clicked Import — which the
+#  forecast math already defends against (fc_fwd is anchored to today, and dataAgeDays is
+#  reported) but cannot fix: correct arithmetic on week-old demand is still week-old demand.
+#
+#  `scheduler.py` owns WHEN. This owns WHAT.
+# ═════════════════════════════════════════════════════════════════════════════
+
+# A scheduled sync that would shrink the catalog below this fraction of its current size is
+# refused. See the guard in upload_from_source for why.
+SYNC_MIN_SKU_RATIO = 0.5
+
+
+# Which weekday the protection tiers are re-measured on (0 = Monday). Weekly, because the
+# tier is chosen from several test windows spanning months — one more day of sales barely
+# moves it, while a full re-measure costs minutes of refitting. Weekly also lands on the
+# same spine the forecast log already uses, so both validators refresh on one rhythm.
+SYNC_BACKTEST_WEEKDAY = int(os.environ.get("LOGITRACK_BACKTEST_WEEKDAY", "0"))
+
+
+def _combos_in_use(limit: int = 12) -> list:
+    """Distinct (lead, coverage) pairs worth measuring, commonest first.
+
+    One run can score several pairs, and measuring the ones people actually plan with is
+    far cheaper than re-running every time a P80 lead time moves. Capped, because each
+    extra pair costs scoring time.
+    """
+    from collections import Counter
+    counts = Counter((v["lead"], v["coverage"]) for v in _settings_seen.values())
+    return [[L, C] for (L, C), _n in counts.most_common(limit)]
+
+
+def _backtest_needed() -> list:
+    """The reasons a backtest should run NOW, regardless of the weekly slot.
+
+    These are exactly the three ways a product falls back to a cost-curve estimate. Each
+    used to be a resting state: the tool quietly showed the weaker answer and waited for
+    somebody to notice and press a button. A fallback is better treated as a TRIGGER — if
+    the estimate is showing because something changed, re-measure the thing that changed.
+    """
+    reasons = []
+    with _state_lock:
+        catalog = dict(_catalog)
+        measured = {k.split("|")[0] for k in _backtest_tier_cache}
+
+    # 1. Products that have crossed the testable threshold since the last run.
+    newly = []
+    for sid, e in catalog.items():
+        if sid in measured:
+            continue
+        df = e.get("df")
+        if df is None or len(df) < 2:
+            continue
+        try:
+            span = int((pd.to_datetime(df["ds"]).max() - pd.to_datetime(df["ds"]).min()).days)
+        except Exception:                                # noqa: BLE001
+            continue
+        if span >= BACKTEST_MIN_TESTABLE_DAYS:
+            newly.append(sid)
+    if newly:
+        reasons.append({"reason": "newly-testable", "skus": sorted(newly)[:20],
+                        "count": len(newly),
+                        "detail": f"{len(newly)} product(s) now have enough history to test."})
+
+    # 2. Planning settings in use that no measurement covers, even within tolerance.
+    #    The lead time is a P80 that drifts as shipments land, so this is the common one.
+    uncovered = []
+    for sid, lead, cov in _settings_in_use():
+        if sid not in measured:
+            continue
+        if _tier_lookup(sid, lead, cov)[0] is None:
+            uncovered.append({"sku": sid, "lead": lead, "coverage": cov})
+    if uncovered:
+        reasons.append({"reason": "settings-uncovered", "settings": uncovered[:20],
+                        "count": len(uncovered),
+                        "detail": (f"{len(uncovered)} product(s) are planned at a lead time or "
+                                   f"coverage the last run never measured.")})
+
+    # 3. Economics that moved beyond what a re-price can absorb.
+    drifted = []
+    for sid in measured:
+        rec = next((v for k, v in _backtest_tier_cache.items() if k.startswith(f"{sid}|")), None)
+        why = _economics_drifted(sid, (_sheet_costs.get(sid) if _sheet_costs else None),
+                                 None, (rec or {}).get("holdingPct"))
+        if why:
+            drifted.append({"sku": sid, "why": why})
+    if drifted:
+        reasons.append({"reason": "economics-drifted", "skus": drifted[:20],
+                        "count": len(drifted),
+                        "detail": f"{len(drifted)} product(s) were measured on costs that have changed."})
+    return reasons
+
+
+def _settings_in_use() -> list:
+    """(sku, lead, coverage) actually being planned with right now.
+
+    Stock, lead times and coverage live in the browser, so the server only learns them when
+    a forecast is requested. Every request records its combination here, which is what lets
+    a sync know that a lead time drifted without anyone telling it.
+    """
+    with _state_lock:
+        return [(sid, v["lead"], v["coverage"]) for sid, v in _settings_seen.items()]
+
+
+# {sku_id: {lead, coverage, at}} — the last settings each product was planned with.
+_settings_seen: dict[str, dict] = {}
+
+
+def _note_settings(sku_id, lead, coverage):
+    with _state_lock:
+        _settings_seen[str(sku_id)] = {"lead": int(lead), "coverage": int(coverage),
+                                       "at": time.time()}
+
+
+# How long to wait for the backtest before calling the day incomplete and trying again
+# later. It is the slow stage by a wide margin, and the one most likely to be interrupted.
+SYNC_BACKTEST_TIMEOUT = 20 * 60
+
+
+def _wait_for_backtest(timeout=SYNC_BACKTEST_TIMEOUT, poll=2.0) -> dict:
+    """Block until the background backtest job settles.
+
+    The sync used to return the moment the job was KICKED OFF, so "today is done" meant
+    "the fetch and refit are done and something expensive is still running". Quit the app
+    then and the backtest died with no trace: its state is in memory, its result is
+    session-scoped, and the persisted copy is fingerprinted against data that now has no
+    matching result — so it was silently discarded and nothing re-ran it. Waiting is what
+    makes the completion marker mean what it says.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        snap = _bt_job_snapshot()
+        status = snap.get("status")
+        if status == "done":
+            return {"ok": True, "status": status}
+        if status == "error":
+            return {"ok": False, "status": status, "error": snap.get("error")}
+        if status == "idle":
+            # Nothing running. Whether that is fine depends entirely on whether a run was
+            # WANTED, which only the caller knows — so report the fact and let it decide.
+            # Treating idle as success is how a night that dropped every measured tier
+            # reported itself complete.
+            return {"ok": True, "status": "idle", "note": "no backtest job was running"}
+        time.sleep(poll)
+    return {"ok": False, "status": "timeout",
+            "error": f"backtest still running after {int(timeout / 60)} minutes"}
+
+
+def _run_daily_sync(ledger=None, day=None) -> dict:
+    """Bring everything current, one stage at a time, resuming whatever is outstanding.
+
+    THREE STAGES, MARKED ONLY ON SUCCESS
+
+      fetch     pull sales + inventory from the saved connection and ingest them
+      refit     re-fit every SKU (this is what makes every tab current)
+      backtest  re-measure protection tiers against the new data
+
+    A stage with no marker is indistinguishable from one that never ran, which is what an
+    interrupted process should look like. On the next start the missing stages run and the
+    finished ones don't — and `fetch` in particular is never repeated, because re-running
+    it costs an API call against someone else's rate limit and returns the same data.
+    """
+    stages = ("fetch", "refit", "backtest")
+    day = day or today().date()
+    out = {"day": day.isoformat() if hasattr(day, "isoformat") else str(day), "stages": {}}
+
+    def done(stage):
+        """Has this stage finished — either earlier today, or a moment ago in this run?
+
+        Both halves matter. The ledger covers a resume across a restart; `out["stages"]`
+        covers the same run, because ingest refits as it loads and the refit stage below
+        must not immediately repeat it. Consulting only the ledger made the job correct
+        with one and wrong without it.
+        """
+        if out["stages"].get(stage, {}).get("ok"):
+            return True
+        return bool(ledger and ledger.stage_done(day, stage))
+
+    def mark(stage, ok, note=None):
+        out["stages"][stage] = {"ok": ok, "note": note}
+        if ledger:
+            ledger.mark_stage(day, stage, ok=ok, note=note)
+
+    saved = _CONN.list_all()
+    if not saved:
+        return {**out, "ok": False, "reason": "no-saved-connection",
+                "detail": "Nothing to sync from. Connect a store and tick Remember this account."}
+    cid = saved[0]["id"]
+    out["label"] = saved[0].get("label")
+
+    # ── 1. fetch + ingest ────────────────────────────────────────────────────
+    if done("fetch"):
+        out["stages"]["fetch"] = {"ok": True, "note": "already fetched today"}
+    else:
+        try:
+            res = upload_from_source({"connectionId": cid, "guardCatalogShrink": True})
+        except HTTPException as exc:
+            mark("fetch", False, str(exc.detail))
+            return {**out, "ok": False, "reason": "fetch-failed", "detail": str(exc.detail)}
+        except Exception as exc:              # noqa: BLE001
+            mark("fetch", False, str(exc))
+            return {**out, "ok": False, "reason": "fetch-failed", "detail": str(exc)}
+        if res.get("guardBlocked"):
+            mark("fetch", False, "refused a catalog shrink")
+            return {**out, "ok": False, "reason": "guard-catalog-shrink",
+                    "existingSkus": res.get("existingSkus"), "incomingSkus": res.get("incomingSkus"),
+                    "detail": (res.get("errors") or ["Refused a drastic catalog shrink."])[0]}
+        loaded = res.get("loadedSkus")
+        out["source"] = res.get("source")
+        out["skus"] = len(loaded) if isinstance(loaded, list) else loaded
+        out["dataQuality"] = res.get("dataQuality")
+        mark("fetch", True)
+        # _ingest already refits as part of loading, so the refit rides along with a
+        # successful fetch rather than being repeated immediately for no reason.
+        mark("refit", True, "refit as part of ingest")
+
+    # ── 2. refit (only reached when fetch was already done on an earlier attempt) ──
+    if not done("refit"):
+        try:
+            with _state_lock:
+                _rebuild(today())
+            mark("refit", True, "re-fit from the persisted catalog")
+        except Exception as exc:              # noqa: BLE001
+            mark("refit", False, str(exc))
+            return {**out, "ok": False, "reason": "refit-failed", "detail": str(exc)}
+
+    # ── 3. backtest ──────────────────────────────────────────────────────────
+    # Runs on the weekly weekday, OR whenever one of the three fallback conditions says a
+    # product is currently resting on an estimate it shouldn't be. Everything else is a
+    # deliberate skip, recorded as such — a skipped stage is NOT the same as a finished
+    # one, and this used to report "ok" whenever the job happened to be idle, which on a
+    # night that had just dropped the tiers meant declaring the day complete while every
+    # protection level was an estimate.
+    if done("backtest"):
+        out["stages"]["backtest"] = {"ok": True, "note": "already measured today"}
+    else:
+        weekday_due = day.weekday() == SYNC_BACKTEST_WEEKDAY
+        triggers = _backtest_needed()
+        out["backtestTriggers"] = triggers
+        if not weekday_due and not triggers:
+            # Nothing to re-measure. The existing tiers still stand and are simply ageing.
+            mark("backtest", True, "not due: measured tiers still current")
+            out["backtest"] = {"ok": True, "status": "skipped",
+                               "note": "weekly refresh not due and no product fell back to an estimate"}
+        else:
+            why = "weekly refresh" if weekday_due else "; ".join(t["detail"] for t in triggers)
+            started = False
+            try:
+                with _state_lock:
+                    started = _run_backtest_job(
+                        {"horizon": 44, "n_cutoffs": "auto", "step": 28, "lead": 14,
+                         "coverage": 30, "service_pct": 95, "min_train": 120,
+                         "holding_pct": _session_holding_pct,
+                         # Measure every lead/coverage actually in use, so a drifting P80
+                         # lead time lands on a measurement instead of an estimate.
+                         "combos": _combos_in_use()},
+                        _effective_sku_costs(None) or {}, "sync")
+            except Exception as exc:                     # noqa: BLE001
+                mark("backtest", False, str(exc))
+                return {**out, "ok": False, "reason": "backtest-failed", "detail": str(exc)}
+            bt = _wait_for_backtest()
+            bt["why"] = why
+            bt["startedHere"] = started
+            out["backtest"] = bt
+            if bt.get("ok"):
+                mark("backtest", True, why)
+            else:
+                # Left unmarked on purpose: an interrupted or timed-out measurement should
+                # be picked up again rather than papered over as finished.
+                mark("backtest", False, bt.get("error"))
+                return {**out, "ok": False, "reason": "backtest-incomplete",
+                        "detail": bt.get("error") or "backtest did not finish"}
+
+    # ── 4. the forecast log and the inventory reading ────────────────────────
+    try:
+        tick = livelog_tick({"connectionId": cid})
+        out["graded"] = (tick or {}).get("score", {}).get("scored")
+        out["stock"] = (tick or {}).get("stock")
+    except Exception as exc:                  # noqa: BLE001
+        out["tickError"] = str(exc)
+
+    complete = bool(ledger.mark_complete(day, stages)) if ledger else True
+    return {**out, "ok": True, "complete": complete}
+
+
+def _data_is_stale() -> bool:
+    """Is the newest sale on file older than yesterday?
+
+    This is the question the scheduler should be asking, and it is deliberately derived
+    from the DATA rather than from a remembered run time. A timestamp can be wrong in both
+    directions — it claims "synced today" after a run that fetched nothing, and "never
+    synced" after every restart — whereas the age of the newest sale is exactly what
+    anyone means by "is the tool current", and it fixes itself.
+
+    Empty catalog → not stale. There is nothing to refresh, and syncing on boot into an
+    empty app would surprise someone who just wanted to upload a spreadsheet.
+    """
+    with _state_lock:
+        if not _catalog:
+            return False
+        newest = None
+        for e in _catalog.values():
+            df = e.get("df")
+            if df is None or not len(df):
+                continue
+            try:
+                d = pd.Timestamp(df["ds"].max()).normalize()
+            except Exception:                            # noqa: BLE001
+                continue
+            if newest is None or d > newest:
+                newest = d
+    if newest is None:
+        return False
+    return data_is_stale_by(newest, today())
+
+
+def data_is_stale_by(newest, now) -> bool:
+    """Has a whole nightly sync been missed?
+
+    The training data ends at the last COMPLETE day. So a healthy catalogue is one day old
+    after the 00:15 run and TWO days old between midnight and 00:15, when yesterday has
+    finished but its sync has not happened yet. This used to say "stale" at anything over
+    one day — written when the data still ran to the day of the sync — which meant every
+    night, the moment midnight passed, the stale path pulled the sync forward to 00:00:30
+    and skipped the fifteen-minute buffer that exists so late sales land first.
+
+    Two days is expected; more than two means a sync genuinely did not happen, and then
+    running immediately rather than waiting for tonight is exactly right.
+    """
+    return (pd.Timestamp(now).normalize() - pd.Timestamp(newest).normalize()).days > 2
+
+
+_sync = _SCHED.DailySync(_run_daily_sync, is_stale=_data_is_stale,
+                         stages=("fetch", "refit", "backtest"))
+
+
+# A price change seen by the hourly reading refits that product straight away, up to this
+# many per tick. Anything beyond waits for the next tick or the nightly sync.
+LIVE_PRICE_REFITS_PER_TICK = 10
+
+
+def _sample_stock_now() -> dict:
+    """One inventory reading from the saved connection, filed in the stock log.
+
+    This is the ONLY thing in the app that observes a moment rather than computing a
+    state, and it is the input the censoring correction runs on: `hours_in_stock` per
+    product per day is reconstructed from these readings, and that is what separates
+    "sold 3 because demand was 3" from "sold 3 because it ran out before lunch".
+
+    Taken hourly. At the one-a-day cadence this replaced, the reconstruction had only two
+    possible answers — in stock all day, or out all day — so the partial-day branch of
+    censoring.py could never be reached and the correction, though fully built and
+    tested, had never once fired on real data.
+
+    Returns rather than raises on every failure path: an unattended sampler that throws
+    takes its thread down, and a dead sampler loses hours that cannot be recovered.
+    """
+    saved = _CONN.list_all()
+    if not saved:
+        # skip, not failure: nothing is broken, there is simply nothing to read from.
+        return {"ok": False, "skip": True, "reason": "no-saved-connection"}
+    # _CONN.get is the server-side view WITH secrets; list_all() is the masked one the
+    # browser gets, so the token is read here and nowhere near a response body.
+    full = _CONN.get(saved[0]["id"]) or {}
+    creds = full.get("creds") or {}
+    source = full.get("source")
+    if not creds or not source:
+        return {"ok": False, "skip": True, "reason": "credentials-unavailable"}
+    try:
+        res = _SRC.sample_stock(source, _slog, creds) or {}
+    except Exception as exc:                              # noqa: BLE001
+        return {"ok": False, "reason": "sample-failed", "detail": f"{type(exc).__name__}: {exc}"}
+
+    # SECOND moment-reading, same tick: how much has sold so far today.
+    #
+    # This is the fetch I argued against when it was proposed as "hourly orders", and the
+    # objection was right for the shape it had then — anything fetched hourly was being
+    # ingested, and a partial day in the training series teaches the models that demand
+    # collapses every morning. The objection was to the ingestion, not to the fetch. Now
+    # that the training window provably ends at the last COMPLETE day, today's figure has
+    # nowhere to leak into, and two things genuinely need it: showing the day, and keeping
+    # a counted stock level current between counts.
+    #
+    # Failure here must not fail the stock reading, which is the unrecoverable half.
+    try:
+        t = _SRC.fetch_today(source, creds) or {}
+        if t.get("day") and not t.get("unsupported"):
+            _today_sales.clear_if_closed(t["day"])
+            rec = _today_sales.record(t["day"], t.get("units") or {})
+            res["todaySales"] = {"day": rec["day"], "units": rec["units"], "skus": rec["skus"]}
+        elif t.get("unsupported"):
+            res["todaySales"] = {"unsupported": True}
+    except Exception as exc:                              # noqa: BLE001
+        res["todaySalesError"] = f"{type(exc).__name__}: {exc}"
+    # THIRD, from the same catalogue call: the price on the shelf right now. A discount
+    # switched on at 10am should not wait for tonight's sync to show up, so a product
+    # whose price facts changed is refitted now — a handful at most per tick, since each
+    # refit is a full model fit and this runs unattended.
+    try:
+        changed = _live.record(res.pop("prices", None), source)
+        if changed:
+            res["pricesChanged"] = len(changed)
+            todo = [sid for sid in changed if sid in _catalog][:LIVE_PRICE_REFITS_PER_TICK]
+            for sid in todo:
+                with _state_lock:
+                    _rebuild(today(), only=sid)
+            if todo:
+                with _state_lock:
+                    _persist_catalog()
+            res["pricesRefitted"] = len(todo)
+    except Exception as exc:                              # noqa: BLE001
+        res["livePriceError"] = f"{type(exc).__name__}: {exc}"
+    # sample_from_shopify swallows store errors into its return value rather than raising,
+    # so an empty reading is a failure even though nothing was thrown.
+    if not res.get("added") and not res.get("collapsed"):
+        return {"ok": False, "reason": "no-levels-returned", **res}
+    return {"ok": True, "source": source, "label": full.get("label"), **res}
+
+
+def _last_stock_sample_at():
+    """When a reading was last filed — looked up LAZILY, through the module global.
+
+    Binding `_slog.last_sample_at` directly would pin the sampler to whichever log object
+    existed at import time, so anything that swaps `_slog` (the reset path, and the fake
+    logs the endpoint tests install) would leave the sampler still interrogating the old
+    one and deciding "not due" against a record nobody is writing to any more. Tolerant of
+    a log that doesn't implement it: the sampler treats None as "nothing on file".
+    """
+    fn = getattr(_slog, "last_sample_at", None)
+    if not callable(fn):
+        return None
+    try:
+        return fn()
+    except Exception:                                     # noqa: BLE001
+        return None
+
+
+_sampler = _SCHED.IntervalSampler(_sample_stock_now, last_sample_at=_last_stock_sample_at)
+
+
+@app.get("/api/sync")
+def sync_status():
+    """When the nightly sync last ran, when it runs next, and what it would sync from."""
+    st = _sync.status()
+    saved = _CONN.list_all()
+    st["connection"] = saved[0] if saved else None
+    st["catalogSkus"] = len(_catalog)
+    st["syncStatePath"] = _sync.state_path
+    # The hourly reading is a separate clock with separate rules — it captures a moment,
+    # so it never catches up — and it is reported separately rather than folded in.
+    st["sampler"] = {**_sampler.status(), "coverage": _slog.coverage()}
+    # The backtest's own schedule, and why it would (or wouldn't) run next.
+    st["backtest"] = {
+        "weekday": SYNC_BACKTEST_WEEKDAY,
+        "weekdayName": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
+                        "Saturday", "Sunday"][SYNC_BACKTEST_WEEKDAY % 7],
+        "dueToday": today().weekday() == SYNC_BACKTEST_WEEKDAY,
+        "triggers": _backtest_needed(),
+        "measuredSkus": len({k.split("|")[0] for k in _backtest_tier_cache}),
+        "lastRanAt": (_last_backtest or {}).get("ranAt"),
+        "combosInUse": _combos_in_use(),
+    }
+    return st
+
+
+@app.post("/api/sync/now")
+def sync_now():
+    """Run the sync immediately.
+
+    This is also the entry point for a real cron in production — `curl -X POST
+    .../api/sync/now` from crontab gives you a sync that survives the process being
+    restarted, which an in-process thread cannot.
+    """
+    return _sync.run_now(trigger="manual")
+
+
+@app.post("/api/sync/settings")
+def sync_settings(payload: dict = Body(default={})):
+    """Body: { enabled?, at? } — `at` is 'HH:MM' in the SERVER's local timezone."""
+    return _sync.configure(at=payload.get("at"), enabled=payload.get("enabled"))
+
+
+@app.get("/api/availability")
+def availability_now():
+    """Live stock state per product, the health of both clocks, and what the censored-
+    demand correction has actually done.
+
+    One endpoint rather than three, because all three answer the same question — "is this
+    thing working while I'm not watching" — and the dashboard shows them together.
+
+    THE UPLIFT BLOCK IS THE ACCEPTANCE TEST. censoring.py has been in the codebase, fully
+    tested, unable to fire: it needs to know a product ran out PARTWAY THROUGH a day, and
+    at one stock reading a day that judgement has only two possible answers. Hourly
+    sampling is what makes the partial case reachable. `productDays` is therefore the
+    number that says whether any of it mattered. Zero after a week means either the store
+    genuinely never sells out mid-day — worth knowing — or sampling is not running, which
+    the sampler block above it will show.
+    """
+    snap = _cache()
+    now = _SL.utcnow()
+    skus, out_now, went_out, unknown = {}, 0, 0, 0
+    for sid, e in snap.items():
+        st = _slog.state_today(sid, now=now)
+        st["name"] = e.get("sku_name") or sid
+        skus[sid] = st
+        if st["state"] == "unknown":
+            unknown += 1
+        elif st["state"] == "out":
+            out_now += 1
+        if st["wentOutToday"]:
+            went_out += 1
+
+    # What the correction did, summed over the catalogue. Each entry carries its own
+    # summary from apply_to_frame; nothing is recomputed here.
+    up = {"productDays": 0, "skus": 0, "unitsAdded": 0.0, "cappedDays": 0, "excludedDays": 0}
+    for e in snap.values():
+        c = e.get("censoring") or {}
+        partial = int(c.get("partial") or 0)
+        up["productDays"] += partial
+        up["cappedDays"] += int(c.get("capped") or 0)
+        up["excludedDays"] += int(c.get("unavailable") or 0)
+        up["unitsAdded"] += float(c.get("addedUnits") or 0.0)
+        if partial:
+            up["skus"] += 1
+    up["unitsAdded"] = round(up["unitsAdded"], 1)
+
+    return {
+        "at": now.isoformat(),
+        "skus": skus,
+        "counts": {"total": len(snap), "outNow": out_now,
+                   "wentOutToday": went_out, "unsampled": unknown},
+        "sampler": {**_sampler.status(), "coverage": _slog.coverage()},
+        "sync": {"lastRunDate": _sync.last_run_date.isoformat() if _sync.last_run_date else None,
+                 "todayComplete": _sync.ledger.is_complete(today().date()),
+                 "pendingStages": _sync.ledger.pending_stages(today().date(), _sync.stages),
+                 "nextRunAt": _sync.next_run_at().isoformat() if _sync.enabled else None,
+                 "lastRunOk": (_sync.last_run or {}).get("ok")},
+        "uplift": up,
+    }
+
+
+@app.post("/api/sync/sample-now")
+def sample_now():
+    """Take one inventory reading immediately, outside the hourly cadence.
+
+    Also the cron entry point: `curl -X POST .../api/sync/sample-now` hourly from crontab
+    gives sampling that survives a process restart, which an in-process thread cannot.
+    """
+    return _sampler.sample_now(trigger="manual")
+
+
+@app.post("/api/sync/sample-settings")
+def sample_settings(payload: dict = Body(default={})):
+    """Body: { enabled?, intervalSeconds? }. Below an hour buys nothing — StockLog
+    collapses identical consecutive readings — and costs someone else's rate limit."""
+    return _sampler.configure(enabled=payload.get("enabled"),
+                              interval_seconds=payload.get("intervalSeconds"))
+
+
+@app.post("/api/upload/shopify")
+def upload_shopify(payload: dict = Body(default={})):
+    """Back-compat alias for the original Shopify-only endpoint.
+
+    Kept so a stale frontend bundle — or the curl script in the ROADMAP — keeps working
+    unchanged. New callers should use /api/upload/source.
+    """
+    body = dict(payload or {})
+    body.setdefault("source", "shopify")
+    if "creds" not in body:
+        body["creds"] = {"shop": body.get("shop"), "token": body.get("token"),
+                         "apiVersion": body.get("apiVersion")}
+    return upload_from_source(body)
 
 
 @app.post("/api/reset")
@@ -1591,6 +3123,11 @@ def reset_all(payload: dict = Body(default=None)):
                 _slog.purge(); purged["stockLog"] = True
             except Exception as e:                           # noqa: BLE001
                 purged["stockLog"] = f"failed: {e}"
+            try:
+                _live.purge(); purged["livePrices"] = True
+                _holidays.purge(); purged["holidays"] = True
+            except Exception as e:                           # noqa: BLE001
+                purged["livePrices"] = f"failed: {e}"
         warmup()
     return {"success": True, "cleared": True, "scope": scope or "catalog", "purged": purged}
 
@@ -1705,7 +3242,7 @@ def _compute_groups():
         return best
 
     def _days_hist(sid):
-        e = _sku_cache.get(sid) or {}
+        e = _cache().get(sid) or {}
         dft = e.get("df_train")
         try:
             return int((dft["ds"].max() - dft["ds"].min()).days) if dft is not None and len(dft) > 1 else 0
@@ -1713,7 +3250,7 @@ def _compute_groups():
             return None
     rows = []
     for sid, c in pool_catalog.items():
-        entry = _sku_cache.get(sid, {})
+        entry = _cache().get(sid, {})
         seas = ((entry.get("explain") or {}).get("seasonality") or {})
         g = groups.get(sid)
         bg = base_groups.get(sid)
@@ -1795,6 +3332,8 @@ def _set_attributes_locked(skus, updated):
                     merged[k] = v
                     changed = True
             _catalog[sid]["attrs"] = merged
+            _catalog[sid]["attrs_set"] = sorted(set(_catalog[sid].get("attrs_set") or [])
+                                                | {str(k) for k in (attrs or {})})
             if changed:
                 updated += 1
     regroup_error = None
@@ -1827,7 +3366,7 @@ def get_reliability_flag(fd, hd):
                                    f"({hd} days). Treat later months as directional.")
     if r < 0.75: return "ORANGE", (f"The forecast window ({fd} days) is more than 50% of your sales history "
                                    f"({hd} days). Confidence in later months is limited.")
-    return "RED", (f"The forecast window ({fd} days) approaches/exceeds your history ({hd} days). "
+    return "RED", (f"The forecast window ({fd} days) approaches or exceeds your history ({hd} days). "
                    f"These estimates are highly speculative.")
 
 
@@ -1946,19 +3485,18 @@ def recommend_protection(margin_pct, *, has_price=None, has_cost=None):
     you to the Scorecard to fix something that was never wrong."""
     if margin_pct is None:
         if has_cost and not has_price:
-            what = ("There's a unit cost on file, but no selling price in the data, so margin "
-                    "can't be worked out")
+            what = "There's a unit cost on file but no selling price in the data, so margin can't be worked out"
             fix = "Add a Price column to the sales file (or pull prices from Shopify)"
         elif has_price and not has_cost:
             what = "No unit cost on file, so protection can't be tuned to this item's economics yet"
-            fix = "Add a unit cost on the Scorecard"
+            fix = "Add a unit cost on the product page (or in the Fleet tab's Costs & fees sheet)"
         elif has_price is False and has_cost is False:
             what = "Neither a selling price nor a unit cost is available, so margin can't be worked out"
-            fix = "Add a Price column to the file and a unit cost on the Scorecard"
+            fix = "Add a Price column to the file and a unit cost on the product page"
         else:
             what = "Margin isn't known for this item yet"
-            fix = "Add a unit cost on the Scorecard (and a Price column in the data)"
-        return "standard", f"{what} — defaulting to Standard (95%). {fix} to tailor it."
+            fix = "Add a unit cost on the product page (and a Price column in the data)"
+        return "standard", f"{what}. Using Standard (95%) for now. {fix} to tailor it."
     if   margin_pct < 15: key = "light"
     elif margin_pct < 30: key = "standard"
     elif margin_pct < 50: key = "high"
@@ -1967,7 +3505,7 @@ def recommend_protection(margin_pct, *, has_price=None, has_cost=None):
     feel = "very costly" if margin_pct >= 50 else "costly" if margin_pct >= 30 else \
            "moderately costly" if margin_pct >= 15 else "cheap"
     return key, (f"This item keeps about {margin_pct:.0f}% margin, so a lost sale is {feel} to forgo. "
-                 f"{t['label']} protection ({t['pct']}%) is recommended — it weighs that stockout cost "
+                 f"{t['label']} protection ({t['pct']}%) is recommended to balance that stockout cost "
                  f"against the cost of holding extra stock.")
 
 
@@ -1990,8 +3528,13 @@ def recommend_economic_protection(*, price, unit_cost, fees, margin_pct, demand_
     if backtest_rec:
         bt_lead = backtest_rec.get("lead")
         bt_cov = backtest_rec.get("coverage")
-        lead_match = bt_lead is None or lead_time_days is None or int(bt_lead) == int(lead_time_days)
-        cov_match = bt_cov is None or int(bt_cov) == int(coverage_days)
+        # Tolerant, not exact — see TIER_LEAD_TOLERANCE. A P80 lead time that moved by a
+        # day when a shipment landed must not demote a measured tier to an estimate.
+        lead_match = _within(bt_lead, lead_time_days, TIER_LEAD_TOLERANCE)
+        cov_match = _within(bt_cov, coverage_days, TIER_COVERAGE_TOLERANCE)
+        near = bool(lead_match and cov_match
+                    and not (bt_lead is None or lead_time_days is None
+                             or int(bt_lead) == int(lead_time_days)))
         drift = _economics_drifted(sku_id, unit_cost, fees, backtest_rec.get("holdingPct"))
         if drift:
             # Measured, but on economics that no longer hold. Fall through to the
@@ -2008,16 +3551,19 @@ def recommend_economic_protection(*, price, unit_cost, fees, margin_pct, demand_
                     # catalog runs the winning single level — and the user deserves to
                     # know that's why this product isn't on its "own" tier.
                     reason = (f"Recommended from the last backtest: one shared level performed best. "
-                              f"Per-product tuning was tried and did NOT hold up when scored on unseen "
-                              f"weeks — the differences between products were mostly noise — so every "
-                              f"product runs {tier['label']} protection ({tier['pct']}%), the level that "
-                              f"won for the catalog as a whole across "
+                              f"Per-product tuning didn't hold up on unseen weeks (the differences were "
+                              f"mostly noise), so every product runs {tier['label']} protection "
+                              f"({tier['pct']}%), the catalog-wide winner across "
                               f"{int(backtest_rec.get('windows') or 0)} historical tests.")
                 else:
                     reason = (f"Recommended from the last backtest: {tier['label']} protection "
                               f"({tier['pct']}%) was the cheapest tier for this SKU, {cost_txt}, "
-                              f"across {int(backtest_rec.get('windows') or 0)} historical tests — and "
-                              f"per-product tuning beat one-level-for-everything when scored on unseen weeks.")
+                              f"across {int(backtest_rec.get('windows') or 0)} historical tests. "
+                              f"Per-product tuning beat one level for everything on unseen weeks.")
+                if near:
+                    reason += (f" Measured at a {int(bt_lead)}-day lead time rather than "
+                               f"today's {int(lead_time_days)}. That's close enough that the cheapest "
+                               f"tier is unchanged, and the buffer is still sized from today's lead.")
                 return key, reason, "backtest", backtest_rec
 
     if margin_pct is None or price in (None, "") or unit_cost in (None, ""):
@@ -2042,17 +3588,16 @@ def recommend_economic_protection(*, price, unit_cost, fees, margin_pct, demand_
             "best": "light",
         }
     if days_history < ECONOMIC_TIER_MIN_DAYS or total_sales < ECONOMIC_TIER_MIN_SALES:
-        return fallback_key, (fallback_reason + " Cost-based tuning will switch on once this "
+        return fallback_key, (fallback_reason + " Cost-based tuning switches on once this "
                               f"SKU has at least {ECONOMIC_TIER_MIN_DAYS} days and "
                               f"{ECONOMIC_TIER_MIN_SALES} sales of history."), fallback_source, None
     if demand_class in ECONOMIC_TIER_BLOCKED_DEMAND:
         return fallback_key, (fallback_reason + " Cost-based tuning is held back because this "
-                              "SKU's demand is intermittent; the margin rule is more stable than "
-                              "a thin per-item cost curve."), fallback_source, None
+                              "SKU's demand is intermittent, where the margin rule is more stable."), fallback_source, None
     spread = float(demand_spread or 0.0)
     if spread <= 0 or not np.isfinite(spread):
-        return fallback_key, (fallback_reason + " Cost-based tuning is held back because the "
-                              "lead-time demand uncertainty is not measurable yet."), fallback_source, None
+        return fallback_key, (fallback_reason + " Cost-based tuning is held back because "
+                              "lead-time demand uncertainty isn't measurable yet."), fallback_source, None
 
     cycles_per_year = 365.0 / max(int(coverage_days or 1), 1)
     rows = []
@@ -2074,9 +3619,8 @@ def recommend_economic_protection(*, price, unit_cost, fees, margin_pct, demand_
     chosen = _TIER_BY_KEY[best["key"]]
     reason = (f"Recommended from this SKU's cost curve: {chosen['label']} protection "
               f"({chosen['pct']}%) has the lowest expected annual cost, about "
-              f"${best['totalCost']:,.0f}/yr, balancing lost profit from stockouts "
-              f"against buffer holding cost. Assumes {round(holding_annual * 100)}%/yr "
-              "holding cost.")
+              f"${best['totalCost']:,.0f}/yr (lost profit from stockouts plus buffer holding "
+              f"cost). Assumes {round(holding_annual * 100)}%/yr holding cost.")
     return best["key"], reason, "economics", {
         "basis": "per-SKU expected cost",
         "holdingPct": round(holding_annual * 100),
@@ -2088,39 +3632,145 @@ def recommend_economic_protection(*, price, unit_cost, fees, margin_pct, demand_
     }
 
 
-def get_eligibility_status(days, sales, demand_class=None, selling_days=None):
+# ── Grading ──────────────────────────────────────────────────────────────────
+#
+# TWO AXES, NOT ONE LADDER.
+#
+# The old rule mixed them and produced CONFLICTING, which covered three unrelated
+# situations — intermittent demand, long history with thin sales, and strong sales with
+# short history — and so told a reader nothing without the prose beside it. It was also
+# 37% of the input space, measured across the characterization grid: not a corner case.
+#
+#   EVIDENCE       how much we know          thin  → partial → established
+#   PREDICTABILITY how knowable it is at all steady/variable/occasional/dormant
+#
+# Predictability is not a history problem: more data never makes lumpy demand smooth. It
+# therefore CAPS the grade rather than sitting on the same scale, which is what the old
+# rule was really doing when it forced intermittent products into CONFLICTING.
+#
+# EVIDENCE IS MEASURED IN DECISION HORIZONS, NOT DAYS.
+#
+# The question this tool answers is "how much do I order to cover the next lead time plus
+# coverage window" — 44 days at the defaults, which is what the backtest scores. Grading
+# that against a fixed 180 days asks a product with a 7-day lead time to clear the same
+# bar as one with a 90-day lead time, which is not the same question. Expressed as
+# multiples of the horizon the thresholds land within a rounding of the old constants at
+# the default horizon (4 x 44 = 176 vs 180; 2 x 44 = 88 vs 90) and scale correctly away
+# from it. Floors stop a very short horizon from grading anything on a fortnight of data.
+READY_HORIZONS = 4            # horizons of history before a forecast is "measured"
+USABLE_HORIZONS = 2           # ...before it is worth planning from at all
+READY_DAYS_FLOOR = 60
+USABLE_DAYS_FLOOR = 30
+DEFAULT_DECISION_HORIZON = 44  # lead 14 + coverage 30; the backtest's own horizon
+
+STATUS_READY = "FORECAST_ELIGIBLE"
+STATUS_USABLE = "LOW_CONFIDENCE"
+STATUS_NOT_READY = "INSUFFICIENT"
+
+_PREDICTABILITY = {"smooth": "steady", "erratic": "variable",
+                   "intermittent": "occasional", "lumpy": "occasional",
+                   "no_demand": "dormant"}
+
+
+def evidence_thresholds(horizon_days=None):
+    """(ready_days, usable_days) for a given decision horizon."""
+    h = int(horizon_days or DEFAULT_DECISION_HORIZON)
+    if h <= 0:
+        h = DEFAULT_DECISION_HORIZON
+    return (max(READY_HORIZONS * h, READY_DAYS_FLOOR),
+            max(USABLE_HORIZONS * h, USABLE_DAYS_FLOOR))
+
+
+def grade_forecast(days, sales, demand_class=None, selling_days=None, horizon_days=None) -> dict:
+    """The full grade: an ordinal status, a machine-readable reason, and the two axes.
+
+    `status` is ordinal and comparable — three levels, sortable, meaningful on its own.
+    `reason` is why, as a stable code the UI can render however it likes. Keeping those
+    separate is the whole point: a grade that needs a paragraph to interpret is not a grade.
+    """
+    days = int(days or 0)
+    sales = int(sales or 0)
     selling_days = int(selling_days or 0)
-    reliable_days = days >= 180
-    reliable_repeats = selling_days >= 45
-    reliable_units = sales >= 60
-    weak_days = days >= 90
-    weak_repeats = selling_days >= 15
-    weak_units = sales >= 30
-    # Intermittent/lumpy demand stays uncertain per period no matter how long the
-    # history is, so it should NOT be labeled a "reliable" forecast.
-    if demand_class in ("intermittent", "lumpy", "no_demand"):
-        if (reliable_days and reliable_repeats) or (weak_days and weak_repeats):
-            return "CONFLICTING", ("Demand is intermittent — many zero-sale days — so per-period forecasts stay "
-                                   "uncertain even with this much history. Handled by a specialist intermittent-demand "
-                                   "model; treat the figures as directional, not precise.")
-        return "INSUFFICIENT", ("Demand is intermittent and history is thin — treat this as a rough placeholder "
-                                "until more sales accumulate.")
-    if reliable_days and reliable_repeats and reliable_units:
-        return "FORECAST_ELIGIBLE", (
-            f"Enough history and repeated sales for a reliable forecast "
-            f"({days} days, {selling_days} selling days, {sales:,} units).")
-    if weak_days and weak_repeats and weak_units:
-        return "LOW_CONFIDENCE", (
-            f"Clears the minimum bar ({days} days, {selling_days} selling days), but use as a "
-            f"general guide rather than a precise plan.")
-    if reliable_days and (not reliable_repeats or not weak_units):
-        return "CONFLICTING", (
-            f"Long history ({days} days) but only {selling_days} selling days and {sales:,} units. "
-            f"This may remain a pooled or intermittent-style forecast for a long time unless sales become more regular.")
-    if reliable_units and not weak_days:
-        return "CONFLICTING", (f"Strong sales ({sales:,} units) but history is too short ({days} days) "
-                                             f"to detect seasonality. Check back in {90 - days} days.")
-    return "INSUFFICIENT", (f"Not enough data ({days} days, {sales} units). At least 90 days and 30 sales required.")
+    horizon = int(horizon_days or DEFAULT_DECISION_HORIZON)
+    ready_days, usable_days = evidence_thresholds(horizon)
+
+    predictability = _PREDICTABILITY.get(demand_class, "unknown")
+
+    # ── Axis 1: evidence ──
+    has_ready = (days >= ready_days and selling_days >= R.ESTABLISHED_SELLING_DAYS
+                 and sales >= R.ESTABLISHED_SALES)
+    has_usable = (days >= usable_days and selling_days >= R.MIN_HISTORY_SELLING_DAYS
+                  and sales >= R.MIN_HISTORY_SALES)
+
+    if has_ready:
+        status, reason = STATUS_READY, "established"
+    elif has_usable:
+        status, reason = STATUS_USABLE, "partial_history"
+    else:
+        status = STATUS_NOT_READY
+        if days < usable_days and sales < R.MIN_HISTORY_SALES and selling_days < R.MIN_HISTORY_SELLING_DAYS:
+            reason = "new_product"
+        elif days < usable_days:
+            reason = "short_history"
+        elif selling_days < R.MIN_HISTORY_SELLING_DAYS:
+            reason = "few_selling_days"
+        else:
+            reason = "low_volume"
+
+    # ── Axis 2: predictability caps the grade ──
+    # A product selling on 8 days in 90 stays uncertain per period however long you watch
+    # it, so it never reaches the top grade — but it is still worth planning from, which
+    # is exactly what the intermittent route exists to do. The old rule sent these to
+    # CONFLICTING, a label that reads as a fault rather than as a property of the demand.
+    if predictability in ("occasional", "dormant") and status in (STATUS_READY, STATUS_USABLE):
+        status = STATUS_USABLE
+        reason = "dormant" if predictability == "dormant" else "intermittent_demand"
+
+    return {"status": status, "reason": reason, "predictability": predictability,
+            "days": days, "sellingDays": selling_days, "units": sales,
+            "decisionHorizonDays": horizon,
+            "readyAtDays": ready_days, "usableAtDays": usable_days,
+            "message": _grade_message(status, reason, days, selling_days, sales,
+                                      horizon, ready_days, usable_days)}
+
+
+def _grade_message(status, reason, days, selling_days, sales, horizon, ready_days, usable_days):
+    """Prose for one (status, reason). Every branch names the horizon it is grading for,
+    because "not enough history" is meaningless without saying enough for what."""
+    if reason == "established":
+        return (f"Measured forecast for the next {horizon} days "
+                f"({days} days of history, {selling_days} selling days, {sales:,} units).")
+    if reason == "intermittent_demand":
+        return ("Sells in occasional bursts, so the intermittent-demand model handles it and a "
+                "per-period figure stays uncertain however long the history. Good for deciding "
+                f"cover over {horizon} days, not for a precise weekly number.")
+    if reason == "dormant":
+        return "No recent sales. Nothing to plan from until it starts selling again."
+    if reason == "partial_history":
+        return (f"Enough to plan the next {horizon} days, but treat it as directional: "
+                f"{days} days of history against {ready_days} for a measured forecast.")
+    if reason == "short_history":
+        return (f"{days} days of history; {usable_days} needed to plan {horizon} days ahead. "
+                f"About {max(usable_days - days, 0)} more days of selling.")
+    if reason == "few_selling_days":
+        return (f"Long enough history ({days} days) but only {selling_days} days with a sale. "
+                f"It needs {R.MIN_HISTORY_SELLING_DAYS} to tell a pattern from a few one-off sales "
+                f"before planning {horizon} days ahead.")
+    if reason == "low_volume":
+        return (f"Only {sales:,} units across {days} days, below the {R.MIN_HISTORY_SALES} needed "
+                f"before the numbers mean much over a {horizon}-day window.")
+    return (f"Not enough data yet ({days} days, {sales:,} units). Needs about {usable_days} days "
+            f"and {R.MIN_HISTORY_SALES} units to plan {horizon} days ahead.")
+
+
+def get_eligibility_status(days, sales, demand_class=None, selling_days=None, horizon_days=None):
+    """(status, message) — the two-value form the forecast payload has always returned.
+
+    Kept as the narrow interface so callers that only want a label and a sentence do not
+    have to care about the rest; `grade_forecast` is the full picture.
+    """
+    g = grade_forecast(days, sales, demand_class, selling_days, horizon_days)
+    return g["status"], g["message"]
 
 
 def get_price_change_warning(entry, events):
@@ -2140,7 +3790,7 @@ def get_price_change_warning(entry, events):
     if round(npx, 2) in obs: return None, None
     if tmin is not None and tmax is not None:
         if npx < tmin or npx > tmax:
-            return "warning", f"${npx:.2f} is outside observed prices (${tmin:.2f}–${tmax:.2f})."
+            return "warning", f"${npx:.2f} is outside observed prices (${tmin:.2f} to ${tmax:.2f})."
         return "info", f"${npx:.2f} wasn't directly observed; demand is estimated from the learned price relationship."
     return None, None
 
@@ -2156,24 +3806,57 @@ GUARDRAIL_COVER_DAYS = 42   # suggested first-order cap: ~6 weeks of cover
 
 
 @app.get("/api/forecast")
-def get_forecast(sku_id: str = Query(...), stock: int = Query(default=500, ge=0),
+# stock defaults to 0, NOT 500. An unknown stock level is not "probably 500" — that
+# default read as hundreds of days of cover on a slow mover and reported the whole
+# catalogue as overstocked. Unknown is 0-with-a-flag everywhere else; this was the
+# last place still disagreeing.
+def get_forecast(sku_id: str = Query(...), stock: int = Query(default=ASSUMED_STOCK, ge=0),
                  lead_time_days: int = Query(default=14, ge=1), coverage_days: int = Query(default=30, ge=1),
                  strategy: str = Query(default="balanced"), forecast_months: int = Query(default=1, ge=1, le=12),
                  units_on_order: int = Query(default=0, ge=0),
                  on_order_eta_days: int | None = Query(default=None, ge=0),
                  unit_cost: float | None = Query(default=None), fees: float = Query(default=0.0, ge=0),
-                 protection: str | None = Query(default=None), tz: str | None = Query(default=None)):
+                 protection: str | None = Query(default=None), tz: str | None = Query(default=None),
+                 stock_source: str | None = Query(default=None),
+                 stock_counted_at: str | None = Query(default=None)):
     set_timezone(tz)   # keep "today" aligned to the user's local date
-    if sku_id not in _sku_cache:
+    # One snapshot for the whole request. Reading _sku_cache twice here meant the
+    # membership test and the lookup could hit two different catalogues, so a delete
+    # landing between them raised KeyError instead of returning the 404 just above.
+    _snap = _cache()
+    if sku_id not in _snap:
         raise HTTPException(404, f"SKU '{sku_id}' not found.")
-    e = _sku_cache[sku_id]
+    e = _snap[sku_id]
     df_train, forecast, future_fc = e["df_train"], e["forecast"], e["future_fc"]
     events = e.get("events", [])
     if df_train is None or forecast is None or future_fc is None:
         raise HTTPException(503, "Model is not ready yet.")
-    # Did the upload actually carry a stock column? If not, the stock figure (and
-    # therefore the stockout/reorder math) is an assumed default, not real data.
-    stock_data_available = "units_in_stock" in df_train.columns
+    # WHERE THE STOCK NUMBER CAME FROM.
+    #
+    # This used to be `"units_in_stock" in df_train.columns` — a test that can only ever
+    # be true for a spreadsheet upload. A live source carries inventory ALONGSIDE the
+    # sales, never inside them, so every Square-connected product reported "assumed" even
+    # when Square had handed us a real count. Provenance is not a property of the training
+    # frame; it belongs to the figure being used, so it is resolved here in that order:
+    #
+    #   1. what the caller says it is  (the browser knows: typed, live, or from a sheet)
+    #   2. a units_in_stock column     (a spreadsheet that carried one)
+    #   3. a StockLog reading          (the hourly sampler saw this product on a shelf)
+    #   4. unknown                     (nobody has ever counted it)
+    # Same rule as the scorecard: an explicit "unknown" from the caller is the absence of
+    # an answer, not a negative one, so the evidence below still gets its turn.
+    _src = (stock_source or "").strip().lower() or None
+    if _src in (None, "unknown", "none", "null"):
+        if "units_in_stock" in df_train.columns:
+            _src = "sheet"
+        elif _slog.latest(str(sku_id)) is not None:
+            _src = "live"
+        else:
+            _src = "unknown"
+    stock_counted = _src in ("manual", "live", "sheet")
+    # Kept under its old name for any client that still reads it; it now means what its
+    # name always claimed rather than "the upload had a column".
+    stock_data_available = stock_counted
 
     # ── One confidence level for every product ───────────────────────────────
     # The band used to move with demand volatility: steady products were shown a 70%
@@ -2205,9 +3888,9 @@ def get_forecast(sku_id: str = Query(...), stock: int = Query(default=500, ge=0)
     inactive = inactive_days > INACTIVE_DAYS
     inactive_msg = (
         f"No sales in {inactive_days:,} days (last sold {pd.Timestamp(last_actual):%b %Y}). This product "
-        f"appears discontinued or has been out of stock long-term, so the forward forecast has been set "
-        f"to 0 — its old sales pattern is years stale and not a reliable signal for today. If it's actually "
-        f"still active, upload recent sales/stock and the forecast will pick back up."
+        f"looks discontinued or out of stock long-term, so its forecast is set to 0; the old sales pattern "
+        f"is too stale to trust. If it's still active, upload recent sales and stock and the forecast "
+        f"will pick back up."
     ) if inactive else None
 
     # Discontinued/dormant items: replaying the ancient seasonal pattern forward yields a
@@ -2225,8 +3908,28 @@ def get_forecast(sku_id: str = Query(...), stock: int = Query(default=500, ge=0)
     days_hist = (df_train["ds"].max() - df_train["ds"].min()).days
     total_sales = int(df_train["y"].sum())
     selling_days = int((df_train["y"] > 0).sum())
-    status, status_msg = get_eligibility_status(days_hist, total_sales, e.get("demand_class"), selling_days)
-    tot_fc_days = forecast_months * 31
+    # The decision this forecast serves is "cover the next lead time plus coverage window",
+    # so that is what the grade is graded against — not an abstract notion of forecast
+    # quality. A 7-day lead time and a 90-day one are not the same question and should not
+    # clear the same bar.
+    _note_settings(sku_id, lead_time_days, coverage_days)
+    decision_horizon = int(lead_time_days or 14) + int(coverage_days or 30)
+    grade = grade_forecast(days_hist, total_sales, e.get("demand_class"),
+                           selling_days, decision_horizon)
+    status, status_msg = grade["status"], grade["message"]
+
+    # ── Cap the projection at what the history supports ──────────────────────
+    # forecast_months accepted 1-12 with no relation to how much data existed, and exports
+    # always asked for 3. Projecting 93 days from 133 days of history is extrapolating most
+    # of the sample; from 40 days it is mostly invention. The rule: you may look forward as
+    # far as you have looked back, but never less than one decision horizon — otherwise a
+    # young product could not be planned at all, which is the opposite of the point.
+    requested_fc_days = forecast_months * 31
+    tot_fc_days = max(decision_horizon, min(requested_fc_days, max(days_hist, 1)))
+    horizon_capped = tot_fc_days < requested_fc_days
+    if horizon_capped:
+        forecast_months = max(1, math.ceil(tot_fc_days / 31))
+        tot_fc_days = min(tot_fc_days, forecast_months * 31)
     rel_color, rel_msg = get_reliability_flag(tot_fc_days, days_hist)
     pc_level, pc_msg = get_price_change_warning(e, events)
 
@@ -2247,10 +3950,9 @@ def get_forecast(sku_id: str = Query(...), stock: int = Query(default=500, ge=0)
         _osd = today() + pd.Timedelta(days=obs_runway)
         obs_stockout_ts = int(pd.Timestamp(_osd).replace(tzinfo=datetime.timezone.utc).timestamp() * 1000)
     too_new_msg = (
-        f"Establishing baseline — {own_days} of {BASELINE_DAYS} days of sales. A product needs about a "
-        f"week of its own history before a forecast means anything, so we're holding off rather than "
-        f"guessing from a few days (or from other products that may sell at a different volume). "
-        f"Inventory is still tracked below, and the forecast turns on automatically once a week of data is in."
+        f"Establishing baseline: {own_days} of {BASELINE_DAYS} days of sales. A forecast needs about a "
+        f"week of this product's own history, so it's on hold rather than guessing. Inventory is still "
+        f"tracked below, and the forecast turns on automatically once a week of data is in."
     ) if too_new else None
 
     # Young-product tier: between the baseline week and ~a month of history the forecast IS
@@ -2262,9 +3964,9 @@ def get_forecast(sku_id: str = Query(...), stock: int = Query(default=500, ge=0)
     YOUNG_DAYS = 28
     young = (not inactive) and (not too_new) and own_days < YOUNG_DAYS
     young_msg = (
-        f"Young product — {own_days} of {YOUNG_DAYS} days of history. The forecast is live but still "
-        f"provisional: it's built on only a few weeks of sales, so reorder timing is a heads-up rather "
-        f"than a hard deadline, and the recommended order is kept conservative until more history builds."
+        f"Young product: {own_days} of {YOUNG_DAYS} days of history. The forecast is live but provisional, "
+        f"built on only a few weeks of sales. Reorder timing is a heads-up, not a hard deadline, and the "
+        f"recommended order stays conservative until more history builds."
     ) if young else None
     # A young product's band used to be stretched 1.4x here. Removed deliberately: every
     # band on every product is now the model's own FORECAST_BAND_PCT interval, unadjusted,
@@ -2343,7 +4045,9 @@ def get_forecast(sku_id: str = Query(...), stock: int = Query(default=500, ge=0)
 
     # Protection level: recommend from the item's economics when supported, otherwise
     # fall back to the margin/default heuristic. Manual override still wins.
-    price = e.get("effective_price") or e.get("last_price")
+    # Margin, and the protection tier chosen from it, on the REGULAR price: a sale this
+    # week is not a reason to protect a product less for the next three months.
+    price = e.get("regular_price") or e.get("effective_price") or e.get("last_price")
     margin_pct = None
     if price and unit_cost not in (None, "") and float(price) > 0:
         margin_pct = (float(price) - float(unit_cost) - float(fees)) / float(price) * 100.0
@@ -2355,6 +4059,26 @@ def get_forecast(sku_id: str = Query(...), stock: int = Query(default=500, ge=0)
     # WIDEN-ONLY: clumping needs more buffer (use the measurement), but a calm 45-day
     # holdout under-measuring error must never THIN the buffer below the √lead formula.
     _basis = _base if _lw is None else min(max(_lw, _base), 3 * _base)
+    # A scheduled price outside what this product has sold at is an extrapolation, and
+    # its effect is uncertain in proportion to how far out it is. Add that uncertainty,
+    # over the window this order has to cover, in quadrature — so an order for a deep
+    # discount leans toward the upside instead of betting on one straight line.
+    # An effect that's off is off on EVERY day it applies: a price response 20% too weak
+    # is 20% too weak all week. So each effect's uncertainty adds up day by day rather than
+    # averaging out. Price effects share one response, so they add up together; separate
+    # holidays are learned separately, so those combine as independent errors.
+    _x_extra = 0.0
+    _win = fc_fwd.head(decision_horizon)
+    _sx = float(pd.to_numeric(_win["x_sd"], errors="coerce").fillna(0.0).sum()) if "x_sd" in _win.columns else 0.0
+    _sh2 = 0.0
+    if "h_sd" in _win.columns:
+        _hs = pd.to_numeric(_win["h_sd"], errors="coerce").fillna(0.0)
+        _hk = _win["holiday"] if "holiday" in _win.columns else pd.Series([None] * len(_win), index=_win.index)
+        for _k in {k for k in _hk.tolist() if k}:
+            _sh2 += float(_hs[_hk == _k].sum()) ** 2
+    _x_extra = float(np.sqrt(_sx ** 2 + _sh2))
+    if _x_extra > 0:
+        _basis = float(np.sqrt(_basis ** 2 + _x_extra ** 2))
     rec_key, rec_reason, rec_source, rec_economics = recommend_economic_protection(
         price=price, unit_cost=unit_cost, fees=fees, margin_pct=margin_pct,
         demand_spread=_basis, coverage_days=coverage_days,
@@ -2364,7 +4088,7 @@ def get_forecast(sku_id: str = Query(...), stock: int = Query(default=500, ge=0)
         # entered, so a product falling back to the cost curve was priced on an assumption
         # the rest of the app had already replaced.
         holding_annual=max(0.0, _session_holding_pct / 100.0),
-        backtest_rec=_backtest_tier_cache.get(_tier_cache_key(str(sku_id), lead_time_days, coverage_days)),
+        backtest_rec=_tier_lookup(str(sku_id), lead_time_days, coverage_days)[0],
     )
     chosen_key = protection if protection in _TIER_BY_KEY else rec_key
     tier = _TIER_BY_KEY[chosen_key]
@@ -2376,8 +4100,10 @@ def get_forecast(sku_id: str = Query(...), stock: int = Query(default=500, ge=0)
     # answer, not a placeholder — but if a backtest is mid-flight the number is about to
     # change, and showing it as settled invites a decision the user would then revisit.
     _job = _bt_job_snapshot()
-    _bt_cached = _backtest_tier_cache.get(_tier_cache_key(str(sku_id), lead_time_days, coverage_days)) \
-        or next((v for k, v in _backtest_tier_cache.items() if k.startswith(f"{sku_id}|")), None)
+    _bt_cached, _bt_match = _tier_lookup(str(sku_id), lead_time_days, coverage_days)
+    if _bt_cached is None:
+        _bt_cached = next((v for k, v in _backtest_tier_cache.items()
+                           if k.startswith(f"{sku_id}|")), None)
     if _job.get("status") == "running" and rec_source != "backtest":
         _status = "calculating"
     elif rec_source == "backtest":
@@ -2463,14 +4189,14 @@ def get_forecast(sku_id: str = Query(...), stock: int = Query(default=500, ge=0)
         exceeded = cap < order_qty
         wks = GUARDRAIL_COVER_DAYS // 7
         if exceeded:
-            reason = (f"Only {days_hist} days of sales history — this forecast is still "
+            reason = (f"Only {days_hist} days of sales history, so this forecast is still "
                       f"speculative. The recommended {order_qty:,} exceeds ~{wks} weeks of cover; "
                       f"consider capping the first order near {cap:,} units and reordering once "
                       f"more sales come in.")
         else:
-            reason = (f"Only {days_hist} days of sales history — treat this as provisional. The "
-                      f"recommended {order_qty:,} is within ~{wks} weeks of cover, so it's a "
-                      f"reasonable first order; just plan to reorder as more sales land.")
+            reason = (f"Only {days_hist} days of sales history, so treat this as provisional. The "
+                      f"recommended {order_qty:,} is within ~{wks} weeks of cover, a reasonable "
+                      f"first order; plan to reorder as more sales land.")
         order_guardrail = {
             "active": True, "capExceeded": exceeded, "suggestedCap": cap,
             "coverDays": GUARDRAIL_COVER_DAYS, "rawOrderQty": order_qty,
@@ -2517,20 +4243,18 @@ def get_forecast(sku_id: str = Query(...), stock: int = Query(default=500, ge=0)
             "forecastRate": round(_fc_rate, 2), "recentRate": round(_recent, 2),
             "shortfallPct": round((1 - _fc_rate / _recent) * 100),
             "sellingDayShare": round(_sell_share * 100),
-            "message": (f"The forecast averages {_fc_rate:.2f}/day, but this product has actually been "
-                        f"selling {_recent:.2f}/day over the last "
-                        f"{'90' if _r90 >= _r180 else '180'} days — about "
-                        f"{round((1 - _fc_rate / _recent) * 100)}% lower. Sparse-demand models lower their "
-                        f"estimate during stretches of zero-sale days, which can undershoot a product that "
-                        f"is still selling regularly. Treat the order suggestion as a floor and check the "
-                        f"backtest before trusting a cut this size."),
+            "message": (f"The forecast averages {_fc_rate:.2f}/day, about "
+                        f"{round((1 - _fc_rate / _recent) * 100)}% below the {_recent:.2f}/day this "
+                        f"product sold over the last {'90' if _r90 >= _r180 else '180'} days. Sparse-demand "
+                        f"models lower their estimate during runs of zero-sale days, so treat the order "
+                        f"suggestion as a floor and check the backtest before trusting a cut this size."),
         }
     _sparse_sub = sparse_subtype(_y, e.get("demand_class"))
     # One plain sentence describing how this product actually sells, so the UI never has
     # to render "0 per day" as though that were the story.
     if _sparse_sub == "low_volume_regular":
         _demand_story = (f"Slow but regular: sells on about {round(_sell_share * 100)}% of days, "
-                         f"roughly {_fc_rate:.1f} a day — call it {round(_fc_rate * 30)} a month. "
+                         f"roughly {_fc_rate:.1f} a day (about {round(_fc_rate * 30)} a month). "
                          f"Plenty of zero-sale days is normal for this product, not a warning sign.")
     elif _sparse_sub == "true_intermittent":
         _demand_story = (f"Sporadic: sells on about {round(_sell_share * 100)}% of days, often with long "
@@ -2540,9 +4264,24 @@ def get_forecast(sku_id: str = Query(...), stock: int = Query(default=500, ge=0)
         _demand_story = (f"Low volume: about {_fc_rate:.1f} a day, roughly {round(_fc_rate * 30)} a month.")
     else:
         _demand_story = None
+    # What has sold since the shelf was counted, and therefore what is on it now. Only
+    # meaningful for a figure someone actually counted — decrementing an assumed 50 would
+    # be compounding one invention with another.
+    _since_count = units_sold_since(str(sku_id), stock_counted_at, df_train) if stock_counted else None
+    _derived_stock = (max(0, int(round(stock - _since_count["total"])))
+                      if (_since_count and _since_count.get("since")) else None)
+
     hist = [{"x": int(r["ds"].timestamp() * 1000), "y": int(r["y"])} for _, r in df_train.iterrows()]
     fut_line, fut_rng = [], []
+    _fc_from = today().normalize()
     for _, r in future_fc.iterrows():
+        # BOTH ends. The upper bound has always been here; the lower one had not, so a
+        # product whose data stopped weeks ago emitted weeks of "forecast" dated in the
+        # PAST — the curve began the day after the last training row while every headline
+        # number (stockout date, reorder date) was measured from today, and the two
+        # silently disagreed. Zero-filling to the window end fixes the usual cause; this
+        # makes the chart correct even when a series legitimately ends early.
+        if r["ds"] < _fc_from: continue
         if r["ds"] > today() + pd.Timedelta(days=tot_fc_days + 60): continue
         ms_ = int(r["ds"].timestamp() * 1000)
         # Do NOT round to whole units. A slow seller forecast at 0.4/day rounds to 0
@@ -2559,6 +4298,16 @@ def get_forecast(sku_id: str = Query(...), stock: int = Query(default=500, ge=0)
     return {
         "skuId": sku_id, "skuName": e["sku_name"], "mode": e["mode"], "filename": e["filename"],
         "status": status, "statusMessage": status_msg,
+        # The grade's two axes and its cause, separately addressable. `status` alone is
+        # ordinal and comparable; `statusReason` says why without the UI parsing prose.
+        "statusReason": grade["reason"], "predictability": grade["predictability"],
+        "decisionHorizonDays": grade["decisionHorizonDays"],
+        "readyAtDays": grade["readyAtDays"], "usableAtDays": grade["usableAtDays"],
+        # What the projection was actually allowed to cover, and whether that is shorter
+        # than what was asked for — so the chart can say "3 months requested, 133 supported"
+        # rather than silently drawing an extrapolation.
+        "forecastDays": int(tot_fc_days), "forecastMonths": int(forecast_months),
+        "horizonCapped": bool(horizon_capped), "requestedForecastDays": int(requested_fc_days),
         "inactive": inactive, "inactiveMessage": inactive_msg, "inactiveDays": inactive_days,
         "tooNew": too_new, "tooNewMessage": too_new_msg, "ownDays": own_days, "baselineDays": BASELINE_DAYS,
         "observedDailyRate": round(obs_rate, 2), "observedRunwayDays": obs_runway,
@@ -2575,6 +4324,20 @@ def get_forecast(sku_id: str = Query(...), stock: int = Query(default=500, ge=0)
         "hasPrice": e["has_price"], "hasPromotion": e["has_promo"], "priceVaried": e["price_varied"],
         "priceWellSampled": e["price_well_sampled"], "lastPrice": e["last_price"],
         "priceModeled": e.get("price_modeled", False), "currentPrice": e.get("effective_price"),
+        "listPrice": e.get("regular_price"),
+        "priceDiscounted": bool((e.get("live_price") or {}).get("discounted")),
+        "livePrice": e.get("live_price"), "posEvents": e.get("pos_events") or [],
+        "priceUsable": e.get("price_usable", False), "priceMixedDays": e.get("price_mixed_days", 0),
+        "priceLevelMinDays": 30, "lastRecordedDate": e.get("last_recorded_date"),
+        "priceResponse": e.get("price_response"),
+        # Extra safety stock (units, before the protection z) for extrapolated price days.
+        "priceExtrapolationSpread": round(_x_extra, 1),
+        # The same, split: how unsure the price effects and the holiday lifts are over the
+        # lead time plus coverage (units, before the protection z). Grows with how deep a
+        # discount goes past known prices and how few years a holiday was learned from.
+        "effectBuffer": {"price": round(_sx, 1), "holiday": round(float(np.sqrt(_sh2)), 1),
+                         "total": round(_x_extra, 1)},
+        "holidays": e.get("holidays"),
         "priceTiers": e.get("price_tiers", []), "priceTrainedMin": e.get("price_trained_min"),
         "priceTrainedMax": e.get("price_trained_max"), "priceSafeMin": e.get("price_safe_min"),
         "priceSafeMax": e.get("price_safe_max"), "priceGapWarning": e.get("price_gap_warning"),
@@ -2585,22 +4348,45 @@ def get_forecast(sku_id: str = Query(...), stock: int = Query(default=500, ge=0)
         "route": e.get("route"), "routeReason": e.get("route_reason"), "forecastDetails": e.get("explain"),
         "clusterInfo": e.get("cluster_info"), "groupInfo": e.get("group_info"),
         "protection": protection_info, "stockDataAvailable": stock_data_available,
+        "stockSource": _src, "stockCounted": stock_counted, "stockUsed": int(stock),
+        "assumedStock": (None if stock_counted else ASSUMED_STOCK),
+        # A COUNT PLUS WHAT HAS SOLD SINCE. A shelf someone counted on Monday is not
+        # Monday's number on Thursday, and the tool knows exactly what left in between —
+        # closed days from the catalogue, today from the hourly side channel. Reported
+        # rather than silently applied: the caller sees the count, the drawdown and the
+        # derived level, so a number that moved can always be explained.
+        "sinceCount": _since_count,
+        "derivedStock": _derived_stock,
+        "todaySales": {**_today_sales.status(today().strftime("%Y-%m-%d")),
+                       "units": float(_today_sales.units_for(str(sku_id),
+                                                             today().strftime("%Y-%m-%d")))},
         # How old the newest sale on file is. Nothing re-imports on a schedule, so the
         # page can sit open for days looking live while the demand under it does not
         # move. Every date on screen advances; the data does not. The UI says so.
         "lastSalesDate": pd.Timestamp(last_actual).strftime("%Y-%m-%d"),
         "dataAgeDays": max(int((today().normalize() - pd.Timestamp(last_actual).normalize()).days), 0),
         "avgDailyDemand": float(round(add, 1)), "safetyStock": safety, "coverageQty": cov_qty,
-        "targetInventory": target, "orderQty": order_qty, "orderGuardrail": order_guardrail,
+        "targetInventory": target,
+        # Order quantity is target minus stock-at-delivery — the same fiction if the stock
+        # half was invented. Suppressed rather than guessed.
+        "orderQty": (order_qty if stock_counted else 0), "orderGuardrail": order_guardrail,
         "projectedStockReorder": psr,
         "stockAtDelivery": stock_del, "salesBeforeReorder": sbr,
-        "stockoutTimestamp": so_ts, "reorderTimestamp": ro_ts,
+        "stockoutTimestamp": (so_ts if stock_counted else None),
+        "reorderTimestamp": (ro_ts if stock_counted else None),
         # A stockout date in the PAST (d_so < 0) means the item is already out — surface
         # that as 0 days ("out now"), never a negative countdown. `alreadyOut` lets the UI /
         # exports say "Out of stock" instead of showing a bare 0.
-        "daysUntilStockout": (max(int(d_so), 0) if so_ts is not None else None),
-        "alreadyOut": bool(so_ts is not None and int(d_so) < 0),
-        "daysUntilReorder": (d_ro if ro_ts is not None else None),
+        #
+        # ALL THREE ARE NULL WHEN NOBODY HAS COUNTED THE STOCK. Every one of them is a
+        # subtraction from the stock figure, so with an assumed figure they are arithmetic
+        # on a number we invented. That is exactly how a product nobody had counted, and
+        # which had not sold in two months, came to display "Overdue 13d — order 0": the
+        # assumed level was read as a real position and the countdown ran from it. A
+        # missing countdown is honest; a confident wrong one costs someone an order.
+        "daysUntilStockout": (max(int(d_so), 0) if (stock_counted and so_ts is not None) else None),
+        "alreadyOut": bool(stock_counted and so_ts is not None and int(d_so) < 0),
+        "daysUntilReorder": (d_ro if (stock_counted and ro_ts is not None) else None),
         "currentMonth": {"unitsSoFar": usf, "forecastRemaining": round(fcr), "lastMonthTotal": lmt},
         "monthCards": cards, "monthlySummary": monthly,
         "chartDataHistory": hist, "chartDataFuture": fut_line, "chartDataRange": fut_rng, "upcomingPromos": promos,
@@ -2620,25 +4406,27 @@ SELLTHROUGH_NEUTRAL = 0.30; HEALTH_HEALTHY = 70; HEALTH_ATTENTION = 40
 SELLTHROUGH_LOW = 0.15    # below → too slow (overstock / slow mover)
 SELLTHROUGH_HIGH = 0.55   # above → too fast (likely under-stocked)
 SC_PROVISIONAL_DAYS = 90  # under this much history a SKU is "still establishing"
+
 MARGIN_TIER_A = 40.0; MARGIN_TIER_B = 20.0; TRAILING_DAYS_DEFAULT = 30
-STATUS_RANK = {"Stockout risk": 0, "Dead stock": 1, "Overstocked": 2, "Reorder due": 3, "Healthy": 4}
+# Ordering for "needs attention". "Stock not counted" sits just below a real stockout:
+# it is genuinely actionable (go and count it) and it blocks every other verdict, so it
+# should not be buried under products whose position we actually know.
+STATUS_RANK = {"Stockout risk": 0, "Stock not counted": 1, "Dead stock": 2,
+               "Overstocked": 3, "Reorder due": 4, "Healthy": 5}
 
 
-def sc_effective_price_today(entry, events):
-    price = entry.get("last_price")
-    if price is None: return None
-    perm = [e for e in events if e.get("type") == "price_change_permanent" and e.get("new_price") is not None
-            and pd.to_datetime(e["date"]) <= today()]
-    if perm:
-        perm.sort(key=lambda e: pd.to_datetime(e["date"])); price = float(perm[-1]["new_price"])
-    for e in events:
-        if e.get("type") == "price_change_temporary" and e.get("new_price") is not None:
-            s = pd.to_datetime(e["date"]); en = pd.to_datetime(e.get("end_date", e["date"]))
-            if s <= today() <= en: price = float(e["new_price"])
-    return float(price)
+def sc_effective_price_today(entry, events=None):
+    """The REGULAR price: the POS's listed price when it reports one, else the last price
+    recorded in sales. Logged events never rewrite it — see _effective_price."""
+    lp = (entry.get("live_price") or {}).get("listPrice")
+    return float(lp) if lp else _effective_price(entry.get("last_price"))
 
 
 def sc_on_promo_today(entry, events):
+    # A discount the POS says is on right now outranks everything else: it is observed.
+    lv = entry.get("live_price") or {}
+    if lv.get("discounted"):
+        return True, lv.get("discountPct")
     for e in events:
         if e.get("type") == "promotion":
             s = pd.to_datetime(e["date"]); en = pd.to_datetime(e.get("end_date", e["date"]))
@@ -2656,7 +4444,18 @@ def sc_baseline_future_fc(entry, regular_price):
     if eng is None: return entry.get("future_fc")
     try:
         fc = eng.predict_baseline(regular_price)
-        return fc[fc["ds"] > today()].copy().reset_index(drop=True)
+        fc = fc[fc["ds"] > today()].copy().reset_index(drop=True)
+        # Holidays aren't promotions: the regular-price view still has Black Friday in it.
+        ff = entry.get("future_fc")
+        if ff is not None and "h_mult" in ff.columns and len(fc):
+            hm = ff[["ds", "h_mult"]].drop_duplicates("ds")
+            fc = fc.merge(hm, on="ds", how="left")
+            m = pd.to_numeric(fc["h_mult"], errors="coerce").fillna(1.0)
+            for c in ("yhat", "yhat_lower", "yhat_upper"):
+                if c in fc.columns:
+                    fc[c] = fc[c] * m
+            fc = fc.drop(columns=["h_mult"])
+        return fc
     except Exception as ex:
         print(f"[scorecard] baseline failed: {ex}"); return entry.get("future_fc")
 
@@ -2781,7 +4580,54 @@ def sc_bands(lt):
     return max(1, round(lt / 2)), max(2, round(lt * 1.5))
 
 
-def sc_status(c, dur, st, lt, cov, po, is_new=False):
+def units_sold_since(sku_id: str, counted_at, df_train=None) -> dict:
+    """Units sold since a stock count was taken, so a count can stay true after it.
+
+    A counted shelf is accurate for exactly as long as nobody buys anything. Without this
+    a manual count is right the moment it is entered and drifts every hour afterwards,
+    which on a fast line makes it wrong by the afternoon — and the whole reason someone
+    counted was to stop guessing.
+
+    Two sources, because one day is not like the others:
+
+      closed days  come from the catalogue, which is authoritative and complete for every
+                   day that has finished.
+      today        comes from today_sales, the hourly side channel, because the catalogue
+                   deliberately does not carry the day in progress.
+
+    They cannot overlap: the catalogue stops at the last complete day and today_sales only
+    ever holds the current one. That is enforced at both ends rather than assumed here.
+
+    `counted_at` is a date or timestamp. A count taken mid-day cannot be attributed to an
+    hour — the catalogue's resolution is a day — so the day of the count is deliberately
+    EXCLUDED from the closed-day sum. Counting the whole of that day would subtract sales
+    that happened before the person counted, understating the shelf. Today's own figure is
+    included only when the count was taken before today.
+    """
+    out = {"closedDays": 0.0, "today": 0.0, "total": 0.0, "since": None,
+           "todayIncluded": False}
+    if counted_at is None:
+        return out
+    try:
+        cd = pd.to_datetime(counted_at).normalize()
+    except (ValueError, TypeError):
+        return out
+    out["since"] = cd.strftime("%Y-%m-%d")
+
+    if df_train is not None and len(df_train):
+        after = df_train[df_train["ds"] > cd]
+        out["closedDays"] = float(after["y"].clip(lower=0).sum()) if len(after) else 0.0
+
+    _today_key = today().strftime("%Y-%m-%d")
+    if cd < today().normalize():
+        out["today"] = float(_today_sales.units_for(str(sku_id), _today_key))
+        out["todayIncluded"] = True
+    out["total"] = round(out["closedDays"] + out["today"], 2)
+    return out
+
+
+def sc_status(c, dur, st, lt, cov, po, is_new=False, dormant=False, stock_counted=True,
+              ever_sold=True):
     """The ONE status definition. The fleet card renders these verbatim rather than
     classifying again, so the two tabs cannot disagree about a product.
 
@@ -2790,7 +4636,41 @@ def sc_status(c, dur, st, lt, cov, po, is_new=False):
     line with a 90-day coverage target is healthy at 70 days of stock; one with a
     14-day target is overstocked at the same 70. Nothing is compared against a
     fleet-wide constant.
+
+    PRECEDENCE, AND WHY IT IS THIS ORDER.
+
+    1. Stock not counted. Everything below this line is arithmetic on the stock figure,
+       so if that figure was invented, every verdict built on it is invented too. This
+       has to come first or the assumed number quietly becomes a diagnosis — which is
+       what produced "overdue, order 0" on products nobody had counted.
+
+    2. Dormant. A product that has stopped selling is dead whatever its shelf says, and
+       that judgement belongs to the demand series, not the stock position. This replaces
+       a rule that decided dead-vs-overstocked on HISTORY LENGTH: under 90 days it said
+       "Overstocked", over it said "Dead stock". Two products behaving identically — no
+       sales, plenty of cover — got different badges because one had been on sale longer,
+       which is exactly the inconsistency this ladder exists to remove. Dormancy is judged
+       against each product's own rhythm, so it needs no such crutch.
+
+    3. Stockout risk, 4. Dead stock (the INVENTORY sense: still selling a little, but
+       buried in cover), 5. Overstocked, 6. Reorder due, 7. Healthy — as before.
+
+    `is_new` still protects a genuinely new product from the inventory-sense dead call,
+    because a line that launched three weeks ago has not had its chance. It no longer
+    decides anything about dormancy — see `ever_sold` below.
     """
+    if not stock_counted: return "Stock not counted"
+    # HAS IT SOLD, not HOW OLD IS IT.
+    #
+    # `is_dormant` is true for two different situations: a product that sold and then
+    # stopped, and one that has never sold at all. Only the second deserves the benefit
+    # of the doubt, and total history length cannot tell them apart — a line that traded
+    # for a month and then went quiet for two has 89 days of history and would be waved
+    # through by a 90-day "still new" guard as though it had just launched. It has not
+    # just launched; it has died. `ever_sold` asks the question that actually separates
+    # them. A never-sold product falls through to the rules below, where `is_new` still
+    # protects it while it is genuinely young and stops protecting it once it is not.
+    if dormant and ever_sold: return "Dead stock"
     risk, due = sc_bands(lt)
     # Not just "already late" — anything inside half a lead time is a position you
     # may not be able to recover by ordering today.
@@ -2810,16 +4690,16 @@ def sc_recommendation(direction, tier, st, c, lt, on_promo, po, cost_known, dur,
     # badge above it describe different products. Both come from sc_bands now.
     _risk, _due = sc_bands(lt)
     prof = tier in ("A", "B"); soon = dur is not None and dur <= _due
-    if po and soon: return ("Covered — reorder in transit", "A purchase order is already on its way. No action needed.")
+    if po and soon: return ("Covered: reorder in transit", "A purchase order is already on its way. No action needed.")
     if soon:
         if dur < 0:
             n = abs(dur); t = (" Profitable line, prioritize it." if prof else " Margins are slim, keep it disciplined.")
-            return ("Reorder overdue — order immediately", f"Reorder point passed {n} day{'s' if n != 1 else ''} ago. Order today." + t)
+            return ("Reorder overdue: order immediately", f"Reorder point passed {n} day{'s' if n != 1 else ''} ago. Order today." + t)
         if dur == 0:
-            t = (" Profitable — give it priority." if prof else " Margins thin, order conservatively.")
+            t = (" Profitable, so give it priority." if prof else " Margins thin, order conservatively.")
             return ("Reorder due today", "Latest you can reorder and still arrive in time." + t)
         if not cost_known: return ("Reorder approaching", "Enter a unit cost to size the order against profitability.")
-        if prof: return ("Reorder approaching — profitable line", f"Reorder point in ~{dur} day{'s' if dur != 1 else ''}. Prioritize it.")
+        if prof: return ("Reorder approaching: profitable line", f"Reorder point in ~{dur} day{'s' if dur != 1 else ''}. Prioritize it.")
         return ("Reorder approaching", f"Reorder point in ~{dur} day{'s' if dur != 1 else ''}. Reorder conservatively.")
     pct = round((st or 0) * 100)
     if direction == "long":
@@ -2830,46 +4710,46 @@ def sc_recommendation(direction, tier, st, c, lt, on_promo, po, cost_known, dur,
             hist_txt = f"{days_hist} days" if days_hist is not None else "little history"
             trend_txt = (" and demand is trending up" if rising else "")
             cover_txt = "beyond a year" if c is None else f"~{c} days"
-            return ("Overstocked for now — hold, it's still establishing",
-                    f"It's carrying {cover_txt} of cover (more than your {cov}-day target) and only ~{pct}% has sold{trend_txt} — "
-                    f"but it only has {hist_txt} of sales history, so this read is provisional. Hold: pause or trim new orders and "
-                    f"let demand settle before judging it. Don't mark it down or discontinue yet.")
+            return ("Overstocked for now: hold, it's still establishing",
+                    f"It's carrying {cover_txt} of cover (more than your {cov}-day target) and only ~{pct}% has sold{trend_txt}, "
+                    f"but with only {hist_txt} of sales history this read is provisional. Pause or trim new orders and "
+                    f"let demand settle. Don't mark it down or discontinue yet.")
         very_dead = (c is None) or (c > (lt + 30) * 4)
         slow = st is not None and st < SELLTHROUGH_LOW   # velocity below the healthy band
         if slow and very_dead and tier in ("C", "F", "—"):
-            return ("Excess stock — consider clearing",
-                    ("Sales are minimal, stock far exceeds demand, AND it loses money on each sale — strong candidate to discontinue or liquidate."
+            return ("Excess stock: consider clearing",
+                    ("Sales are minimal, stock far exceeds demand, and it loses money on each sale. A strong candidate to discontinue or liquidate."
                      if tier == "F" else
                      "Sales are minimal and stock far exceeds demand. Consider a markdown, promotion, or discontinuing it."))
         if slow:
             # Velocity overrides a good margin: a healthy per-unit margin earns
             # little to nothing when almost none of the stock is actually selling.
-            note = (" The per-unit margin looks healthy, but only a small fraction is actually selling, so little to no profit is being realized."
+            note = (" The per-unit margin looks healthy, but so little is selling that little to no profit is being realized."
                     if prof else " Sales are minimal and the margin is thin.")
-            return ("Overstocked & barely selling — reduce orders",
-                    f"Only ~{pct}% of stock has sold recently while it's projected to outlast demand by a wide margin." + note +
+            return ("Overstocked and barely selling: reduce orders",
+                    f"Only ~{pct}% of stock has sold recently, and it's projected to far outlast demand." + note +
                     " Cut future orders, and consider a markdown or promotion to move it.")
         if prof:
-            return ("Overstocked but profitable — reduce future orders",
-                    "You're carrying more than demand requires, but it's selling at a healthy margin. Keep it, but lower future order quantities.")
-        return ("Overstocked — scale back ordering", "Stock will outlast demand and the margin is slim. Reduce future orders.")
+            return ("Overstocked but profitable: reduce future orders",
+                    "You're carrying more than demand needs, but it sells at a healthy margin. Keep it and lower future order quantities.")
+        return ("Overstocked: scale back ordering", "Stock will outlast demand and the margin is slim. Reduce future orders.")
 
     # Cover is healthy/short — but very high velocity still signals under-stocking,
     # even when the margin looks fine (you're leaving sales on the table).
     fast = st is not None and st > SELLTHROUGH_HIGH
     if fast:
-        note = (" It's a healthy-margin line, so missed sales are costly — prioritize keeping it in stock."
+        note = (" It's a healthy-margin line, so missed sales are costly. Prioritize keeping it in stock."
                 if prof else " Keep an eye on the margin, but avoid stocking out.")
-        return ("Selling fast — risk of under-stocking",
-                f"About {pct}% of available stock has sold recently — it's moving quickly and you may be under-stocked." + note +
+        return ("Selling fast: risk of under-stocking",
+                f"About {pct}% of available stock has sold recently, so you may be under-stocked." + note +
                 " Consider raising the stock level or reorder point so you don't miss sales.")
-    base = ("Healthy — maintain position", "Stock is well matched to demand. Hold and monitor.")
+    base = ("Healthy: maintain position", "Stock is well matched to demand. Hold and monitor.")
     if on_promo: return (base[0], base[1] + " A promotion is active, so sales are temporarily elevated.")
     return base
 
 
 def sc_score_one(entry, fc, stock, unit_cost, fees, reg_price, td, lt, cov, po, on_promo,
-                 on_order=0, on_order_eta=None):
+                 on_order=0, on_order_eta=None, stock_source=None, sku_id=None):
     df = entry["df_train"]; cutoff = today() - pd.Timedelta(days=td)
     tr = df[df["ds"] > cutoff]; tu = int(tr["y"].sum()) if len(tr) else 0; ta = tu / max(td, 1)
     n30 = fc.head(30) if fc is not None else None
@@ -2888,7 +4768,27 @@ def sc_score_one(entry, fc, stock, unit_cost, fees, reg_price, td, lt, cov, po, 
     days_hist = int((df["ds"].max() - df["ds"].min()).days) if len(df) > 1 else 0
     is_new = days_hist < SC_PROVISIONAL_DAYS
     rising = trend is not None and trend > 1.05
-    status = sc_status(cover, dur, st, lt, cov, po, is_new)
+    # Provenance comes from the caller's params: the browser knows whether a figure was
+    # typed, synced or invented. Absent that, a StockLog reading still proves someone has
+    # seen this product on a shelf. Passed in as an argument — reaching into the caller's
+    # locals for `cfg` is what broke the whole scorecard endpoint.
+    # "unknown" IS NOT AN ANSWER — it is the absence of one.
+    #
+    # This first read the caller's value and only fell back to the log when the caller
+    # sent nothing at all. But the browser always sends something: DEFAULT_PARAMS carries
+    # stockSource "unknown", which is a truthy string, so the fallback never ran and every
+    # product in a Square-connected catalogue was reported as uncounted — including ones
+    # the sampler had a real reading for. A client saying "I don't know" must never
+    # outrank evidence the server holds.
+    _ssrc = str(stock_source or "").strip().lower()
+    if _ssrc in ("", "unknown", "none", "null") and sku_id is not None:
+        _ssrc = "live" if _slog.latest(str(sku_id)) is not None else "unknown"
+    if not _ssrc:
+        _ssrc = "unknown"
+    _counted = _ssrc in ("manual", "live", "sheet")
+    status = sc_status(cover, dur, st, lt, cov, po, is_new,
+                       dormant=bool(entry.get("dormant")), stock_counted=_counted,
+                       ever_sold=bool(len(df) and float(df["y"].sum()) > 0))
     _disp = entry.get("residual_dispersion")
     # ONE signal. Each of the other three was a restatement of something already on
     # screen, and each was deleted once that was demonstrated.
@@ -2947,14 +4847,25 @@ def sc_score_one(entry, fc, stock, unit_cost, fees, reg_price, td, lt, cov, po, 
     if ck and reg_price:
         margin = round((reg_price - unit_cost - fees_v) / reg_price * 100, 1) if reg_price else None
     if is_new:
-        flags.append({"type": "new", "text": f"New product ({days_hist}d of history) — health read is provisional."})
+        flags.append({"type": "new", "text": f"New product ({days_hist} days of history), so the health read is provisional."})
     tier = sc_return_tier(margin)
     action, reason = sc_recommendation(direction, tier, st, cover, lt, on_promo, po, ck, dur,
                                        is_new=is_new, rising=rising, days_hist=days_hist, cov=cov)
-    return {"daysOfCover": cover, "daysOfCoverWithInbound": cover_pos, "unitsOnOrder": inbound,
-            "coverDirection": direction, "daysUntilReorder": dur,
+    # Cover and the reorder countdown are both stock ÷ demand. With an assumed stock they
+    # are arithmetic on an invented number, and the fleet reads daysUntilReorder straight
+    # into an "Overdue Nd" badge — which is how an uncounted, unsold product came to be
+    # reported as an overdue reorder. Null means "not measured", which the UI already
+    # knows how to render; a number here would mean "measured", which would be false.
+    return {"daysOfCover": (cover if _counted else None),
+            "daysOfCoverWithInbound": (cover_pos if _counted else None),
+            "unitsOnOrder": inbound,
+            "coverDirection": (direction if _counted else None),
+            "daysUntilReorder": (dur if _counted else None),
             "sellThrough": round(st, 3) if st is not None else None, "trailingUnits": tu,
             "status": status, "statusRank": STATUS_RANK.get(status, 9), "signals": breakdown,
+            # The two facts the status now turns on, published so the UI can explain a
+            # badge rather than re-derive it and risk disagreeing.
+            "dormant": bool(entry.get("dormant")), "stockCounted": _counted, "stockSource": _ssrc,
             "flags": flags, "marginPct": margin, "returnTier": tier,
             "recommendation": {"action": action, "reason": reason}}
 
@@ -2963,10 +4874,10 @@ def sc_score_one(entry, fc, stock, unit_cost, fees, reg_price, td, lt, cov, po, 
 def get_scorecard(payload: dict = Body(default={})):
     td = int(payload.get("trailingDays", TRAILING_DAYS_DEFAULT)); inp = payload.get("skus", {}) or {}
     rows = []
-    for sku_id, e in _sku_cache.items():
+    for sku_id, e in _cache().items():
         if e.get("df_train") is None or e.get("future_fc") is None: continue
         cfg = inp.get(sku_id, {})
-        stock = int(cfg.get("stock", 500)); uc = cfg.get("unitCost", None); uc = float(uc) if uc not in (None, "") else None
+        stock = int(cfg.get("stock", ASSUMED_STOCK)); uc = cfg.get("unitCost", None); uc = float(uc) if uc not in (None, "") else None
         fees = cfg.get("fees", None); fees = float(fees) if fees not in (None, "") else 0.0
         lt = int(cfg.get("leadTime", 14)); cov = int(cfg.get("coverage", 30)); po = bool(cfg.get("hasOpenPo", False))
         # Quantity and arrival date of an open PO. Only the boolean used to come across,
@@ -2985,7 +4896,8 @@ def get_scorecard(payload: dict = Body(default={})):
         events = e.get("events", []) or []
         reg = sc_effective_price_today(e, events); on_promo, disc = sc_on_promo_today(e, events)
         pp = round(reg * (1 - float(disc) / 100), 2) if (on_promo and disc and reg is not None) else None
-        live = sc_score_one(e, e["future_fc"], stock, uc, fees, reg, td, lt, cov, po, on_promo, ooq, eta)
+        live = sc_score_one(e, e["future_fc"], stock, uc, fees, reg, td, lt, cov, po, on_promo,
+                            ooq, eta, stock_source=cfg.get("stockSource"), sku_id=sku_id)
         row = {"skuId": sku_id, "skuName": e.get("sku_name") or sku_id, "mode": e.get("mode"),
                "stock": stock, "unitCost": uc, "fees": fees, "costKnown": uc is not None and uc > 0,
                "regularPrice": reg, "onPromoToday": on_promo, "promoPrice": pp,
@@ -2994,8 +4906,11 @@ def get_scorecard(payload: dict = Body(default={})):
                "winningModel": e.get("winning_model"), "demandClass": e.get("demand_class"), "route": e.get("route"),
                **live}
         if on_promo:
+            # Same provenance, or the promo-baseline view grades the same product on a
+            # different set of facts from the row it sits inside.
             row["baselineView"] = sc_score_one(e, sc_baseline_future_fc(e, reg), stock, uc, fees, reg,
-                                               td, lt, cov, po, False, ooq, eta)
+                                               td, lt, cov, po, False, ooq, eta,
+                                               stock_source=cfg.get("stockSource"), sku_id=sku_id)
         rows.append(row)
     dist = {k: 0 for k in STATUS_RANK}
     for r in rows: dist[r["status"]] = dist.get(r["status"], 0) + 1
@@ -3024,9 +4939,10 @@ def get_history(sku_id: str | None = Query(default=None), recent_days: int = Que
     daily rows — enough to answer historical/trend questions without shipping
     thousands of raw rows. Dates reflect the loaded (re-anchored) data."""
     out = []
-    targets = [sku_id] if sku_id else list(_sku_cache.keys())
+    _snap = _cache()
+    targets = [sku_id] if sku_id else list(_snap.keys())
     for sid in targets:
-        e = _sku_cache.get(sid)
+        e = _snap.get(sid)
         if not e or e.get("df_train") is None or e["df_train"].empty:
             continue
         df = e["df_train"]
@@ -3080,7 +4996,7 @@ def _export_view(sid, p):
     p = p or {}
     view = get_forecast(
         sku_id=sid,
-        stock=int(_num(p.get("stock"), 500)),
+        stock=int(_num(p.get("stock"), ASSUMED_STOCK)),
         lead_time_days=int(_num(p.get("leadTime"), 14)),
         coverage_days=int(_num(p.get("coverage"), 30)),
         strategy="balanced",
@@ -3090,8 +5006,11 @@ def _export_view(sid, p):
         unit_cost=(float(p["unitCost"]) if p.get("unitCost") not in (None, "") else None),
         fees=float(_num(p.get("fees"), 0)),
         protection=(p.get("protection") or None),
+        # Provenance travels into the export too, or the sheet re-derives it and gets it
+        # wrong — which is precisely how live Square counts came to be labelled "assumed".
+        stock_source=(p.get("stockSource") or None),
     )
-    view["__stock"] = int(_num(p.get("stock"), 500))
+    view["__stock"] = int(_num(p.get("stock"), ASSUMED_STOCK))
     return view
 
 
@@ -3101,7 +5020,7 @@ def _fleet_items(skus, folders):
         for sid in (f.get("skuIds") or []):
             fmap[sid] = f.get("name")
     items = []
-    for sid in _sku_cache:
+    for sid in _cache():
         try:
             items.append({"view": _export_view(sid, (skus or {}).get(sid)), "folder": fmap.get(sid)})
         except Exception as ex:
@@ -3111,7 +5030,7 @@ def _fleet_items(skus, folders):
 
 @app.post("/api/export/sku/{sku_id}")
 def export_sku(sku_id: str, payload: dict = Body(default={})):
-    if sku_id not in _sku_cache:
+    if sku_id not in _cache():
         raise HTTPException(404, "SKU not found.")
     p = (payload.get("skus") or {}).get(sku_id) or payload.get("params") or payload
     wb = exports.build_sku_workbook(_export_view(sku_id, p))
@@ -3140,13 +5059,13 @@ def export_all(payload: dict = Body(default={})):
     if isinstance(suppliers, dict):
         suppliers = list(suppliers.values())
     sc_body = {"trailingDays": payload.get("trailingDays", 30),
-               "skus": {sid: {"stock": _num((skus.get(sid) or {}).get("stock"), 500),
+               "skus": {sid: {"stock": _num((skus.get(sid) or {}).get("stock"), ASSUMED_STOCK),
                               "unitCost": (skus.get(sid) or {}).get("unitCost"),
                               "fees": (skus.get(sid) or {}).get("fees"),
                               "leadTime": _num((skus.get(sid) or {}).get("leadTime"), 14),
                               "coverage": _num((skus.get(sid) or {}).get("coverage"), 30),
                               "hasOpenPo": (skus.get(sid) or {}).get("hasOpenPo", False)}
-                        for sid in _sku_cache}}
+                        for sid in _cache()}}
     try:
         sc_rows = get_scorecard(sc_body).get("rows", [])
     except Exception as ex:
@@ -3352,6 +5271,158 @@ def get_holding():
     return {"holding": _session_holding_pct}
 
 
+# ─── Holidays ────────────────────────────────────────────────────────────────
+# Which promotional periods the store cares about. Saved to its own file, so it survives
+# restarts. Saving refits every product in the background (a minute or two on a big
+# catalogue); GET reports progress so the page can say so.
+_holiday_refit = {"status": "idle", "startedAt": None, "finishedAt": None, "error": None}
+_holiday_refit_lock = threading.Lock()
+
+
+def _holiday_catalog_view(settings):
+    t = today().date()
+    out = []
+    for key, name, group, rule, (before, after), desc in _HOL.CATALOG:
+        wins = _HOL.windows_for(key, t, t + datetime.timedelta(days=400), settings)
+        nxt = next(((s_, e_) for s_, e_ in wins if e_ >= t), None)
+        row = {"key": key, "name": name, "group": group, "description": desc,
+               "next": ({"start": nxt[0].isoformat(), "end": nxt[1].isoformat()} if nxt else None),
+               "table": rule[0] == "table"}
+        if rule[0] == "table":
+            past = _HOL.windows_for(key, datetime.date(2015, 1, 1), t + datetime.timedelta(days=800), settings)
+            row["dates"] = [{"start": a.isoformat(), "end": b.isoformat()} for a, b in past]
+            row["needsDate"] = nxt is None
+        out.append(row)
+    return out
+
+
+@app.get("/api/holidays")
+def get_holidays():
+    """The calendar every product is checked against, the store's own sales periods and
+    added Prime Day dates, and whether a refit after a change is still running."""
+    st = _holidays.get()
+    return {"settings": {"custom": st.get("custom") or [], "dates": st.get("dates") or {},
+                         "ignored": st.get("ignored") or {}},
+            "groups": _HOL.GROUPS, "catalog": _holiday_catalog_view(st), "refit": dict(_holiday_refit)}
+
+
+@app.post("/api/holidays")
+def set_holidays(payload: dict = Body(default={})):
+    """Store-wide changes: the store's own sales periods and Prime Day dates. Every
+    product is refitted in the background. Per-product switches are kept as they are
+    unless the payload carries its own `ignored`."""
+    before = _holidays.get()
+    merged = {"custom": (payload or {}).get("custom", before.get("custom") or []),
+              "dates": (payload or {}).get("dates", before.get("dates") or {}),
+              "ignored": (payload or {}).get("ignored", before.get("ignored") or {})}
+    try:
+        clean = _HOL.validate(merged)
+    except _HOL.SettingsError as ex:
+        raise HTTPException(400, str(ex))
+    changed = (json.dumps(_HOL.validate(before), sort_keys=True) != json.dumps(clean, sort_keys=True))
+    _holidays.save(clean)
+    started = _start_holiday_refit() if (changed and _catalog) else False
+    return {"success": True, "settings": clean, "refitting": started, "refit": dict(_holiday_refit)}
+
+
+@app.post("/api/skus/{sku_id}/holidays")
+def set_sku_holidays(sku_id: str, payload: dict = Body(default={})):
+    """Switch periods off (or back on) for one product, e.g. a spike you know was a
+    one-off. Only this product is refitted."""
+    with _state_lock:
+        if sku_id not in _catalog:
+            raise HTTPException(404, "SKU not found.")
+        st = _holidays.get()
+        ign = dict(st.get("ignored") or {})
+        ign[str(sku_id)] = list((payload or {}).get("ignored") or [])
+        try:
+            clean = _HOL.validate({**st, "ignored": ign})
+        except _HOL.SettingsError as ex:
+            raise HTTPException(400, str(ex))
+        _holidays.save(clean)
+        _rebuild(today(), only=sku_id)
+        if sku_id in _last_rebuild_errors:
+            raise HTTPException(400, f"Couldn't refit: {_last_rebuild_errors.pop(sku_id)}")
+    return {"success": True, "ignored": clean["ignored"].get(str(sku_id), [])}
+
+
+@app.get("/api/holidays/report")
+def holiday_report_xlsx():
+    """Every product against every period: what each past year showed, what the forecast
+    uses, and when it next applies. One workbook, two sheets."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+    wb = Workbook()
+    ws = wb.active; ws.title = "By product"
+    head = ["SKU", "Product", "Holiday or period", "Status", "Forecast uses", "Past years (own sales)",
+            "Based on", "Next dates", "Day by day (next time)", "Why"]
+    ws.append(head)
+    label = {"applied": "Applied", "none": "No clear effect", "unseen": "Not in history yet",
+             "discounted": "Can't separate from discounts", "off": "Switched off"}
+    summary = {}
+    for sid, e in sorted(_cache().items()):
+        rep = e.get("holidays") or {}
+        for r in rep.get("effects") or []:
+            yrs = "; ".join(f"{y['start'][:4]}: {'+' if y['pct'] > 0 else ''}{y['pct']}% "
+                            f"({y['units']} sold vs {y['ordinary']} ordinary)" for y in r.get("years") or [])
+            basis = ("own sales" if r["source"] == "own" else f"{r['peers']} similar products" if r["source"] == "peers"
+                     else f"own sales + {r['peers']} similar products" if r["source"] == "own+peers" else "")
+            nxt = r.get("next") or {}
+            days = ", ".join(f"{d['date'][5:]} {'+' if d['pct'] > 0 else ''}{d['pct']}%" for d in r.get("days") or [])
+            ws.append([sid, e.get("sku_name") or sid, r["name"], label.get(r["status"], r["status"]),
+                       (f"{'+' if r['pct'] > 0 else ''}{r['pct']}%" if r["status"] == "applied" else ""),
+                       yrs, basis, (f"{nxt.get('start')} to {nxt.get('end')}" if nxt else ""), days, r["text"]])
+            a = summary.setdefault(r["name"], {"applied": 0, "pcts": [], "checked": 0})
+            a["checked"] += 1
+            if r["status"] == "applied":
+                a["applied"] += 1; a["pcts"].append(r["pct"])
+    ws2 = wb.create_sheet("By holiday")
+    ws2.append(["Holiday or period", "Products it moves", "Products checked", "Smallest lift", "Largest lift"])
+    for name, a in sorted(summary.items(), key=lambda kv: -kv[1]["applied"]):
+        p = sorted(a["pcts"])
+        ws2.append([name, a["applied"], a["checked"], (f"{p[0]:+d}%" if p else ""), (f"{p[-1]:+d}%" if p else "")])
+    for sh, widths in ((ws, [12, 26, 26, 26, 14, 60, 30, 26, 44, 70]), (ws2, [28, 18, 18, 14, 14])):
+        for c in sh[1]:
+            c.font = Font(bold=True, color="FFFFFF"); c.fill = PatternFill("solid", fgColor="1F2328")
+            c.alignment = Alignment(vertical="center")
+        for i, w in enumerate(widths):
+            sh.column_dimensions[chr(65 + i)].width = w
+        sh.freeze_panes = "A2"
+    buf = io.BytesIO(); wb.save(buf); buf.seek(0)
+    fn = f"logitrack_holidays_{today().strftime('%Y-%m-%d')}.xlsx"
+    return StreamingResponse(buf, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                             headers={"Content-Disposition": f'attachment; filename="{fn}"'})
+
+
+def _start_holiday_refit():
+    with _holiday_refit_lock:
+        if _holiday_refit["status"] == "running":
+            _holiday_refit["again"] = True        # picked up when the current one finishes
+            return True
+        _holiday_refit.update({"status": "running", "startedAt": time.time(), "finishedAt": None,
+                               "error": None, "again": False})
+
+    def work():
+        while True:
+            try:
+                with _state_lock:
+                    _rebuild(today())
+                err = None
+            except Exception as ex:                          # noqa: BLE001
+                import traceback; traceback.print_exc()
+                err = f"{type(ex).__name__}: {ex}"
+            with _holiday_refit_lock:
+                if _holiday_refit.get("again") and err is None:
+                    _holiday_refit["again"] = False
+                    continue
+                _holiday_refit.update({"status": "error" if err else "done",
+                                       "finishedAt": time.time(), "error": err})
+                return
+
+    threading.Thread(target=work, daemon=True, name="holiday-refit").start()
+    return True
+
+
 @app.post("/api/backtest/partial")
 def backtest_partial(payload: dict = Body(default={})):
     """Re-test ONLY the named products, then rebuild the catalog totals from the merge.
@@ -3537,6 +5608,66 @@ def _tier_cache_key(sku: str, lead, coverage) -> str:
     return f"{sku}|{int(lead)}|{int(coverage)}"
 
 
+# How far a measured tier may be reused when the planning settings have moved.
+#
+# WHY THERE IS A TOLERANCE AT ALL. The planning lead time is the P80 of that lane's
+# completed deliveries, so it MOVES every time a shipment lands — 14, then 17, then 16 —
+# and with few deliveries it moves a lot. An exact-match cache key therefore misses almost
+# every time a supplier delivers, and the product silently drops from a measured tier to a
+# cost-curve estimate because a parcel arrived a day late. That is not caution; it is
+# throwing away the better answer over a rounding difference.
+#
+# WHY 25% IS DEFENSIBLE. The buffer is z x sigma over the lead window, and sigma grows as
+# the square root of the lead, so a 25% change in lead moves the buffer about 12%. More to
+# the point, the tier CHOICE — which service level is cheapest — is far stabler than the
+# buffer magnitude: it turns on the ratio of stockout cost to holding cost, which a
+# modest lead change barely touches. A near match is labelled as one, never passed off as
+# exact.
+TIER_LEAD_TOLERANCE = 0.25
+TIER_COVERAGE_TOLERANCE = 0.25
+
+
+def _within(measured, requested, tolerance) -> bool:
+    """Is `requested` close enough to `measured` to reuse its measurement?"""
+    if measured is None or requested is None:
+        return True
+    try:
+        m, r = float(measured), float(requested)
+    except (TypeError, ValueError):
+        return False
+    if m <= 0:
+        return False
+    return abs(r - m) / m <= tolerance
+
+
+def _tier_lookup(sku_id: str, lead, coverage):
+    """The best measured tier for these settings: (record, match) where match is
+    'exact', 'near' or None.
+
+    Exact first, then the nearest measurement inside tolerance — nearest by relative lead
+    distance, because lead drives the buffer far more than coverage does.
+    """
+    sid = str(sku_id)
+    exact = _backtest_tier_cache.get(_tier_cache_key(sid, lead, coverage))
+    if exact:
+        return exact, "exact"
+    best, best_dist = None, None
+    for key, rec in _backtest_tier_cache.items():
+        if not key.startswith(f"{sid}|"):
+            continue
+        if not _within(rec.get("lead"), lead, TIER_LEAD_TOLERANCE):
+            continue
+        if not _within(rec.get("coverage"), coverage, TIER_COVERAGE_TOLERANCE):
+            continue
+        try:
+            dist = abs(float(lead) - float(rec.get("lead"))) / max(float(rec.get("lead")), 1.0)
+        except (TypeError, ValueError):
+            dist = 1.0
+        if best_dist is None or dist < best_dist:
+            best, best_dist = rec, dist
+    return (best, "near") if best else (None, None)
+
+
 def _record_backtest_exclusions(res: dict) -> None:
     """Why each product's measured tier is missing.
 
@@ -3553,23 +5684,22 @@ def _record_backtest_exclusions(res: dict) -> None:
         if s.get("kind") == "error":
             out.setdefault(sku, f"its test windows hit an error ({s.get('reason')}).")
         else:
-            out.setdefault(sku, f"it only has {s.get('days')} days of sales history — testing needs at "
-                                f"least {BACKTEST_MIN_TESTABLE_DAYS}, so there's nothing to measure "
-                                f"against yet.")
+            out.setdefault(sku, f"it only has {s.get('days')} days of sales history, and testing needs at "
+                                f"least {BACKTEST_MIN_TESTABLE_DAYS}.")
     for row in (res.get("tierAnalysis") or {}).get("bySku") or []:
         sku = str(row.get("sku") or "")
         if not sku or sku in out:
             continue
         windows = int(row.get("windows") or 0)
         if not row.get("costKnown"):
-            out[sku] = ("no unit cost on file, so there's no way to price a stockout against the cost "
-                        "of holding stock. Add one in the Scorecard.")
+            out[sku] = ("no unit cost on file, so a stockout can't be priced against the cost of "
+                        "holding stock. Add one on the product page or in the Fleet tab's Costs & fees sheet.")
         elif row.get("lossMaking"):
-            out[sku] = ("it sells at or below cost after fees, so a stockout forgoes no profit and more "
-                        "safety stock would only lose money faster. That's a pricing issue, not a buffer one.")
+            out[sku] = ("it sells at or below cost after fees, so more safety stock would only lose money "
+                        "faster. That's a pricing issue, not a buffer one.")
         elif windows < BACKTEST_TIER_MIN_WINDOWS:
             out[sku] = (f"it produced only {windows} usable test window"
-                        f"{'' if windows == 1 else 's'} — under {BACKTEST_TIER_MIN_WINDOWS} "
+                        f"{'' if windows == 1 else 's'}, and under {BACKTEST_TIER_MIN_WINDOWS} "
                         f"the result is too noisy to act on.")
         elif not row.get("bestTier"):
             out[sku] = "the test couldn't separate the protection levels for it."
@@ -3588,8 +5718,8 @@ def _why_provisional(sku_id: str, status: str, days_hist: int,
         return None
     job = _bt_job_snapshot()
     if status == "calculating":
-        return ("A test is running right now — this will switch to a measured figure when it finishes, "
-                "usually a few minutes.")
+        return ("A test is running right now. This switches to a measured figure when it finishes, "
+                "usually within a few minutes.")
     drift = _economics_drifted(sku_id, _drift_cost, _drift_fees, (cached or {}).get("holdingPct"))
     if drift:
         return (f"The last test measured it before {drift}. That changes which protection level is "
@@ -3607,15 +5737,14 @@ def _why_provisional(sku_id: str, status: str, days_hist: int,
         return f"It was left out of the last test because {reason}"
     if days_hist < BACKTEST_MIN_TESTABLE_DAYS:
         return (f"It has {days_hist} days of sales history. Testing needs at least "
-                f"{BACKTEST_MIN_TESTABLE_DAYS} — about {BACKTEST_MIN_TESTABLE_DAYS - days_hist} more days "
-                f"— before there's anything to measure against.")
+                f"{BACKTEST_MIN_TESTABLE_DAYS} (about {BACKTEST_MIN_TESTABLE_DAYS - days_hist} more days).")
     if job.get("status") == "error":
         return f"The last test failed to finish ({job.get('error')}), so no measured figure is available."
     if not _backtest_tier_cache:
         return ("No test has been run yet. One starts automatically when you upload a sales file, "
                 "or you can run it from the Backtest tab.")
-    return ("This product wasn't included in the last test run — uploading again, or running the "
-            "Backtest tab, will pick it up.")
+    return ("This product wasn't included in the last test run. Upload again or run the "
+            "Backtest tab to pick it up.")
 
 
 def _combo_policy(analysis: dict) -> tuple[str, float | None]:
@@ -3824,10 +5953,12 @@ def livelog_snapshot(payload: dict = Body(default={})):
     horizons = payload.get("horizons") or DEFAULT_LOG_HORIZONS
     cadence = payload.get("cadence") or _FL.WEEKLY
     rows, skipped = [], []
-    with _state_lock:
-        skus = list(_sku_cache.keys())
+    # A snapshot, not the lock: sealing the week must not queue behind a refit that
+    # holds _state_lock for minutes — a missed seal is a permanent hole in the record.
+    _snap = _cache()
+    skus = list(_snap.keys())
     for sid in skus:
-        e = _sku_cache.get(sid) or {}
+        e = _snap.get(sid) or {}
         fc = e.get("future_fc")
         if fc is None or len(fc) == 0:
             skipped.append(sid)
@@ -3849,9 +5980,44 @@ def livelog_snapshot(payload: dict = Body(default={})):
             "summary": _flog.summary()}
 
 
+def _livelog_connection(payload: dict) -> tuple:
+    """Which store the clock-driven endpoints should read.
+
+    A tick fired by cron carries no credentials — that is the whole point of saving a
+    connection. Resolution order:
+
+      1. whatever the caller named explicitly (a connectionId, or source + creds)
+      2. the most recently used SAVED connection, whichever platform it is
+      3. environment variables, which is what the ROADMAP's cron setup assumes and what
+         every existing deployment is doing today
+
+    Step 3 returns empty creds on purpose: each source's own _cfg() falls back to its env
+    vars, so nothing about the current Shopify-by-environment setup changes.
+    """
+    payload = payload or {}
+    if any(payload.get(k) for k in ("connectionId", "connection_id", "source", "shop", "token")):
+        try:
+            source, creds, cid, _label = _resolve_connection(payload)
+            if cid:
+                _CONN.touch(cid)
+            return source, creds
+        except HTTPException:
+            pass                                  # fall through to a saved/env connection
+
+    saved = _CONN.list_all()
+    if saved:
+        full = _CONN.get(saved[0]["id"]) or {}
+        _CONN.touch(saved[0]["id"])
+        return full.get("source"), (full.get("creds") or {})
+
+    if os.environ.get("SQUARE_ACCESS_TOKEN") and not os.environ.get("SHOPIFY_TOKEN"):
+        return "square", {}
+    return "shopify", {}
+
+
 @app.post("/api/livelog/score")
 def livelog_score(payload: dict = Body(default={})):
-    """Grade everything whose window has closed, using real Shopify sales.
+    """Grade everything whose window has closed, using real sales from the connected store.
 
     Anything not yet due is untouched — the clock decides, not the button.
     """
@@ -3860,13 +6026,13 @@ def livelog_score(payload: dict = Body(default={})):
     if not due:
         return {"scored": 0, "unavailable": 0, "reason": "nothing-due",
                 "summary": _flog.summary()}
+    source, creds = _livelog_connection(payload)
     try:
-        fn = _LA.shopify_actuals_provider(
-            pending, shop=payload.get("shop"), token=payload.get("token"))
+        fn = _SRC.actuals_provider(source, pending, creds)
     except Exception as exc:
         raise HTTPException(400, f"Could not read the store: {exc}")
     res = _flog.score_due(fn)
-    return {**res, "sourceFailed": bool(getattr(fn, "failed", False)),
+    return {**res, "source": source, "sourceFailed": bool(getattr(fn, "failed", False)),
             "lookbackDays": getattr(fn, "days", None),
             "summary": _flog.summary()}
 
@@ -3886,11 +6052,14 @@ def livelog_tick(payload: dict = Body(default={})):
     same one set of predictions and grades nothing new.
     """
     out = {"snapshot": None, "score": None, "stock": None}
-    # Read inventory FIRST. Shopify keeps no history, so a reading missed now is a day we
-    # can never reconstruct — whereas scoring can always be retried tomorrow.
+    source, creds = _livelog_connection(payload)
+    out["source"] = source
+    # Read inventory FIRST. Shopify keeps no queryable stock history, so a reading missed
+    # now is a day that can never be reconstructed — whereas scoring can always be retried
+    # tomorrow. (Square DOES expose historical inventory changes, which means its gap is
+    # backfillable later; that doesn't make skipping the reading free, so the order stands.)
     try:
-        out["stock"] = _SL.sample_from_shopify(
-            _slog, shop=payload.get("shop"), token=payload.get("token"))
+        out["stock"] = _SRC.sample_stock(source, _slog, creds)
     except Exception as exc:
         out["stock"] = {"ok": False, "error": str(exc), "added": 0}
     try:
@@ -3900,7 +6069,9 @@ def livelog_tick(payload: dict = Body(default={})):
         out["snapshot"] = {"error": str(exc), "added": 0}
     if _flog.due():
         try:
-            out["score"] = livelog_score({})
+            # Pass the resolved connection through rather than re-resolving from an empty
+            # body — otherwise a tick told to read store A could grade against store B.
+            out["score"] = livelog_score({"source": source, "creds": creds})
         except HTTPException as exc:
             out["score"] = {"error": exc.detail, "scored": 0}
         except Exception as exc:
@@ -3922,7 +6093,7 @@ def bundles_set(payload: dict = Body(default={})):
     report = _BUN.validate(incoming, known_skus=known or None)
     _bundle_map = incoming
     return {"saved": len(incoming), "validation": report,
-            "note": "Applies to sales loaded from here on — re-upload or re-sync to "
+            "note": "Applies to sales loaded from here on. Re-upload or re-sync to "
                     "attribute past bundle sales."}
 
 
@@ -3993,6 +6164,8 @@ def price_history(sku: str = Query(...), days: int = Query(default=365, ge=7, le
     d2 = df.tail(days).copy()
     series, last = [], None
     for _, r in d2.iterrows():
+        if float(r.get("price_mixed", 0) or 0) >= 1:
+            continue                    # a blend of two prices is not a price change
         try:
             p = float(r["price"])
         except (TypeError, ValueError):
@@ -4088,7 +6261,7 @@ def livelog_amend(payload: dict = Body(default={})):
     # Re-derive the week's forecast WITH the promotion now scheduled, over the days that
     # remain. Days already elapsed keep what was originally expected — the campaign
     # cannot lift sales that have already happened.
-    e = _sku_cache.get(sku) or {}
+    e = _cache().get(sku) or {}
     fc = e.get("future_fc")
     if fc is None or not len(fc):
         raise HTTPException(409, "no current forecast to revise from")

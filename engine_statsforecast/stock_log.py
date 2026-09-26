@@ -121,6 +121,32 @@ class StockLog:
             self._samples[sku] = kept
 
     # -- reads --
+    def latest(self, sku: str):
+        """The most recent on-hand reading for one SKU, or None if it was never watched.
+
+        This is what makes a reading survive a restart. Live inventory never reaches the
+        catalog frame — a sync carries it alongside the sales, not inside them — so before
+        this existed the only copy lived in the browser, and a cleared cache or a second
+        device silently reverted every product to the dashboard default.
+        """
+        arr = self._samples.get(str(sku))
+        if not arr:
+            return None
+        try:
+            return float(arr[-1].get("onHand"))
+        except (TypeError, ValueError, AttributeError, IndexError):
+            return None
+
+    def latest_all(self) -> dict:
+        """{sku: on_hand} for every SKU with a reading."""
+        with self._lock:
+            out = {}
+            for sku in self._samples:
+                v = self.latest(sku)
+                if v is not None:
+                    out[sku] = v
+            return out
+
     def samples(self, sku: str) -> list:
         with self._lock:
             return list(self._samples.get(str(sku), []))
@@ -162,6 +188,95 @@ class StockLog:
         return {"skus": len(skus), "samples": total, "firstSeen": first,
                 "lastSeen": last, "daysCovered": days,
                 "trackingSince": first}
+
+    def state_today(self, sku: str, now=None) -> dict:
+        """What this product's stock is doing RIGHT NOW, from the readings on file.
+
+        Deliberately NOT hours_in_stock(). That answers "how much of this DAY was it
+        buyable", and to do so it carries the last reading forward to midnight — correct
+        for a finished day, misleading for one in progress. At 10am it would report a
+        nearly-full day of availability for a day that is two hours old.
+
+        This reports only what has actually been observed:
+
+            state           in | out | unknown       (unknown = nothing sampled yet)
+            level           the most recent reading
+            lastReadingAt   when that reading was taken. THIS is the per-product
+                            freshness signal: record() slides the tail timestamp forward
+                            on an unchanged level, so it tracks the poll, not the change.
+            changesToday    distinct readings on file for today. record() collapses
+                            identical consecutive readings, so this counts how often the
+                            level MOVED, not how often we looked — a product sitting
+                            still through fourteen polls shows 1. Never read it as
+                            "the sampler isn't running"; that is lastReadingAt's job,
+                            and globally it is /api/sync -> sampler.
+            outSince        if it is out NOW, when the run of zeroes began
+            wentOutToday    it hit zero at some point today, even if it is back in stock
+        """
+        now = now or utcnow()
+        midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        out = {"state": "unknown", "level": None, "lastReadingAt": None,
+               "changesToday": 0, "outSince": None, "wentOutToday": False}
+
+        pts = []
+        with self._lock:
+            for smp in self._samples.get(str(sku), []):
+                try:
+                    ts = _dt.datetime.fromisoformat(str(smp["ts"]).replace("Z", "+00:00"))
+                except (KeyError, ValueError, TypeError):
+                    continue
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=_dt.timezone.utc)
+                try:
+                    pts.append((ts, float(smp.get("onHand") or 0)))
+                except (TypeError, ValueError):
+                    continue
+        if not pts:
+            return out
+        pts.sort()
+
+        last_ts, last_level = pts[-1]
+        today = [(ts, v) for ts, v in pts if ts >= midnight]
+        out.update({"state": "out" if last_level <= 0 else "in",
+                    "level": last_level,
+                    "lastReadingAt": last_ts.isoformat(),
+                    "changesToday": len(today),
+                    "wentOutToday": any(v <= 0 for _, v in today)})
+
+        # How long it has been out: walk back while the readings are still zero. Reported
+        # from the FIRST zero, because that is the last moment we know it was buyable —
+        # anything finer would be inventing precision the hourly cadence doesn't have.
+        if last_level <= 0:
+            since = last_ts
+            for ts, v in reversed(pts[:-1]):
+                if v > 0:
+                    break
+                since = ts
+            out["outSince"] = since.isoformat()
+        return out
+
+    def last_sample_at(self):
+        """When a reading was last filed, across every product — or None.
+
+        The sampler asks this at boot instead of keeping a timer of its own. A process
+        restart wipes an in-memory timer but not the log, so this is the only answer that
+        survives the thing most likely to interrupt sampling: the server going down.
+        """
+        newest = None
+        with self._lock:
+            for arr in self._samples.values():
+                if not arr:
+                    continue
+                ts = str(arr[-1].get("ts") or "")
+                if ts and (newest is None or ts > newest):
+                    newest = ts
+        if not newest:
+            return None
+        try:
+            out = _dt.datetime.fromisoformat(newest.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return out if out.tzinfo else out.replace(tzinfo=_dt.timezone.utc)
 
     def purge(self):
         with self._lock:

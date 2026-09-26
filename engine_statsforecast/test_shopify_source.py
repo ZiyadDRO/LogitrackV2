@@ -46,6 +46,8 @@ sys.modules["requests"] = fake_requests
 
 sys.path.insert(0, __import__("os").path.dirname(__import__("os").path.abspath(__file__)))
 import shopify_source as SH
+import pandas as pd
+import datetime as dt
 
 PASS, FAIL = [], []
 def check(name, cond, detail=""):
@@ -98,15 +100,43 @@ check("second request carries the cursor", fake_requests.calls[1][2]["variables"
 check("created_at filter sent when days given", "created_at:>=" in (fake_requests.calls[0][2]["variables"].get("q") or ""),
       str(fake_requests.calls[0][2]["variables"]))
 check("cancelled order excluded", float(a["units_sold"].sum()) == 3.0, str(a["units_sold"].tolist()))
-check("zero-sale days filled (A: 06-01→06-04 = 4 rows)", len(a) == 4, str(a["date"].tolist()))
+# The series no longer stops at the last sale — it runs to the end of the fetch window,
+# so that a product which has gone quiet carries REAL zeros instead of simply ending.
+# That is what makes trailing_zero_run (and therefore dormancy detection) possible at all.
+# Asserted on shape rather than a row count, which would otherwise grow by one a day.
+_a_dates = pd.to_datetime(a["date"])
+check("the internal gap is filled (06-01..06-04 all present)",
+      set(_a_dates[_a_dates <= "2026-06-04"].dt.strftime("%Y-%m-%d"))
+      == {"2026-06-01", "2026-06-02", "2026-06-03", "2026-06-04"}, str(a["date"].tolist()[:6]))
+_a_end = _a_dates.max().date()
+check("and the series runs on past the last sale, to the window end",
+      _a_end > dt.date(2026, 6, 4), str(_a_end))
+# Never to today: a day still in progress is not an observed zero. See test_square_source.
+check("today is NOT in the series — it has not finished yet",
+      _a_end < dt.datetime.now().astimezone().date(), str(_a_end))
+check("every day after the last sale is a real zero",
+      float(a.loc[_a_dates > "2026-06-04", "units_sold"].sum()) == 0.0)
 check("filled days carry 0 units", a.loc[a["date"] == "2026-06-02", "units_sold"].iloc[0] == 0)
 check("discount netted into paid price (100 − 20/2 = 90)", float(a.loc[0, "price"]) == 90.00, str(a.loc[0, "price"]))
 check("discounted day flagged on_promotion", int(a.loc[0, "on_promotion"]) == 1)
 check("price carried forward across gap days", float(a.loc[1, "price"]) == 90.00, str(a.loc[1, "price"]))
 check("undiscounted day keeps full price", float(a.loc[3, "price"]) == 100.00, str(a.loc[3, "price"]))
-check("same-day line items merged (B = 4 units, one row)", len(b) == 1 and float(b.loc[0, "units_sold"]) == 4.0,
-      f"rows={len(b)} units={b['units_sold'].tolist()}")
+check("same-day line items merged (B = 4 units on its one sale day)",
+      float(b["units_sold"].sum()) == 4.0
+      and int((b["units_sold"] > 0).sum()) == 1,
+      f"rows={len(b)} total={b['units_sold'].sum()}")
 check("no date filter when days omitted is allowed", True)  # exercised implicitly below
+
+# The fill, against a FIXED window end so the assertion can't drift with the calendar.
+_fx = pd.DataFrame([{"date": "2026-06-01", "sku": "Q", "sku_name": "Q", "units_sold": 2,
+                     "price": 10.0, "on_promotion": 0}])
+_out = SH._fill_zero_days(_fx, window_end="2026-06-10")
+check("fill runs to the given window end", len(_out) == 10, str(len(_out)))
+check("and the tail is zeros", float(_out["units_sold"].sum()) == 2.0, str(_out["units_sold"].tolist()))
+check("price carried across the silent tail", float(_out["price"].iloc[-1]) == 10.0)
+_out2 = SH._fill_zero_days(_fx)
+check("no window end given -> ends at the last sale (old behaviour, still available)",
+      len(_out2) == 1, str(len(_out2)))
 
 # 2) rate limiting (both shapes) ---------------------------------------------------
 print("\n2) rate limiting")
@@ -115,14 +145,18 @@ fake_requests.queue = [
     FakeResponse(200, orders_page([order("2026-06-01", [li("X", 1, 10.00)])])),
 ]
 df2 = SH.fetch_sales(shop="test-store", token="shpat_fake", days=30)
-check("retries after HTTP 429 and succeeds", len(df2) == 1)
+check("retries after HTTP 429 and succeeds",
+      float(df2["units_sold"].sum()) == 1.0 and int((df2["units_sold"] > 0).sum()) == 1,
+      f"rows={len(df2)} total={df2['units_sold'].sum()}")
 
 fake_requests.queue = [
     FakeResponse(200, {"errors": [{"message": "Throttled", "extensions": {"code": "THROTTLED"}}]}),
     FakeResponse(200, orders_page([order("2026-06-01", [li("X", 1, 10.00)])])),
 ]
 df3 = SH.fetch_sales(shop="test-store", token="shpat_fake", days=30)
-check("retries after 200-THROTTLED error body and succeeds", len(df3) == 1)
+check("retries after 200-THROTTLED error body and succeeds",
+      float(df3["units_sold"].sum()) == 1.0 and int((df3["units_sold"] > 0).sum()) == 1,
+      f"rows={len(df3)} total={df3['units_sold'].sum()}")
 
 fake_requests.queue = [FakeResponse(429, {}, {"Retry-After": "0"})] * 6
 try:
@@ -138,7 +172,7 @@ try:
     SH.fetch_sales(shop="wrong-handle", token="shpat_fake", days=30)
     check("404 → actionable store-handle hint", False, "no exception")
 except SH.ShopifyError as e:
-    check("404 → actionable store-handle hint", "handle" in str(e).lower() and ".myshopify.com" in str(e), str(e))
+    check("404 → actionable store-handle hint", "store name" in str(e).lower() and ".myshopify.com" in str(e), str(e))
 
 fake_requests.queue = [FakeResponse(401, {"errors": "Invalid API key"})]
 try:
@@ -185,6 +219,27 @@ check("category + stock + unit cost mapped",
       meta["VAN-A"] == {"category": "Vanities", "stock": 42, "cost": 315.0}, str(meta.get("VAN-A")))
 check("missing fields → None (not crash)",
       meta["VAN-B"] == {"category": None, "stock": None, "cost": None}, str(meta.get("VAN-B")))
+
+# 5) shelf price and Shopify's sale mechanism (compare-at price) ---------------------
+print("\n5) price and compare-at price")
+fake_requests.queue = [
+    FakeResponse(200, gpage([{"productType": "Lamps", "variants": {"nodes": [
+        {"sku": "LAMP-SALE", "inventoryQuantity": 5, "price": "30.00", "compareAtPrice": "50.00",
+         "inventoryItem": None},
+        {"sku": "LAMP-FULL", "inventoryQuantity": 5, "price": "50.00", "compareAtPrice": None,
+         "inventoryItem": None},
+        {"sku": "LAMP-ODD", "inventoryQuantity": 5, "price": "50.00", "compareAtPrice": "40.00",
+         "inventoryItem": None}]}}], False, None)),
+]
+meta = SH.fetch_catalog_meta(shop="test-store", token="shpat_fake")
+check("on sale: original is the compare-at price, current is the price",
+      meta["LAMP-SALE"].get("listPrice") == 50.0 and meta["LAMP-SALE"].get("currentPrice") == 30.0,
+      str(meta["LAMP-SALE"]))
+check("not on sale: one price", meta["LAMP-FULL"].get("listPrice") == 50.0
+      and meta["LAMP-FULL"].get("currentPrice") == 50.0, str(meta["LAMP-FULL"]))
+check("a compare-at BELOW the price is not a sale",
+      meta["LAMP-ODD"].get("listPrice") == 50.0 and meta["LAMP-ODD"].get("currentPrice") == 50.0,
+      str(meta["LAMP-ODD"]))
 
 print(f"\n=== {len(PASS)} passed, {len(FAIL)} failed ===")
 if FAIL:

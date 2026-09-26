@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "connections": [
+    {
+      "id": "c464338a1d22",
+      "source": "square",
+      "label": "Square",
+      "creds": {
+        "accessToken": "EAAAl0FpFZ-XXQZe5tHxjJowHT91Tg-arL018obHV_L1zlD_MhCFRu-qL8uA_yKG",
+        "locationIds": [
+          "LGGJTJAFFGRVV",
+          "L195BHEW989ZP"
+        ]
+      },
+      "created_at": "2026-09-21T02:21:58.795715+00:00",
+      "last_used_at": "2026-09-26T04:15:35.243010+00:00"
+    }
+  ]
+}

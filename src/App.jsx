@@ -22,6 +22,10 @@ import { DEFAULT_PARAMS, autoStrategy, makeFolderId, poEtaDays, planningLeadTime
 export default function App() {
   const [lightMode,    setLightMode]    = useState(false);
   const [skuList,      setSkuList]      = useState([]);
+  // Live stock state per product, from the hourly readings. Polled rather than pushed:
+  // the readings only move once an hour, so anything faster is wasted, and a stale dot is
+  // a much smaller sin than a websocket to maintain.
+  const [availability, setAvailability] = useState({ skus: {}, sampler: null, sync: null, uplift: null });
   const [activeSku,    setActiveSku]    = useState(null);
   const [activeView,   setActiveView]   = useState("fleet"); // "fleet" | "suppliers" | "backtest" | "live" | "categorize"
   const [showProducts, setShowProducts] = useState(false);   // products drawer (slide-over over the content)
@@ -103,6 +107,27 @@ export default function App() {
   }, [holdingPct]);
   useEffect(() => { saveStorage("logitrack_folders", folders);   }, [folders]);
 
+  /* Hourly stock readings → the availability dots, and the two clocks' health.
+     Polled every 5 minutes. The underlying readings move once an hour, so this is already
+     generous; it is short enough that the page is never more than a few minutes stale
+     after you leave it open overnight, which is the case that matters. Failures are
+     swallowed: an unreachable status endpoint must never blank the dashboard, and the
+     previous reading staying on screen is the right behaviour for a transient blip. */
+  useEffect(() => {
+    let alive = true;
+    const pull = async () => {
+      try {
+        const r = await fetch(`${API}/api/availability`);
+        if (!r.ok) return;
+        const d = await r.json();
+        if (alive) setAvailability(d);
+      } catch { /* keep whatever we last had */ }
+    };
+    pull();
+    const id = setInterval(pull, 5 * 60 * 1000);
+    return () => { alive = false; clearInterval(id); };
+  }, []);
+
   // ⌘K / Ctrl+K opens the command palette; Esc closes palette or drawer.
   useEffect(() => {
     const onKey = (e) => {
@@ -151,7 +176,7 @@ export default function App() {
       headers: { "Content-Type": "application/json" },
       // Shared with the fleet card and AiDrawer — one question, one answer.
       body: JSON.stringify(buildScorecardBody(list, params, pos, suppliers)),
-    }, "Loading scorecard");
+    }, "Loading product status");
     setScorecardRows(res?.rows || []);
   }, [skuList, skuParams, openPOs]);
 
@@ -170,7 +195,7 @@ export default function App() {
     const protQ = p.protection ? `&protection=${p.protection}` : "";
     // plt1 is the PLANNED lead time (lane-aware, clamped). `leadTime` is the raw field and
     // must never reach the API — that mismatch is what 422'd.
-    const fc = await fetchJson(`${API}/api/forecast?sku_id=${encodeURIComponent(skuId)}&stock=${stock}&lead_time_days=${plt1}&coverage_days=${coverage}&strategy=${strategy}&forecast_months=3&units_on_order=${oq}${etaQ}${costQ}${feesQ}${protQ}&tz=${TZ}`,
+    const fc = await fetchJson(`${API}/api/forecast?sku_id=${encodeURIComponent(skuId)}&stock=${stock}&lead_time_days=${plt1}&coverage_days=${coverage}&strategy=${strategy}&forecast_months=3&units_on_order=${oq}${etaQ}${costQ}${feesQ}${protQ}&stock_source=${encodeURIComponent(p.stockSource || "unknown")}${p.stockCountedAt ? `&stock_counted_at=${encodeURIComponent(p.stockCountedAt)}` : ""}&tz=${TZ}`,
       undefined, `Forecast for ${skuId}`);
     if (!fc) return;
     setSkuForecasts(prev => [...prev.filter(f => f.skuId !== skuId), fc]);
@@ -217,7 +242,16 @@ export default function App() {
       }
       if (s.lastKnownCost != null && (cur?.unitCost == null || cur.unitCost === "")) {
         patch.unitCost = s.lastKnownCost;
-        patch.unitCostSource = "sheet";
+        /* The server now REMEMBERS where the cost came from, so a Square-derived cost is
+           no longer relabelled "sheet" on every restart. Falls back only when talking to
+           an older backend that doesn't send the field. */
+        patch.unitCostSource = s.costSource || "sheet";
+      }
+      /* Stock provenance survives the restore too. The server now falls back to StockLog
+         when the catalog frame has no units_in_stock column, which is every live sync —
+         so a restart no longer silently hands every product back uncounted. */
+      if (s.lastKnownStock != null && (cur?.stock == null || cur.stock === "")) {
+        patch.stockSource = s.stockSource || "sheet";
       }
       if (Object.keys(patch).length) {
         params[s.id] = { ...(cur ?? DEFAULT_PARAMS), ...patch };
@@ -231,7 +265,7 @@ export default function App() {
       const eta = poEtaDays(pos[s.id]);
       const etaQ2 = eta != null ? `&on_order_eta_days=${eta}` : "";
       const plt = planningLeadTime(s.id, p, suppliers).days;
-      return fetchJson(`${API}/api/forecast?sku_id=${encodeURIComponent(s.id)}&stock=${p.stock}&lead_time_days=${plt}&coverage_days=${p.coverage}&strategy=balanced&forecast_months=3&units_on_order=${oq}${etaQ2}&tz=${TZ}`,
+      return fetchJson(`${API}/api/forecast?sku_id=${encodeURIComponent(s.id)}&stock=${p.stock}&lead_time_days=${plt}&coverage_days=${p.coverage}&strategy=balanced&forecast_months=3&units_on_order=${oq}${etaQ2}&stock_source=${encodeURIComponent(p.stockSource || "unknown")}&tz=${TZ}`,
         undefined, `Forecast for ${s.id}`);
     }));
     setSkuForecasts(forecasts.filter(Boolean));
@@ -504,7 +538,17 @@ export default function App() {
     (info.loadedSkus || []).forEach(sku => {
       if (sku.lastKnownStock !== null && sku.lastKnownStock !== undefined) {
         const existing = updatedParams[sku.id] ?? DEFAULT_PARAMS;
-        updatedParams[sku.id] = { ...existing, stock: sku.lastKnownStock };
+        updatedParams[sku.id] = { ...existing, stock: sku.lastKnownStock,
+                                  stockSource: sku.stockSource || "live" };
+      } else {
+        /* The store returned no count for this product — it isn't inventory-tracked there.
+           Say so rather than leaving it to inherit a number: an uncounted product used to
+           land on the 500-unit default, which is indistinguishable from a real 500 and
+           reads as "plenty in stock, nothing to do". */
+        const existing = updatedParams[sku.id] ?? DEFAULT_PARAMS;
+        if (existing.stock == null || existing.stock === "" || existing.stockSource == null) {
+          updatedParams[sku.id] = { ...existing, stock: 0, stockSource: "unknown" };
+        }
       }
       // A Cost/Unit_Cost column in the file seeds the unit-cost field so margin /
       // protection economics work out of the box — but NEVER overwrite a cost the
@@ -514,9 +558,12 @@ export default function App() {
         if (existing.unitCost === undefined || existing.unitCost === null || existing.unitCost === "") {
           /* Stamp where it came from. The value alone can't be trusted the same way
              from every source, and the product page now says which one it was. A
-             hand-typed cost is still never overwritten — that guard is the `if`. */
+             hand-typed cost is still never overwritten — that guard is the `if`.
+             The server names the platform it came from ("shopify", "square", …); this
+             used to collapse everything that wasn't Shopify into "sheet", which would
+             have labelled a Square cost as having come from a spreadsheet. */
           updatedParams[sku.id] = { ...existing, unitCost: sku.lastKnownCost,
-                                    unitCostSource: sku.costSource === "shopify" ? "shopify" : "sheet" };
+                                    unitCostSource: sku.costSource || "sheet" };
         }
       }
     });
@@ -614,7 +661,7 @@ export default function App() {
     const subCount = cats.reduce((n, c) => n + Object.keys(tree[c].subs).length, 0);
     setConfirm({
       title: "Auto-organize into folders?",
-      body: `This creates ${cats.length} category folder${cats.length !== 1 ? "s" : ""}${subCount ? ` with ${subCount} subfolder${subCount !== 1 ? "s" : ""}` : ""} — mirroring the Grouping tab (${cats.slice(0, 4).join(", ")}${cats.length > 4 ? "…" : ""}) — and sorts your products in. You can rename, move, or remove anything afterward.`,
+      body: `This creates ${cats.length} category folder${cats.length !== 1 ? "s" : ""}${subCount ? ` with ${subCount} subfolder${subCount !== 1 ? "s" : ""}` : ""}, matching the Grouping tab (${cats.slice(0, 4).join(", ")}${cats.length > 4 ? "…" : ""}), and sorts your products into them. You can rename, move, or remove anything afterward.`,
       confirmLabel: "Create folders",
       onConfirm: () => setFolders(prev => {
         const next = { ...prev };
@@ -708,7 +755,7 @@ export default function App() {
       const a = document.createElement("a"); a.href = url; a.download = filename; a.click();
       URL.revokeObjectURL(url);
     } catch (e) {
-      alert("Could not generate the export — is the backend running? " + (e?.message || ""));
+      alert("Could not generate the export. Is the backend running? " + (e?.message || ""));
     } finally {
       setExporting(null);
     }
@@ -904,7 +951,8 @@ export default function App() {
             <FolderRow key={folderId} folderId={folderId} folder={folder} allFolders={folders} skuList={skuList} skuForecasts={skuForecasts}
               openPOs={openPOs} activeSku={activeSku} onSelectSku={setActiveSku} onDeleteSku={handleDeleteSku}
               onRename={renameFolder} onDelete={deleteFolder} onToggleCollapse={toggleFolderCollapse}
-              onRemoveSkuFromFolder={removeSkuFromFolder} onAddSubfolder={createSubfolder} lm={lm} scoreBySku={scoreBySkuApp} />
+              onRemoveSkuFromFolder={removeSkuFromFolder} onAddSubfolder={createSubfolder} lm={lm} scoreBySku={scoreBySkuApp}
+              availability={availability.skus || {}} samplerEnabled={availability.sampler?.enabled !== false} />
           ))}
 
           {ungroupedSkus.map(sku => {
@@ -914,6 +962,8 @@ export default function App() {
                 onDelete={handleDeleteSku} reorderDays={fc?.daysUntilReorder} hasOpenPO={!!openPOs[sku.id]} lm={lm}
                 healthStatus={scoreBySkuApp[sku.id]?.status}
                 provisional={fc?.tooNew || fc?.young}
+                availability={(availability.skus || {})[sku.id]}
+                samplerEnabled={availability.sampler?.enabled !== false}
                 secondaryAction={Object.keys(folders).length > 0
                   ? { title: "Move to folder", onClick: () => setAssignModal({ skuId: sku.id, skuName: sku.name }), iconPath: "M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V7z" }
                   : undefined} />
@@ -926,7 +976,8 @@ export default function App() {
         <div style={{ height: importHeight ?? undefined }} className={`p-4 border-t ${divider} space-y-3 shrink-0 overflow-y-auto sku-scroll`}>
           <div className={`text-[13px] uppercase tracking-widest ${importLabel} font-bold`}>Import Data</div>
           <UploadPanel onUploadSuccess={handleUploadSuccess} onUploadError={setUploadError}
-            isUploading={isUploading} setIsUploading={setIsUploading} lm={lm} holdingPct={holdingPct} setHoldingPct={setHoldingPct} />
+            isUploading={isUploading} setIsUploading={setIsUploading} lm={lm} holdingPct={holdingPct} setHoldingPct={setHoldingPct}
+            uplift={availability.uplift} availCounts={availability.counts} />
           {uploadError && (
             <div className={`text-[14px] rounded-lg p-2 leading-relaxed border ${"text-[var(--t-bad)] bg-[var(--t-bad-soft)] border-[var(--t-bad-line)]"}`}>{uploadError}</div>
           )}
@@ -939,7 +990,7 @@ export default function App() {
           {uploadInfo?.errors?.length > 0 && (
             <div className={`text-[14px] rounded-lg border overflow-hidden ${"text-[var(--t-warn)] bg-[var(--t-warn-soft)] border-[var(--t-warn-line)]"}`}>
               <div className="p-2 font-semibold">
-                ⚠️ {uploadInfo.errors.length} product{uploadInfo.errors.length !== 1 ? "s" : ""} skipped — not in your catalogue
+                ⚠️ {uploadInfo.errors.length} product{uploadInfo.errors.length !== 1 ? "s" : ""} skipped (not in your catalogue)
               </div>
               <ul className={`px-2 pb-2 space-y-0.5 border-t pt-1.5 ${"border-[var(--t-warn-line)]"}`}>
                 {uploadInfo.errors.map((e, i) => (
@@ -953,9 +1004,9 @@ export default function App() {
           {uploadInfo && Math.abs(uploadInfo.dateShiftDays || 0) > 21 && (
             <div className={`text-[14px] rounded-lg p-2 leading-relaxed border ${"text-[var(--t-warn)] bg-[var(--t-warn-soft)] border-[var(--t-warn-line)]"}`}>
               ⚠️ <span className="font-semibold">Dates shifted {Math.abs(uploadInfo.dateShiftDays).toLocaleString()} days.</span>{" "}
-              This file's data ends well in the past, so every date was moved forward to line up with today.
-              A shift this large relocates sales into different months and can distort seasonal patterns —
-              for accurate seasonality, re-export a file that runs up to the present.
+              This file ends well in the past, so every date was moved forward to line up with today.
+              That moves sales into different months and can distort seasonal patterns.
+              For accurate seasonality, re-export a file that runs up to the present.
             </div>
           )}
           {uploadInfo && (
@@ -973,7 +1024,7 @@ export default function App() {
                   )}
                   {uploadInfo.loadedSkus?.some(s => s.lastKnownCost != null) && (
                     <span className={`block ${"text-[var(--t-accent)]"}`}>
-                      Unit costs auto-detected for {uploadInfo.loadedSkus.filter(s => s.lastKnownCost != null).length} SKU{uploadInfo.loadedSkus.filter(s => s.lastKnownCost != null).length !== 1 ? "s" : ""} — margins &amp; protection tiers will use them (your own entries are never overwritten)
+                      Unit costs auto-detected for {uploadInfo.loadedSkus.filter(s => s.lastKnownCost != null).length} SKU{uploadInfo.loadedSkus.filter(s => s.lastKnownCost != null).length !== 1 ? "s" : ""}. Margins &amp; protection tiers will use them; your own entries are never overwritten.
                     </span>
                   )}
                   {uploadInfo.loadedSkus?.some(s => s.stockoutRowsDropped > 0) && (
@@ -1106,7 +1157,7 @@ export default function App() {
                 <>
                   <h2 className={`text-lg font-bold ${"text-[var(--t-ink)]"}`}>No products loaded</h2>
                   <p className={`text-[16.5px] mt-2 max-w-md ${"text-[var(--t-dim)]"}`}>
-                    Upload a sales file following the format to get started. Your file needs <span className="font-semibold">Date</span> and <span className="font-semibold">Units_Sold</span> columns — optional: SKU, Category, Price, On_Promotion, Units_In_Stock.
+                    Upload a sales file to get started. It needs <span className="font-semibold">Date</span> and <span className="font-semibold">Units_Sold</span> columns. Optional: SKU, Category, Price, On_Promotion, Units_In_Stock.
                   </p>
                   <p className={`text-[15px] mt-3 ${"text-[var(--t-dim)]"}`}>
                     Click <span className="font-semibold">Products</span> in the top bar to import a file or download the template.
@@ -1178,7 +1229,7 @@ export default function App() {
           <span>
             <span className="font-semibold">Testing your protection levels against your own sales history…</span>
             <span className={`ml-1.5 ${"text-[var(--t-dim)]"}`}>
-              a few minutes · figures shown are provisional estimates until it finishes
+              takes a few minutes · figures are estimates until it finishes
             </span>
           </span>
         </div>

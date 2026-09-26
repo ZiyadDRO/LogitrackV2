@@ -240,7 +240,9 @@ check("...with a 400 rather than a crash", _empty_ok)
 print("\n8) Price modeling flag + effective price")
 ev_now = [{"type": "price_change_permanent", "date": (TODAY - pd.Timedelta(days=5)).strftime("%Y-%m-%d"), "new_price": 17.5}]
 ev_fut = [{"type": "price_change_permanent", "date": (TODAY + pd.Timedelta(days=5)).strftime("%Y-%m-%d"), "new_price": 17.5}]
-check("effective price reflects an in-force permanent change", M._effective_price(20.0, ev_now, TODAY) == 17.5)
+# Events are forecast inputs. They never rewrite the recorded price — not even one
+# dated in the past. What was charged comes from sales data alone.
+check("an in-force permanent event does NOT rewrite the recorded price", M._effective_price(20.0, ev_now, TODAY) == 20.0)
 check("future-dated price change does NOT change current price", M._effective_price(20.0, ev_fut, TODAY) == 20.0)
 
 # 9) Regression: eligibility for intermittent demand must not crash ------------
@@ -248,7 +250,11 @@ print("\n9) Eligibility status (intermittent NameError regression)")
 try:
     s_long, _ = M.get_eligibility_status(400, 500, "intermittent", selling_days=50)
     s_thin, _ = M.get_eligibility_status(40, 10, "lumpy", selling_days=4)
-    check("intermittent + long history → CONFLICTING (no crash)", s_long == "CONFLICTING", s_long)
+    # Was CONFLICTING. That status was removed when grading was settled into three ordinal
+    # levels with the cause reported separately — a long-history intermittent product is
+    # now LOW_CONFIDENCE with reason "intermittent_demand", which says the same thing
+    # without a fourth, non-ordinal status nothing could rank.
+    check("intermittent + long history → LOW_CONFIDENCE (no crash)", s_long == "LOW_CONFIDENCE", s_long)
     check("intermittent + thin history → INSUFFICIENT (no crash)", s_thin == "INSUFFICIENT", s_thin)
 except NameError as e:
     check("eligibility for intermittent demand does not raise", False, str(e))
@@ -1195,7 +1201,7 @@ import exports as _EXs
 _vs = M._export_view("SLOW-1", {"stock": 322, "unitCost": 272.0, "leadTime": 14, "coverage": 30})
 _wbs = _EXs.build_sku_workbook(_vs)
 _ovr = {r[0]: r[1] for r in _wbs["Overview"].iter_rows(values_only=True) if r and r[0]}
-check("the export leads with how it sells", "How it sells" in _ovr and _ovr["How it sells"] != "—")
+check("the export leads with how it sells", "How it sells" in _ovr and _ovr["How it sells"] not in ("—", "-"))
 _frows = [r for r in _wbs["Daily Forecast"].iter_rows(values_only=True) if r and r[1] == "Forecast"]
 check("exported daily units are fractional, not zeros",
       any(isinstance(r[2], float) and 0 < r[2] < 2 for r in _frows[:5]), str(_frows[:2]))

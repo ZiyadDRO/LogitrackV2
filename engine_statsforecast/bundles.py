@@ -237,5 +237,5 @@ def explain(report: dict, dep: dict | None = None) -> str:
     if heavy:
         parts.append(f"{len(heavy)} of them get most of their demand through bundles "
                      f"({', '.join(sorted(heavy)[:3])}"
-                     f"{'…' if len(heavy) > 3 else ''}) — forecast those with the bundle in mind.")
+                     f"{'…' if len(heavy) > 3 else ''}). Forecast those with the bundle in mind.")
     return " ".join(parts)

@@ -464,12 +464,12 @@ export default function SupplierPanel({ suppliers, setSuppliers, skuList, lm, op
           <div style={{ ...panel, padding:"16px 18px", display:"grid",
             gridTemplateColumns:"repeat(4, minmax(0,1fr))", alignItems:"start" }}>
             {fig("Suppliers", supList.length, supList.length === 1 ? "one on file" : "on file", undefined, 0)}
-            {fig("On-time rate", onTime != null ? `${onTime}%` : "—",
+            {fig("On-time rate", onTime != null ? `${onTime}%` : "-",
               rated.length ? `across ${rated.reduce((a, x) => a + x.st.n, 0)} deliveries`
                 : timed.length ? `${unpromisedAll} logged without an expected date`
                 : "no completed orders yet",
               onTime == null ? undefined : onTime >= 90 ? T.green : onTime >= 75 ? T.over : T.red, 1)}
-            {fig("Avg lead time", avgLead != null ? `${avgLead}d` : "—",
+            {fig("Avg lead time", avgLead != null ? `${avgLead}d` : "-",
               laneBits.length ? `P80 · ${laneBits.join(" · ")}`
                 : avgLead != null ? "order → arrival" : "no completed orders yet", undefined, 2)}
             {fig("In transit", inTransit, inTransit ? "open orders" : "none open",
@@ -492,7 +492,7 @@ export default function SupplierPanel({ suppliers, setSuppliers, skuList, lm, op
         <div style={{ ...panel, padding:"34px 24px", textAlign:"center", marginTop:12 }}>
           <div style={{ fontSize:16.5, fontWeight:600 }}>No suppliers yet</div>
           <div style={{ fontSize:15, color:T.soft, marginTop:6, lineHeight:1.6 }}>
-            Add a supplier, then link orders using “Mark Order In Transit” on any SKU. Orders will appear here for tracking.
+            Add a supplier, then link orders with “Mark Order In Transit” on any SKU. Orders appear here for tracking.
           </div>
         </div>
       )}
@@ -614,15 +614,15 @@ export default function SupplierPanel({ suppliers, setSuppliers, skuList, lm, op
                     <div>
                       <div style={figCap}>On time</div>
                       <div style={{ ...mono, ...figVal, color: st.onTimeRate == null ? T.faint : otColor(st.onTimeRate) }}>
-                        {st.onTimeRate != null ? `${st.onTimeRate}%` : "—"}
+                        {st.onTimeRate != null ? `${st.onTimeRate}%` : "-"}
                       </div>
                     </div>
                     <div>
                       <div style={figCap}>
-                        <Tip text="The plain average of every completed delivery. Useful as a sense of the middle, but never plan against it — half of all deliveries arrive later than average, which is why the order dates use the P80 instead.">Average wait</Tip>
+                        <Tip text="The plain average of every completed delivery. Don't plan against it: half of all deliveries arrive later than average. Order dates use the P80 instead.">Average wait</Tip>
                       </div>
                       <div style={{ ...mono, ...figVal, color: st.avg == null ? T.faint : T.soft }}>
-                        {st.avg != null ? <>{st.avg}<span style={figUnit}>days</span></> : "—"}
+                        {st.avg != null ? <>{st.avg}<span style={figUnit}>days</span></> : "-"}
                       </div>
                     </div>
                     <div>
@@ -630,7 +630,7 @@ export default function SupplierPanel({ suppliers, setSuppliers, skuList, lm, op
                         <Tip text="The planning figure. 80% of this supplier's deliveries arrived within this many days, so ordering against it leaves you short only about one time in five. The Backtest and product pages call it P80 too.">We plan on</Tip>
                       </div>
                       <div style={{ ...mono, ...figVal, color: st.p80 == null ? T.faint : T.amber }}>
-                        {st.p80 != null ? <>{st.p80}<span style={figUnit}>days</span></> : "—"}
+                        {st.p80 != null ? <>{st.p80}<span style={figUnit}>days</span></> : "-"}
                       </div>
                       <div style={{ fontSize:13.5, color:T.faint, marginTop:3, whiteSpace:"nowrap" }}>P80 · 80th percentile</div>
                     </div>
@@ -724,7 +724,7 @@ export default function SupplierPanel({ suppliers, setSuppliers, skuList, lm, op
                                     )}
                                   </div>
                                   <div style={{ display:"flex", alignItems:"center", gap:3 }}>
-                                    <input type="number" min="1" placeholder={mixed ? "mixed" : "—"}
+                                    <input type="number" min="1" placeholder={mixed ? "mixed" : "-"}
                                       value={ownSet ? own : (derived ?? "")}
                                       onChange={e => setSupLane(sup.id, k, e.target.value)}
                                       title={ownSet ? "Set on this supplier. Clear it to fall back to the product's own number."
@@ -734,22 +734,22 @@ export default function SupplierPanel({ suppliers, setSuppliers, skuList, lm, op
                                         fontStyle: ownSet ? "normal" : "italic", color: ownSet ? T.ink : T.soft }} />
                                     <span style={{ ...mono, fontSize:12.5, color:T.faint }}>d</span>
                                   </div>
-                                  <span style={v.avg != null ? num : dash}>{v.avg != null ? `${v.avg}d` : "—"}</span>
+                                  <span style={v.avg != null ? num : dash}>{v.avg != null ? `${v.avg}d` : "-"}</span>
                                   <span style={{ ...(v.p80 != null ? num : dash), color: v.n >= LEAD_TIME_MIN_DELIVERIES ? T.amber : (v.p80 != null ? T.ink : T.faint) }}>
-                                    {v.p80 != null ? `${v.p80}d` : "—"}
+                                    {v.p80 != null ? `${v.p80}d` : "-"}
                                   </span>
                                   <span style={{ ...(v.onTimeRate != null ? num : dash), color: v.onTimeRate != null ? otColor(v.onTimeRate) : T.faint }}
                                     title={v.onTimeRate == null && v.n > 0
                                       ? "These deliveries were logged without an expected date, so there's nothing to score against."
                                       : undefined}>
-                                    {v.onTimeRate != null ? `${v.onTimeRate}%` : "—"}
+                                    {v.onTimeRate != null ? `${v.onTimeRate}%` : "-"}
                                   </span>
-                                  <span style={{ ...dash, color: v.n ? T.soft : T.faint }}>{v.n || "—"}</span>
+                                  <span style={{ ...dash, color: v.n ? T.soft : T.faint }}>{v.n || "-"}</span>
                                 </div>
                               );
                             })}
                             <div style={{ ...sub, marginTop:8 }}>
-                              Baseline is what every product here plans from until that method has {LEAD_TIME_MIN_DELIVERIES} deliveries of its own; a product that sets its own number keeps it.
+                              Products here plan from the baseline until that method has {LEAD_TIME_MIN_DELIVERIES} deliveries of its own. A product that sets its own number keeps it.
                               {byLane.untagged > 0 && ` ${byLane.untagged} untagged.`}
                               {unpromised > 0 && ` On-time skips ${unpromised} ${unpromised === 1 ? "delivery" : "deliveries"} logged without an expected date.`}
                             </div>
@@ -865,13 +865,13 @@ export default function SupplierPanel({ suppliers, setSuppliers, skuList, lm, op
                                           )}
                                         </div>
                                       </div>
-                                      <span style={{ ...mono, textAlign:"right", fontSize:14, color:T.soft }}>{laneName || "—"}</span>
+                                      <span style={{ ...mono, textAlign:"right", fontSize:14, color:T.soft }}>{laneName || "-"}</span>
                                       <span style={{ ...mono, textAlign:"right", fontSize:14.5, fontWeight:600, color: hasData ? T.ink : T.faint }}>
-                                        {hasData ? `${st2.avg}d` : "—"}
+                                        {hasData ? `${st2.avg}d` : "-"}
                                       </span>
                                       <span style={{ ...mono, textAlign:"right", fontSize:14.5, fontWeight:600,
                                         color: hasData && st2.p80 != null ? (reliable ? T.amber : T.soft) : T.faint }}>
-                                        {hasData && st2.p80 != null ? `${st2.p80}d` : "—"}
+                                        {hasData && st2.p80 != null ? `${st2.p80}d` : "-"}
                                       </span>
                                       <span style={{ ...mono, textAlign:"right", fontSize:14, color: hasData ? T.soft : T.faint }}
                                         title={setAside > 0 ? `${setAside} earlier ${setAside === 1 ? "delivery" : "deliveries"} set aside by a lead-time change` : undefined}>
@@ -886,10 +886,10 @@ export default function SupplierPanel({ suppliers, setSuppliers, skuList, lm, op
                                           <div style={{ ...sub, border:`2px solid ${T.amber}44`, background:`${T.amber}10`, padding:"7px 9px", marginBottom:8 }}>
                                             <b style={{ color:T.amber }}>
                                               Lead time changed {isoToDisplay(changedOn)}
-                                              {lastChange && !lastChange.legacy ? ` — ${describeLeadTimeChange(lastChange)}` : ""}.
+                                              {lastChange && !lastChange.legacy ? `: ${describeLeadTimeChange(lastChange)}` : ""}.
                                             </b>{" "}
                                             Figures here cover {st2.n === 0 ? "no deliveries" : `the ${st2.n} ${st2.n === 1 ? "delivery" : "deliveries"}`} since.
-                                            {setAside > 0 && ` ${setAside} earlier ${setAside === 1 ? "one is" : "ones are"} set aside — nothing was deleted.`}
+                                            {setAside > 0 && ` ${setAside} earlier ${setAside === 1 ? "one is" : "ones are"} set aside. Nothing was deleted.`}
                                           </div>
                                         )}
                                         {pp ? (() => {
@@ -912,13 +912,13 @@ export default function SupplierPanel({ suppliers, setSuppliers, skuList, lm, op
                                                   <span title={t.inherited ? `Inherited from ${sup.name}` : undefined}
                                                     style={{ ...mono, textAlign:"right", fontStyle: t.inherited ? "italic" : "normal",
                                                       color: t.baseline == null ? T.faint : t.inherited ? T.soft : T.ink }}>
-                                                    {t.baseline != null ? `${t.baseline}d` : "—"}
+                                                    {t.baseline != null ? `${t.baseline}d` : "-"}
                                                   </span>
                                                   <span style={{ ...mono, textAlign:"right", fontWeight: t.p80 != null ? 600 : 400,
                                                     color: t.p80 != null ? T.green : T.faint }}>
-                                                    {t.p80 != null ? `${t.p80}d` : "—"}
+                                                    {t.p80 != null ? `${t.p80}d` : "-"}
                                                   </span>
-                                                  <span style={{ ...mono, textAlign:"right", color:T.soft }}>{t.n || "—"}</span>
+                                                  <span style={{ ...mono, textAlign:"right", color:T.soft }}>{t.n || "-"}</span>
                                                 </div>
                                               ))}
                                               <div style={{ ...sub, marginTop:8 }}>
@@ -1064,7 +1064,7 @@ export default function SupplierPanel({ suppliers, setSuppliers, skuList, lm, op
                             <div style={{ gridColumn:"span 2" }}>
                               <label style={lbl}>Product</label>
                               <select value={orderForm.skuId || ""} onChange={e => setOrderForm(p => ({ ...p, skuId: e.target.value }))} style={inp}>
-                                <option value="">— none (don&apos;t change stock) —</option>
+                                <option value="">None (don&apos;t change stock)</option>
                                 {skuList.map(s => <option key={s.id} value={s.id}>{s.name} ({s.id})</option>)}
                               </select>
                             </div>
@@ -1092,10 +1092,10 @@ export default function SupplierPanel({ suppliers, setSuppliers, skuList, lm, op
                                       onChange={e => setOrderForm(p => ({ ...p, expectedDate: e.target.value }))} style={inp} />
                                     <div style={{ ...sub, marginTop:3 }}>
                                       {orderForm.expectedDate ? "Your date."
-                                        : basis ? <span title={basis.detail}>{basis.label}{basis.disagrees ? " — deliveries disagree" : ""}</span>
+                                        : basis ? <span title={basis.detail}>{basis.label}{basis.disagrees ? " (deliveries disagree)" : ""}</span>
                                         : auto ? `${FREIGHT_MODES[mode]} baseline for ${sup.name}.`
                                         : sku ? "No lead time known for this product yet."
-                                        : "No baseline for this method — on-time can't be scored without a date."}
+                                        : "No baseline for this method. On-time can't be scored without a date."}
                                     </div>
                                   </>
                                 );
@@ -1107,7 +1107,7 @@ export default function SupplierPanel({ suppliers, setSuppliers, skuList, lm, op
                             <div style={{ gridColumn:"span 2" }}>
                               <label style={{ display:"flex", alignItems:"center", gap:8, cursor:"pointer", userSelect:"none" }}>
                                 <input type="checkbox" checked={!!orderForm.notArrived} onChange={e => setOrderForm(p => ({ ...p, notArrived: e.target.checked }))} />
-                                <span style={{ fontSize:15, color:T.ink }}>Not arrived yet — track as in transit (stock updates when it arrives)</span>
+                                <span style={{ fontSize:15, color:T.ink }}>Not arrived yet: track as in transit (stock updates when it arrives)</span>
                               </label>
                             </div>
                             <div style={{ gridColumn:"span 2" }}><label style={lbl}>Notes (optional)</label><input type="text" value={orderForm.notes || ""} onChange={e => setOrderForm(p => ({ ...p, notes: e.target.value }))} style={inp} /></div>

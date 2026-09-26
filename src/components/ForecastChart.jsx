@@ -22,8 +22,9 @@ export function ChartTooltip({ active, payload, label, lm }) {
     if (p.dataKey === "rangeLow" && p.value != null && !isNaN(p.value)) low = Math.round(p.value);
     if (p.dataKey === "rangeHigh" && p.value != null && !isNaN(p.value)) high = Math.round(p.value);
   }
+  const todayP = payload.find(p => p.dataKey === "todaySoFar" && p.value != null);
 
-  if (value === null) return null;
+  if (value === null && !todayP) return null;
 
   const T = terminal(lm);
   const style = {
@@ -40,9 +41,18 @@ export function ChartTooltip({ active, payload, label, lm }) {
   return (
     <div style={style}>
       <div style={{ color: T.dim, fontSize: 11, marginBottom: 3 }}>{dateStr}</div>
-      <div><span style={{ fontWeight: 600, color: T.ink }}>{value.toLocaleString()}</span> units</div>
+      {todayP && (
+        <div><span style={{ fontWeight: 600, color: T.ink }}>{Math.round(todayP.value).toLocaleString()}</span> sold so far today
+          <div style={{ color: T.soft, fontSize: 11 }}>
+            partial day{todayP.payload?.todayStale ? " · last check over an hour old" : ""} · not in the forecast yet
+          </div>
+        </div>
+      )}
+      {value !== null && (
+        <div><span style={{ fontWeight: 600, color: T.ink }}>{value.toLocaleString()}</span> units{todayP ? " forecast" : ""}</div>
+      )}
       {low != null && high != null && (
-        <div style={{ color: T.soft, fontSize: 11.5, marginTop: 3 }}>{low.toLocaleString()} – {high.toLocaleString()} units range</div>
+        <div style={{ color: T.soft, fontSize: 11.5, marginTop: 3 }}>{low.toLocaleString()} to {high.toLocaleString()} units range</div>
       )}
     </div>
   );
@@ -59,7 +69,7 @@ export function RefLineLabel({ viewBox, value, color, yOffset = 4, flip = false 
   );
 }
 
-export function ForecastChart({ historyPoints, futurePoints, rangePoints, stockoutTime, reorderTime, poLandsTime = null, intervalWidth, upcomingPromos, lm }) {
+export function ForecastChart({ historyPoints, futurePoints, rangePoints, stockoutTime, reorderTime, poLandsTime = null, intervalWidth, upcomingPromos, holidayWindows = [], lm, todaySales = null }) {
   /* The strip's labels are laid out in pixels, so it has to know how wide it
      actually is — percent-only layout is what let labels overrun each other and
      the card edge. Hooks run before any early return. */
@@ -91,6 +101,21 @@ export function ForecastChart({ historyPoints, futurePoints, rangePoints, stocko
     existing.rangeLow  = rp?.y?.[0] ?? null;
     existing.rangeHigh = rp?.y?.[1] ?? null;
     dataMap.set(fp.x, existing);
+  }
+  /* TODAY SO FAR — its own series, never folded into `y`.
+     The history line stops at the last COMPLETE day on purpose (a day in progress is not
+     a small day, it is an unknown one), which left the chart silent about the hours
+     since midnight: a shop that had traded all day looked exactly like one that had not.
+     This marks today's running total as a separate, visibly different point so it can
+     never be read as a finished day or pull the history line down to meet it. */
+  if (todaySales && todaySales.forToday && !todaySales.unsupported && todaySales.day) {
+    const tx = Date.parse(`${todaySales.day}T00:00:00Z`);
+    if (Number.isFinite(tx)) {
+      const existing = dataMap.get(tx) || { x: tx };
+      existing.todaySoFar = Number(todaySales.units) || 0;
+      existing.todayStale = !!todaySales.stale;
+      dataMap.set(tx, existing);
+    }
   }
   const data = Array.from(dataMap.values()).sort((a, b) => a.x - b.x);
 
@@ -194,7 +219,7 @@ export function ForecastChart({ historyPoints, futurePoints, rangePoints, stocko
      over them, and is clamped to the strip so the card can no longer cut it off.
      On a long axis the gap is only a few pixels wide, and a bracket that thin sits
      entirely behind its own caption — so it is drawn only when it can be seen. */
-  const capText = leadGap ? `${leadGap.days} days of lead time — why that date is the deadline` : "";
+  const capText = leadGap ? `${leadGap.days} days of lead time: why that date is the deadline` : "";
   const capShort = leadGap ? `${leadGap.days}d lead time` : "";
   const capA = leadGap ? pxOf(leadGap.a) : 0;
   const capB = leadGap ? pxOf(leadGap.b) : 0;
@@ -263,6 +288,15 @@ export function ForecastChart({ historyPoints, futurePoints, rangePoints, stocko
         <Tooltip content={<ChartTooltip lm={lm} />} />
         <Legend wrapperStyle={{ fontSize: 10, fontFamily: "ui-monospace, monospace", color: legendColor, paddingBottom: 4 }} />
 
+        {/* Holidays the forecast lifts (or lowers), shaded on their own dates. Grey, so
+            they don't compete with the promotions you entered, and unlabelled because
+            neighbouring holidays would print over each other: the line under the chart
+            names them. Day spans run to the end of the last day. */}
+        {(holidayWindows || []).map((h, i) => (
+          <ReferenceArea key={`h${i}`} x1={new Date(h.start + "T00:00:00Z").getTime()}
+            x2={new Date(h.end + "T00:00:00Z").getTime() + 86400000}
+            fill={CT.ink} fillOpacity={lm ? 0.05 : 0.06} />
+        ))}
         {(upcomingPromos || []).map((p, i) => (
           <ReferenceArea key={i} x1={new Date(p.date + "T00:00:00Z").getTime()} x2={new Date((p.end_date || p.date) + "T00:00:00Z").getTime()}
             fill={CT.blue} fillOpacity={lm ? 0.12 : 0.10} label={{ value: p.label || "Promo", fill: CT.blue, fontSize: 11 }} />
@@ -272,6 +306,11 @@ export function ForecastChart({ historyPoints, futurePoints, rangePoints, stocko
         <Area name="_rangeLow" dataKey="rangeLow" stroke="none" fill={bandMask} fillOpacity={1} legendType="none" isAnimationActive={false} connectNulls dot={false} activeDot={false} />
         <Area name="Historical Sales" dataKey="y" stroke={CT.ink} strokeWidth={1.6} fill={CT.ink} fillOpacity={lm ? 0.07 : 0.05} isAnimationActive={false} connectNulls dot={false} activeDot={{ r: 3, fill: CT.ink }} />
         <Line name="Forecast" dataKey="forecast" stroke={CT.amber} strokeWidth={2} strokeDasharray="5 4" isAnimationActive={false} connectNulls dot={false} activeDot={{ r: 3, fill: CT.amber }} />
+        {/* A ring, not a filled dot, and no connecting line: it is a partial reading. */}
+        <Line name="Today so far" dataKey="todaySoFar" stroke="none" isAnimationActive={false}
+          legendType="circle" connectNulls={false}
+          dot={{ r: 5, stroke: CT.ink, strokeWidth: 2, fill: CT.panel }}
+          activeDot={{ r: 6, stroke: CT.ink, strokeWidth: 2, fill: CT.panel }} />
 
         {refLines.map((rl, i) => (
           <ReferenceLine key={i} x={rl.x} stroke={rl.stroke} strokeWidth={rl.width} strokeDasharray={rl.dash}

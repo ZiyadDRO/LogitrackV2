@@ -38,6 +38,7 @@ ESTABLISHED_SALES  = 60        # low guardrail; selling-days carries the real ev
 NEW_DAYS           = 60    # below this, a SKU is "new/thin" (its own history is weak)
 MIN_HISTORY_DAYS   = 90    # below this AND no relatives → abstain
 MIN_HISTORY_SALES  = 30
+MIN_HISTORY_SELLING_DAYS = 15  # the weak-band mirror of ESTABLISHED_SELLING_DAYS
 MIN_RELATIVES      = 2     # related SKUs (each with usable history) needed to pool
                            # (2 solid category-mates is enough to borrow a seasonal shape;
                            #  the young/baseline gates still mute a brand-new SKU's display)
@@ -50,7 +51,7 @@ MIN_GROUP_COHESION = 0.35  # broad/narrow pools below this are too incoherent to
 # cost/unit_cost are unit ECONOMICS (they seed the Scorecard's cost field on
 # upload), not product attributes — grouping on them would be meaningless.
 RESERVED_COLS = {"ds", "y", "date", "units_sold", "price", "on_promotion",
-                 "units_in_stock", "sku", "sku_name", "cost", "unit_cost"}
+                 "units_in_stock", "sku", "sku_name", "cost", "unit_cost", "price_mixed", "price_listed"}
 
 # Within a broad category, prefer fields that describe what the product *is*
 # before fields that describe incidental traits. This keeps a "floating vanity"
@@ -581,6 +582,28 @@ _MONTHS = ["January", "February", "March", "April", "May", "June", "July", "Augu
            "September", "October", "November", "December"]
 
 
+def category_peers(sku_id: str, groups: dict, catalog: dict, limit: int = 25):
+    """Frames of the products a holiday lift or a price response can be borrowed from:
+    the same category group, or the whole store when there are no categories. Broader
+    than the behavioural cluster on purpose. A cluster is picked for a distinctive
+    seasonal SHAPE and is often one or two products; how shoppers react to Black Friday
+    or to 20% off is shared much more widely than that. Closest in sales volume first."""
+    g = groups.get(sku_id)
+    ids = [m for m, gg in groups.items() if m != sku_id and m in catalog and (g is None or gg == g)]
+    if not ids:
+        ids = [m for m in catalog if m != sku_id]
+    tgt = catalog.get(sku_id, {}).get("df")
+    tmean = float(tgt["y"].mean()) if tgt is not None and len(tgt) else 0.0
+
+    def dist(m):
+        d = catalog[m].get("df")
+        v = float(d["y"].mean()) if d is not None and len(d) else 0.0
+        return abs(np.log((v + 0.1) / (tmean + 0.1)))
+
+    ids = sorted(ids, key=dist)[:limit]
+    return [catalog[m]["df"] for m in ids if catalog[m].get("df") is not None and len(catalog[m]["df"])]
+
+
 def behavioral_relatives(sku_id: str, groups: dict, catalog: dict,
                          clusters: dict | None = None, min_days: int = RELATIVE_MIN_DAYS,
                          baseline=None):
@@ -673,9 +696,9 @@ def route(days_history: int, total_sales: int, demand_class: str,
     # 1) Established, regular demand → Prophet (the main workhorse).
     if established and not sparse:
         return "prophet", (
-            f"This product has a solid run of its own history (sales spanning {days_history} days, "
-            f"{total_sales:,} units sold across {selling_days:,} selling days) with a regular sales "
-            f"pattern, so it's forecast directly with Prophet.")
+            f"This product has a solid, regular history of its own ({days_history} days, "
+            f"{total_sales:,} units over {selling_days:,} selling days), so it's forecast directly "
+            f"with Prophet.")
 
     # 2) Genuinely INTERMITTENT/LUMPY demand with enough of its OWN history → Croston/TSB.
     #    Croston is purpose-built for sporadic demand. Pooling such an item into the global
@@ -683,10 +706,10 @@ def route(days_history: int, total_sales: int, demand_class: str,
     #    so a sporadic product with a real track record uses Croston even when relatives exist.
     if intermittent and days_history >= NEW_DAYS:
         return "croston", (
-            f"Demand is intermittent (sells sporadically, with many zero-sale days) and there's "
-            f"enough of its own history ({days_history} days) to model that pattern, so a specialist "
-            f"intermittent-demand model (Croston/TSB) is used — rather than a pooled model that "
-            f"would apply the category's typical volume and over-forecast a slow-mover.")
+            f"Demand is intermittent (many zero-sale days) and there's enough of its own history "
+            f"({days_history} days) to model it, so a specialist intermittent-demand model "
+            f"(Croston/TSB) is used. A pooled model would apply the category's typical volume "
+            f"and over-forecast a slow-mover.")
 
     # 3) New / thin / no-own-sales, but enough related products to learn from → global pooled.
     #    (A NEW sparse SKU can't yet be told apart from a genuinely intermittent one, so it
@@ -723,19 +746,16 @@ def route(days_history: int, total_sales: int, demand_class: str,
     if days_history < MIN_HISTORY_DAYS or total_sales < MIN_HISTORY_SALES:
         if pool_incoherent:
             return "abstain", (
-                f"LAST-RESORT ESTIMATE — this product has little history of its own "
-                f"({days_history} days, {total_sales} units), and while it does have "
-                f"{n_relatives} category peers, those peers do not agree on a seasonal shape "
-                f"(cohesion {pool_cohesion:.2f}, below the {MIN_GROUP_COHESION:.2f} needed to "
-                f"trust a borrowed pattern), so borrowing from them would invent a season this "
-                f"product may not have. It falls back to a flat moving average; treat it as a "
+                f"Last-resort estimate. This product has little history of its own "
+                f"({days_history} days, {total_sales} units), and its {n_relatives} category "
+                f"peers don't agree on a seasonal shape (cohesion {pool_cohesion:.2f}, below the "
+                f"{MIN_GROUP_COHESION:.2f} needed). It uses a flat moving average; treat it as a "
                 f"rough placeholder until it builds more history or its peer group tightens up.")
         return "abstain", (
-            f"LAST-RESORT ESTIMATE — this product has neither enough of its own sales history "
-            f"({days_history} days, {total_sales} units) nor enough similar products to borrow from, "
-            f"so there is nothing solid to forecast from. It falls back to a flat moving average; "
-            f"treat it as a rough placeholder, not a real forecast, until it builds up more history "
-            f"or gets categorized alongside similar products.")
+            f"Last-resort estimate. This product has neither enough sales history of its own "
+            f"({days_history} days, {total_sales} units) nor similar products to borrow from, so it "
+            f"uses a flat moving average. Treat it as a rough placeholder until it builds more "
+            f"history or is categorized with similar products.")
 
     # 6) Default: regular enough to use Prophet even if not 'established'.
     return "prophet", (
@@ -747,5 +767,5 @@ ROUTE_LABELS = {
     "prophet":  "Prophet (own history)",
     "global":   "Global model (pooled from related products)",
     "croston":  "Croston/TSB (intermittent demand)",
-    "abstain":  "Last-resort estimate — no history, no relatives",
+    "abstain":  "Last-resort estimate (no history, no relatives)",
 }

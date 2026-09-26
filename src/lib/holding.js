@@ -14,7 +14,7 @@
 // Sources are ordinary inventory-carrying-cost components; the split is what lets the
 // result be explained rather than asserted.
 export const CAPITAL = {
-  own_cash:   { pct: 7,  label: "Own cash, no borrowing", note: "opportunity cost — what that money could earn elsewhere" },
+  own_cash:   { pct: 7,  label: "Own cash, no borrowing", note: "opportunity cost (what that money could earn elsewhere)" },
   bank_loan:  { pct: 11, label: "Bank loan or credit line", note: "typical small-business borrowing cost" },
   expensive:  { pct: 20, label: "Card, factoring or merchant advance", note: "high-cost financing" },
   investor:   { pct: 13, label: "Investor funded", note: "expected return on capital" },
@@ -29,17 +29,17 @@ export const STORAGE = {
 };
 
 export const OBSOLESCENCE = {
-  stable:     { pct: 1,  label: "Barely dates — same product for years" },
-  seasonal:   { pct: 4,  label: "Seasonal — leftovers get discounted" },
-  trend:      { pct: 9,  label: "Style/trend driven — goes out of fashion" },
-  tech:       { pct: 8,  label: "Tech — superseded by new models" },
-  perishable: { pct: 15, label: "Dated or perishable — expires" },
+  stable:     { pct: 1,  label: "Barely dates: same product for years" },
+  seasonal:   { pct: 4,  label: "Seasonal: leftovers get discounted" },
+  trend:      { pct: 9,  label: "Style/trend driven: goes out of fashion" },
+  tech:       { pct: 8,  label: "Tech: superseded by new models" },
+  perishable: { pct: 15, label: "Dated or perishable: expires" },
 };
 
 export const RISK = {
   durable:    { pct: 1,  label: "Durable, low theft risk" },
-  fragile:    { pct: 3,  label: "Fragile — breakages happen" },
-  valuable:   { pct: 4,  label: "Small and valuable — shrinkage risk" },
+  fragile:    { pct: 3,  label: "Fragile: breakages happen" },
+  valuable:   { pct: 4,  label: "Small and valuable: shrinkage risk" },
 };
 
 const INSURANCE_TAX = 1;   // insurance + property/inventory tax, roughly flat

@@ -59,8 +59,8 @@ export default function HoldingWizard({ lm = false, onApply, onClose }) {
       <div>
         <h3 className={`text-[16.5px] font-bold ${text_}`}>Work out your holding cost</h3>
         <p className={`text-[14px] ${muted} mt-1 leading-relaxed`}>
-          Five questions. The rate is calculated from your answers — the same answers always give
-          the same number, and you can see every part of it below.
+          Five questions. The same answers always give the same rate, and every part of it is
+          shown below.
         </p>
       </div>
 
@@ -78,7 +78,7 @@ export default function HoldingWizard({ lm = false, onApply, onClose }) {
         </div>
         <select value={industry} onChange={(e) => { setIndustry(e.target.value); setHow("manual"); }}
           className={`mt-2 w-full rounded-lg border px-2 py-1.5 text-[15px] ${inp}`}>
-          <option value="">— or pick your industry —</option>
+          <option value="">Or pick your industry</option>
           {Object.entries(INDUSTRY).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
         </select>
         {industry && (
@@ -87,7 +87,7 @@ export default function HoldingWizard({ lm = false, onApply, onClose }) {
             {how === "keyword" ? " (matched from your description)"
               : how === "ai" ? " (identified by AI)"
               : how === "cached" ? " (same as last time you typed this)" : ""}
-            . It only sets the starting points below — change any of them.
+            . It only sets the starting points below. Change any of them.
           </p>
         )}
       </div>

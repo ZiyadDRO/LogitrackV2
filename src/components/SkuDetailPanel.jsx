@@ -8,14 +8,75 @@ import { Tip, ReliabilityBadge, MetricCard, MonthForecastCard, MonthlySummaryTab
 import { formatDate, isoToDisplay, urgencyLevel, autoStrategy, computeSkuLeadTimeStats,
          makeSupId, makeOrdId, todayMs, todayStr, STATUS_CONFIG, poEtaDays, planningLeadTime, LEAD_TIME_MIN_DELIVERIES, FREIGHT_MODES, leadTimeTracks, supplierOf, resolveLane, readSlowShipment, slowShipmentNote,
          readLeadTimeChanges, latestChangeAt, applyLeadTimeChange, undoLastLeadTimeChange,
-         describeLeadTimeChange, parkOrder, adoptParkedOrders } from '../lib/helpers';
+         describeLeadTimeChange, parkOrder, adoptParkedOrders, REASON_LABELS, stockIsCounted} from '../lib/helpers';
 import { UnitEconomicsCard } from './UnitEconomics';
+import { SkuActionBar, PriceHistoryDrawer, HolidaysDrawer, forecastHealth } from './SkuActions';
 import { terminal, MONO, SANS } from '../lib/theme';
 import { API, TZ, fetchJson } from '../lib/api';
 import { saveStorage } from '../lib/storage';
 import { GROQ_URL, GROQ_MODEL, GROQ_LOW_REASONING } from '../lib/ai';
 
 // ─── ORDER MATH BREAKDOWN ─────────────────────
+/* What a count is worth now. A shelf counted on Monday is not Monday's number on
+   Thursday, and the tool knows exactly what left in between — so it shows the count, the
+   drawdown and the level it derives, rather than silently substituting one for another.
+   A number that moved on its own is only trustworthy if it can be explained. */
+export function StockSinceCount({ data, params, lm }) {
+  const since = data?.sinceCount;
+  const derived = data?.derivedStock;
+  const today = data?.todaySales;
+  if (!since?.since) {
+    return <p className={`text-[13px] mt-1 ${"text-[var(--t-dim)]"}`}>Counted by you.</p>;
+  }
+  const sold = Number(since.total) || 0;
+  const when = new Date(since.since + "T00:00:00").toLocaleDateString(undefined,
+    { month: "short", day: "numeric" });
+  if (sold <= 0) {
+    return (
+      <p className={`text-[13px] mt-1 ${"text-[var(--t-dim)]"}`}>
+        Counted {when}. Nothing sold since, so this is still current.
+      </p>
+    );
+  }
+  return (
+    <div className={`text-[13px] mt-1 space-y-0.5 ${"text-[var(--t-dim)]"}`}>
+      <div>
+        Counted <strong>{params.stock}</strong> on {when} · <strong>{sold}</strong> sold since
+        {since.todayIncluded && Number(since.today) > 0
+          ? ` (${since.today} today)` : ""}
+      </div>
+      <div className={"text-[var(--t-soft)]"}>
+        Likely on the shelf now: <strong>{derived}</strong>
+      </div>
+      {today?.stale && since.todayIncluded && (
+        <div className={"text-[var(--t-warn)]"}>
+          Today&apos;s figure is over an hour old. A reading was missed.
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* Today's running total, from the hourly tick. Deliberately understated next to the
+   month figures: it is a partial day and says so, and it carries its own freshness
+   because a number from ten minutes ago and one from two hours ago support different
+   decisions. Silent when the source cannot supply it at all, rather than printing a zero
+   that would be indistinguishable from a real one. */
+export function TodaySoFar({ data, muted }) {
+  const t = data?.todaySales;
+  if (!t || t.unsupported || t.forToday === false) return null;
+  const units = Number(t.units) || 0;
+  const mins = t.ageSeconds == null ? null : Math.round(t.ageSeconds / 60);
+  const when = mins == null ? "" : mins < 2 ? "just now" : `${mins} min ago`;
+  return (
+    <div className={`text-[13px] mt-1 ${t.stale ? "text-[var(--t-warn)]" : muted}`}>
+      {units > 0 ? <><strong>{units.toLocaleString()}</strong> today</> : "none today"}
+      {when && <> · checked {when}</>}
+      {t.stale && <> · a check was missed</>}
+    </div>
+  );
+}
+
 export function OrderMathCard({ data, leadTime, coverageDays, unitsOnOrder, lm, skuSt, demandVolatilityColor }) {
   const bg    = "bg-[var(--t-sunken)] border-[var(--t-line)]";
   const label = "text-[var(--t-dim)]";
@@ -98,9 +159,9 @@ export function OrderMathCard({ data, leadTime, coverageDays, unitsOnOrder, lm, 
                 </span>
               ) : prot?.status === "stale" ? "re-testing for your new settings…"
                 : prot?.source === "backtest" ? "cheapest across your own sales history"
-                : prot?.source === "economics" ? "provisional estimate — not yet tested against your history"
-                : prot?.costKnown ? `set from ${Math.round(prot.marginPct)}% margin — too little history to test`
-                : "default — add a unit cost to tune"}{prot?.overridden ? " · manual override" : ""}
+                : prot?.source === "economics" ? "provisional estimate, not yet tested against your history"
+                : prot?.costKnown ? `set from ${Math.round(prot.marginPct)}% margin (too little history to test)`
+                : "default: add a unit cost to tune"}{prot?.overridden ? " · manual override" : ""}
             </div>
           </div>
         </div>
@@ -120,23 +181,23 @@ export function OrderMathCard({ data, leadTime, coverageDays, unitsOnOrder, lm, 
             {usingP80 ? (
               <>
                 <div className={`text-[14px] font-semibold ${"text-[var(--t-soft)]"}`}>
-                  Late deliveries — P80 active
+                  Late deliveries: P80 active
                   <span className={`ml-1.5 font-mono font-normal text-[14px] ${"text-[var(--t-accent)]"}`}>orders {daysEarlier}d earlier</span>
                 </div>
                 <div className={`text-[14px] mt-0.5 ${"text-[var(--t-dim)]"}`}>
-                  80% of past deliveries arrive within {leadTime}d — covers up to {daysEarlier}d delay
+                  80% of past deliveries arrive within {leadTime}d, covering up to {daysEarlier}d delay
                 </div>
               </>
             ) : (
               <>
                 <div className={`text-[14px] font-semibold ${"text-[var(--t-warn)]"}`}>
-                  Late deliveries — no protection
+                  Late deliveries: no protection
                   {usingAvg && skuSt?.p80 && <span className={`ml-1.5 font-normal text-[14px] ${"text-[var(--t-dim)]"}`}>using avg · switch to P80 to protect</span>}
                 </div>
                 <div className={`text-[14px] mt-0.5 ${"text-[var(--t-dim)]"}`}>
                   {usingAvg
-                    ? `Using avg lead time (${leadTime}d) — ~50% of deliveries arrive on time`
-                    : `Manual lead time (${leadTime}d) — log ≥ 3 orders to unlock P80`}
+                    ? `Using avg lead time (${leadTime}d): only ~50% of deliveries arrive on time`
+                    : `Manual lead time (${leadTime}d). Log ≥ 3 orders to unlock P80`}
                 </div>
               </>
             )}
@@ -154,16 +215,17 @@ export function OrderMathCard({ data, leadTime, coverageDays, unitsOnOrder, lm, 
 // One dense, scannable health bar that replaces the old Eligibility +
 // Reliability + Training-Data-Quality cards. Pills by default; full detail +
 // AI "Why?" on demand. (Stripe / Linear / Bloomberg style: compact, expandable.)
-export function SkuSignalStrip({ mlData, statusCfg, apiKey, lm }) {
+export function SkuSignalStrip({ mlData, statusCfg, apiKey, lm, alwaysOpen = false }) {
   // State resets on SKU change via key={mlData.skuId} at the call site (remount).
-  const [open, setOpen]               = useState(false);
+  const [openRaw, setOpen]            = useState(false);
+  const open = alwaysOpen || openRaw;
   const [explanation, setExplanation] = useState(null);
   const [loading, setLoading]         = useState(false);
 
   const lowRel = ["YELLOW", "ORANGE", "RED"].includes(mlData.reliabilityColor);
   const explain = async () => {
     setLoading(true); setExplanation(null);
-    const prompt = `You are an inventory data analyst. A demand forecast for SKU "${mlData.skuName}" has been flagged as unreliable.\nReliability: ${mlData.reliabilityColor}\nMessage: ${mlData.reliabilityMessage}\nStatus: ${mlData.status} — ${mlData.statusMessage}\nDays of history: ${mlData.daysOfHistory}\nIn 3-4 short bullet points (use • character), explain why the forecast has low reliability, what data issues are causing it, and what the user can do to improve accuracy. Be specific and practical. No markdown, no headers.`;
+    const prompt = `You are an inventory data analyst. A demand forecast for SKU "${mlData.skuName}" has been flagged as unreliable.\nReliability: ${mlData.reliabilityColor}\nMessage: ${mlData.reliabilityMessage}\nStatus: ${mlData.status} — ${mlData.statusMessage}\nDays of history: ${mlData.daysOfHistory}\nIn 3-4 short bullet points (use • character), explain why the forecast has low reliability, what data issues are causing it, and what the user can do to improve accuracy. Be specific and practical. No markdown, no headers, no em dashes.`;
     try {
       const res = await fetch(GROQ_URL, {
         method: "POST",
@@ -177,7 +239,8 @@ export function SkuSignalStrip({ mlData, statusCfg, apiKey, lm }) {
   };
 
   const relTone    = { GREEN: "emerald", YELLOW: "amber", ORANGE: "orange", RED: "rose" };
-  const statusTone = { FORECAST_ELIGIBLE: "emerald", LOW_CONFIDENCE: "amber", CONFLICTING: "orange", INSUFFICIENT: "rose" };
+  const statusTone = { FORECAST_ELIGIBLE: "emerald", LOW_CONFIDENCE: "amber", INSUFFICIENT: "rose",
+                       CONFLICTING: "amber" };   // deprecated grade, kept for stale payloads
   const dataLabel  = { GREEN: "Strong data", YELLOW: "Moderate data", ORANGE: "Limited data", RED: "Thin data" }[mlData.reliabilityColor] || "Strong data";
   const noiseTone  = { GREEN: "emerald", YELLOW: "amber", ORANGE: "orange" }[mlData.demandVolatilityColor];
   const noiseLabel = { GREEN: "Low noise", YELLOW: "Moderate noise", ORANGE: "High noise" }[mlData.demandVolatilityColor];
@@ -187,7 +250,7 @@ export function SkuSignalStrip({ mlData, statusCfg, apiKey, lm }) {
     const n = mlData.priceTiers?.length || 0;
     pricePill = mlData.priceWellSampled
       ? { tone: "emerald", text: `Price modelled${n ? ` · ${n} tier${n !== 1 ? "s" : ""}` : ""}` }
-      : { tone: "amber", text: "Price — limited data" };
+      : { tone: "amber", text: "Price: limited data" };
   }
   const zeroStock = mlData.stockoutRowsDropped > 0;
   const hasDetail = mlData.statusMessage || mlData.reliabilityMessage || (pricePill && mlData.priceTiers?.length) || zeroStock;
@@ -198,20 +261,24 @@ export function SkuSignalStrip({ mlData, statusCfg, apiKey, lm }) {
   return (
     <div className={`${card} border rounded-2xl px-4 py-3`}>
       <div className="flex items-center gap-2 flex-wrap">
-        <span className={`text-[14px] uppercase tracking-widest font-bold mr-1 ${head}`}>Forecast health</span>
-        <SignalPill tone={statusTone[mlData.status] || "slate"} lm={lm}>
-          <span className={`h-1.5 w-1.5 rounded-full ${statusCfg.dot}`} />{statusCfg.label}
-        </SignalPill>
-        <SignalPill tone={relTone[mlData.reliabilityColor] || "emerald"} lm={lm}>{dataLabel}</SignalPill>
+        {!alwaysOpen && <span className={`text-[14px] uppercase tracking-widest font-bold mr-1 ${head}`}>Forecast health</span>}
+        {/* Inside Forecast details the grade and data strength are already the headline
+            above this, so only the signals not said there are repeated as pills. */}
+        {!alwaysOpen && (
+          <SignalPill tone={statusTone[mlData.status] || "slate"} lm={lm}>
+            <span className={`h-1.5 w-1.5 rounded-full ${statusCfg.dot}`} />{statusCfg.label}
+          </SignalPill>
+        )}
+        {!alwaysOpen && <SignalPill tone={relTone[mlData.reliabilityColor] || "emerald"} lm={lm}>{dataLabel}</SignalPill>}
         {noiseLabel && <SignalPill tone={noiseTone} lm={lm}>{noiseLabel}{mlData.intervalWidth ? ` · ${mlData.intervalWidth}% band` : ""}</SignalPill>}
-        {pricePill && <SignalPill tone={pricePill.tone} lm={lm}>{pricePill.text}</SignalPill>}
+        {pricePill && !alwaysOpen && <SignalPill tone={pricePill.tone} lm={lm}>{pricePill.text}</SignalPill>}
         {zeroStock && <SignalPill tone="slate" lm={lm}>{mlData.stockoutRowsDropped} zero-stock day{mlData.stockoutRowsDropped > 1 ? "s" : ""} excluded</SignalPill>}
         <div className="flex-1 min-w-[12px]" />
         {lowRel && !explanation && !loading && (
           <button onClick={() => { setOpen(true); explain(); }}
             className={`text-[14px] font-semibold ${"text-[var(--t-warn)] hover:text-[var(--t-warn)]"}`}>Why?</button>
         )}
-        {hasDetail && (
+        {hasDetail && !alwaysOpen && (
           <button onClick={() => setOpen(o => !o)}
             className={`text-[14px] font-semibold ${"text-[var(--t-dim)] hover:text-[var(--t-soft)]"}`}>{open ? "Hide details" : "Details"}</button>
         )}
@@ -226,12 +293,7 @@ export function SkuSignalStrip({ mlData, statusCfg, apiKey, lm }) {
               {mlData.stockoutRowsDropped} zero-stock day{mlData.stockoutRowsDropped > 1 ? "s were" : " was"} removed from training so the model doesn't learn artificially low demand during stockouts.
             </p>
           )}
-          {pricePill && mlData.priceTiers?.length > 0 && (
-            <div>
-              <div className={`text-[14px] uppercase tracking-widest font-bold mb-1 ${head}`}>Price tiers</div>
-              <PriceTierTable tiers={mlData.priceTiers} lm={lm} />
-            </div>
-          )}
+          {/* Price levels live in Price history now, next to the rest of the price story. */}
           {(loading || explanation) && (
             <div>
               {loading && (
@@ -258,6 +320,8 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
   const [showPoModal, setShowPoModal] = useState(false);
   const [showEvents,  setShowEvents]  = useState(false);
   const [showForecastDetails, setShowForecastDetails] = useState(false);
+  const [showPriceHistory, setShowPriceHistory] = useState(false);
+  const [showHolidays, setShowHolidays] = useState(false);
   const [showBufferMath, setShowBufferMath] = useState(false);
   const [showSlowWhy,   setShowSlowWhy]   = useState(false);
   const [slowDraft,     setSlowDraft]     = useState({ open: false, dir: "later", days: "", reason: "" });
@@ -295,6 +359,20 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
     setDraft(next);
     debouncedCommit(next);
   };
+  /* The count-confirmation. Holds the typed value until the person says it is real. */
+  const [pendingCount, setPendingCount] = useState(null);
+  const confirmCount = () => {
+    updateDraftMany({
+      stock: pendingCount,
+      stockSource: "manual",
+      // WHEN, not just how many. A count is only true until the next sale, so the moment
+      // it was taken is what lets the tool subtract what has sold since and keep it true.
+      // Without this the number is right once and drifts from then on.
+      stockCountedAt: new Date().toISOString(),
+    });
+    setPendingCount(null);
+  };
+
   const openPO     = openPOs[skuId];
   const onOrderQty = openPO ? openPO.qty : 0;
   // When it lands, not just how much — see poEtaDays.
@@ -456,6 +534,13 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
   );
 
   const statusCfg = STATUS_CONFIG[mlData.status] || STATUS_CONFIG.INSUFFICIENT;
+  /* The grade says how much to trust the forecast; the reason says why, without the reader
+     parsing a paragraph to find out. Separating them is the point of the rework. */
+  const statusReason = REASON_LABELS[mlData.statusReason] || null;
+  /* An uncounted product shows "—", not a number. A 0 nobody has verified is not the same
+     claim as a counted 0, and rendering them identically is what turned an unknown into an
+     urgent reorder (or, with the old 500 default, into "plenty in stock, nothing to do"). */
+  const stockCounted = stockIsCounted(params);
   const projTotal = mlData.currentMonth.unitsSoFar + mlData.currentMonth.forecastRemaining;
   const pctChange = mlData.currentMonth.lastMonthTotal > 0
     ? ((projTotal - mlData.currentMonth.lastMonthTotal) / mlData.currentMonth.lastMonthTotal) * 100 : 0;
@@ -520,7 +605,45 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
           `tabular-nums` and `font-mono` cells pick the face up without touching each one. */}
       <style>{`.tabular-nums,.font-mono{font-family:${MONO};font-variant-numeric:tabular-nums}`}</style>
       {/* Forecast "why" panel — opened from the Forecast details button in the header */}
-      <ForecastDetailsDrawer data={mlData} lm={lm} open={showForecastDetails} onClose={() => setShowForecastDetails(false)} />
+      <ForecastDetailsDrawer data={mlData} lm={lm} open={showForecastDetails} onClose={() => setShowForecastDetails(false)}
+        health={mlData ? forecastHealth(mlData, STATUS_CONFIG[mlData.status] || STATUS_CONFIG.INSUFFICIENT) : null}
+        healthBody={mlData ? <SkuSignalStrip key={mlData.skuId} mlData={mlData}
+          statusCfg={STATUS_CONFIG[mlData.status] || STATUS_CONFIG.INSUFFICIENT} apiKey={apiKey} lm={lm} alwaysOpen /> : null} />
+      {mlData && <PriceHistoryDrawer open={showPriceHistory} onClose={() => setShowPriceHistory(false)} mlData={mlData} />}
+      {mlData && <HolidaysDrawer open={showHolidays} onClose={() => setShowHolidays(false)} mlData={mlData} onChanged={fetchData} />}
+      {/* Promoting a placeholder to a real count. Confirmed once, because it changes what
+          the tool is willing to claim about this product from here on. */}
+      {pendingCount !== null && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50"
+             onClick={() => setPendingCount(null)}>
+          <div onClick={e => e.stopPropagation()}
+               className={`w-[min(440px,92vw)] rounded-xl border p-5 space-y-3 ${"bg-[var(--t-panel)] border-[var(--t-line2)]"}`}>
+            <div className={`text-[16px] font-semibold ${"text-[var(--t-ink)]"}`}>
+              Record {pendingCount} units as a real count?
+            </div>
+            <p className={`text-[14px] leading-relaxed ${"text-[var(--t-soft)]"}`}>
+              The {params.stock} shown now is a placeholder, since your POS reports no level
+              for this product. Saving {pendingCount} records a real count taken right now.
+              From then on, sales are subtracted to keep it current: closed days from your
+              sales history, today&apos;s sales from the hourly check.
+            </p>
+            <p className={`text-[14px] leading-relaxed ${"text-[var(--t-soft)]"}`}>
+              Days of cover, stockout date, reorder date and order quantity are hidden while
+              stock is a placeholder. Saving makes them appear.
+            </p>
+            <div className="flex gap-2 justify-end pt-1">
+              <button onClick={() => setPendingCount(null)}
+                className={`px-3 py-1.5 rounded-lg text-[14px] border ${"border-[var(--t-line2)] text-[var(--t-soft)] hover:bg-[var(--t-sunken)]"}`}>
+                Cancel
+              </button>
+              <button onClick={confirmCount}
+                className={`px-3 py-1.5 rounded-lg text-[14px] font-semibold ${"bg-[var(--t-accent)] text-[var(--t-btn-fg)]"}`}>
+                Yes, this is a real count
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       {/* Params panel */}
       <div ref={panelRef} style={{ width: panelWidth }}
         className={`relative shrink-0 ${sidebarBg} border-r flex flex-col`}>
@@ -530,7 +653,27 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
         <div className="space-y-4">
           <div>
             <label className={lbl}>Units in Stock</label>
-            <input type="number" value={draftParams.stock} onChange={e => updateDraft("stock", Number(e.target.value))} className={inp} />
+            <input type="number" value={draftParams.stock}
+              onChange={e => {
+                const v = Number(e.target.value);
+                /* Editing an UNCOUNTED figure is a different act from adjusting a counted
+                   one. The number on screen was a placeholder; typing over it is the
+                   moment this product stops being a guess. That is worth confirming once
+                   — partly so nobody promotes a placeholder by leaning on the arrow keys,
+                   and partly because everything downstream changes at that instant: the
+                   stockout date, the reorder countdown and the order quantity all appear,
+                   having been deliberately withheld while the level was invented. */
+                if (!stockCounted && v !== draftParams.stock) { setPendingCount(v); return; }
+                updateDraft("stock", v);
+              }} className={inp} />
+            {stockCounted ? (
+              <StockSinceCount data={mlData} params={draftParams} lm={lm} />
+            ) : (
+              <p className={`text-[13px] mt-1 ${"text-[var(--t-warn)]"}`}>
+                Placeholder: your POS reports no level for this product. Cover, stockout
+                and reorder dates are hidden until you enter a real count.
+              </p>
+            )}
           </div>
 
           {/* Unit economics. Cost and fees used to be editable ONLY in the Scorecard
@@ -539,6 +682,7 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
               here now, next to the thing they change. */}
           <UnitEconomicsCard lm={lm} params={draftParams}
             price={mlData?.currentPrice ?? mlData?.lastPrice ?? null}
+            listPrice={mlData?.listPrice ?? null} livePrice={mlData?.livePrice ?? null}
             onChange={updateDraftMany} />
           {/* ── Lead Time ──
               The "Lead Time (days)" summary card that used to head this section is gone.
@@ -592,7 +736,7 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
                       while its row sat blank, and the default row showed a stale
                       params.leadTime that wasn't what planning used. Clearing the box
                       still means "inherit": the supplier's number reappears, italic. */}
-                  <input type="number" placeholder="—"
+                  <input type="number" placeholder="-"
                     value={t.baseline ?? ""}
                     onChange={e => {
                       const v = e.target.value === "" ? undefined : Number(e.target.value);
@@ -609,15 +753,15 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
                       if (t.isDefault || !draftParams.freightMode) patch.leadTime = v;
                       updateDraftMany(patch);
                     }}
-                    title={t.inherited ? `Inherited from ${supplierName || "this supplier"} — type here to give this product its own` : undefined}
+                    title={t.inherited ? `Inherited from ${supplierName || "this supplier"}. Type here to give this product its own.` : undefined}
                     className={`w-16 text-right rounded border px-1.5 py-0.5 font-mono text-[14px] ${
                       t.inherited
                         ? ("bg-[var(--t-panel)] border-[var(--t-line)] text-[var(--t-dim)] italic")
                         : ("bg-[var(--t-panel)] border-[var(--t-line2)] text-[var(--t-ink)]")}`} />
                   <span className={`text-right font-mono tabular-nums w-12 ${t.p80 != null ? ("text-[var(--t-good)] font-bold") : ("text-[var(--t-soft)]")}`}>
-                    {t.p80 != null ? `${t.p80}d` : "—"}
+                    {t.p80 != null ? `${t.p80}d` : "-"}
                   </span>
-                  <span className={`text-right font-mono tabular-nums w-8 ${"text-[var(--t-dim)]"}`}>{t.n || "—"}</span>
+                  <span className={`text-right font-mono tabular-nums w-8 ${"text-[var(--t-dim)]"}`}>{t.n || "-"}</span>
                 </div>
               ))}
               {/* Carries the resolved planning number now that the card above is gone —
@@ -626,14 +770,14 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
                   to live on the card. */}
               <div className={`px-3 py-2 border-t text-[13px] ${"border-[var(--t-line)] text-[var(--t-dim)]"}`}>
                 {params.leadTimeMode === "manual"
-                  ? <>Planning on <b>{plan.days}d</b> — pinned by you, ignoring delivery history.{" "}
+                  ? <>Planning on <b>{plan.days}d</b>: pinned by you, ignoring delivery history.{" "}
                       <button onClick={() => updateDraft("leadTimeMode", undefined)}
                         className={`font-semibold underline ${"text-[var(--t-soft)]"}`}>measure it instead</button></>
                   : activeTrack.p80 != null
-                  ? <>Planning on <b>{plan.days}d</b> — measured {activeTrack.label}, P80 of {activeTrack.n} shipments. Your baseline is only used if that record goes away; editing it never drops a delivery.</>
+                  ? <>Planning on <b>{plan.days}d</b>: measured {activeTrack.label}, P80 of {activeTrack.n} shipments. Your baseline is used only if that record goes away. Editing it never drops a delivery.</>
                   : draftParams.freightMode
-                    ? <>Planning on <b>{plan.days}d</b> — {activeTrack.inherited ? `${supplierName || "supplier"}'s` : "your"} {activeTrack.label} baseline. {activeTrack.needed} more {activeTrack.label} delivery{activeTrack.needed === 1 ? "" : " deliveries"} and it switches to this product&apos;s own measured P80. No other product&apos;s shipments are ever mixed in.</>
-                    : <>Fill in the row for however this product ships — that sets it as the method to plan from. Until then it pools every delivery.</>}
+                    ? <>Planning on <b>{plan.days}d</b>: {activeTrack.inherited ? `${supplierName || "supplier"}'s` : "your"} {activeTrack.label} baseline. {activeTrack.needed} more {activeTrack.label} delivery{activeTrack.needed === 1 ? "" : " deliveries"} and it switches to this product&apos;s own measured P80. Other products&apos; shipments are never mixed in.</>
+                    : <>Fill in the row for how this product ships to make it the planning method. Until then it pools every delivery.</>}
               </div>
               {/* The opt-out checkbox that used to sit here is gone. It existed back when
                   a product could inherit its supplier's MEASURED average — pooling that
@@ -685,7 +829,7 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
                 <div className={`px-3 py-1.5 text-[14px] border-t ${"border-[var(--t-line)] text-[var(--t-dim)]"}`}>
                   Measured figures restart at the newest change, so P80 rebuilds from deliveries logged since then.
                   {plan.priorP80 ? ` The previous arrangement measured ${plan.priorP80}d.` : ""}
-                  {" "}Nothing is deleted — undo brings the older deliveries straight back.
+                  {" "}Nothing is deleted. Undo brings the older deliveries straight back.
                 </div>
               </div>
             )}
@@ -703,12 +847,12 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
               <div className={`rounded-xl border px-3 py-2.5 space-y-2 ${"bg-[var(--t-panel)] border-[var(--t-accent-line)]"}`}>
                 <div className={`text-[14px] font-bold ${"text-[var(--t-ink)]"}`}>New lead times from today</div>
                 <div className={`text-[13px] ${"text-[var(--t-dim)]"}`}>
-                  Change what moved and leave the rest — anything you don&apos;t touch keeps its current number.
+                  Change what moved. Anything you don&apos;t touch keeps its current number.
                 </div>
                 {tracks.map(t => (
                   <div key={t.mode} className="flex items-center gap-2">
                     <span className={`text-[14px] w-14 shrink-0 ${"text-[var(--t-soft)]"}`}>{t.label}</span>
-                    <input type="number" min="1" placeholder="—"
+                    <input type="number" min="1" placeholder="-"
                       value={ltChange[t.mode] ?? ""}
                       onChange={e => setLtChange(c => ({ ...c, [t.mode]: e.target.value }))}
                       className={`w-16 text-right rounded border px-1.5 py-0.5 font-mono text-[14px] ${"bg-[var(--t-panel)] border-[var(--t-line2)] text-[var(--t-ink)]"}`} />
@@ -789,7 +933,7 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
                 {showSlowWhy && (
                   <div className={`text-[13px] mt-1 leading-relaxed ${"text-[var(--t-dim)]"}`}>
                     Nothing is excluded. When it lands it counts in this product&apos;s lead times and the
-                    supplier&apos;s averages like any other delivery — because it really did take that long.
+                    supplier&apos;s averages like any other delivery, because it really did take that long.
                     Protection levels stay tested against your normal{" "}
                     {planningLeadTime(skuId, { ...params, slowShipment: undefined, nextLeadTime: undefined }, suppliers).days}-day
                     wait, not this one-off.
@@ -839,7 +983,7 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
                 {valid && (
                   <div className={`text-[13px] ${tooFast ? ("text-[var(--t-bad)]") : ("text-[var(--t-soft)]")}`}>
                     {tooFast
-                      ? `That's more than the whole ${normalPlan}-day wait — the next order can't arrive before it's placed.`
+                      ? `That's more than the whole ${normalPlan}-day wait. The next order can't arrive before it's placed.`
                       : `Planning the next order at ${result}d instead of ${normalPlan}d.`}
                   </div>
                 )}
@@ -966,7 +1110,7 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
             return (
               <div>
                 <label className={lbl}>
-                  <Tip text="How hard to guard against running out. When there is enough history and a unit cost, this is picked from the item's expected stockout cost versus buffer holding cost. Otherwise it falls back to the margin rule. You can override it.">Stockout Protection</Tip>
+                  <Tip text="How hard to guard against running out. With enough history and a unit cost, it's picked from the item's expected stockout cost vs. buffer holding cost; otherwise from the margin rule. You can override it.">Stockout Protection</Tip>
                 </label>
                 <div className={`rounded-xl border overflow-hidden ${"bg-[var(--t-sunken)] border-[var(--t-line)]"}`}>
                   {/* While a test is running, show NOTHING — no tiers, no percentages, no
@@ -1058,7 +1202,7 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
                   {p.status !== "calculating" && disp != null && (
                     <div className={`divide-y ${"divide-[var(--t-line)] border-t border-[var(--t-line)]"}`}>
                       <div className={`flex items-center justify-between px-3 py-1.5 text-[14px] ${"bg-[var(--t-panel)]"}`}>
-                        <Tip text={`Swing in daily sales after trend and seasonality are removed, measured against the randomness any product this size carries anyway. 1.0x is as steady as that sales volume permits; past 2.0x it moves more than its size explains.${sigObs != null && refRate ? ` Here that is about ±${sigObs.toFixed(1)} a day on ${refRate.toFixed(1)} a day.` : ""} The buffer is sized from that raw swing in units, accumulated over a lead time — not from this ratio, which divides the swing by product size so that two products of different sizes can be compared. Bigger swing means a bigger buffer; a higher ratio does not, on its own.`}>
+                        <Tip text={`Daily sales swing after trend and seasonality, measured against the randomness normal for a product this size: 1.0x is as steady as that volume allows, past 2.0x it moves more than its size explains.${sigObs != null && refRate ? ` Here that is about ±${sigObs.toFixed(1)} a day on ${refRate.toFixed(1)} a day.` : ""} The buffer comes from the raw swing in units over a lead time, not this size-adjusted ratio, so a bigger swing raises it but a higher ratio alone does not.`}>
                           <span className={"text-[var(--t-dim)]"}>Sales volatility</span>
                         </Tip>
                         <span className={`font-mono font-bold ${"text-[var(--t-soft)]"}`}>{disp.toFixed(1)}x{mlData.demandVolatilityLabel ? ` · ${mlData.demandVolatilityLabel}` : ""}</span>
@@ -1096,7 +1240,7 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
                             <div className={`flex justify-between ${rowC}`}><span>Protection factor</span><span className={`font-mono ${valC}`}>×{zScore?.toFixed(2)} ({p.servicePct}%)</span></div>
                             <div className={`flex justify-between font-semibold border-t pt-1.5 ${"border-[var(--t-line)] text-[var(--t-soft)]"}`}><span>Buffer held</span><span className="font-mono">{mlData.safetyStock} units</span></div>
                             <p className={`pt-1 leading-relaxed ${"text-[var(--t-dim)]"}`}>
-                              We hold <span className="font-semibold">{mlData.safetyStock}</span> spare units, aiming to cover demand swings during the {lt}-day wait about {p.servicePct}% of the time{p.achievedPct != null ? ` — replayed against your own history it came out at ${p.achievedPct}%, because the buffer is sized from a bell curve and real demand has a longer tail` : ""}. That swing is measured from how far past forecasts actually missed over real {lt}-day stretches{widened ? " — and because this item's sales come in clumps, it's wider than a steady seller's, so it earns extra buffer" : ", and here it lines up with the usual day-to-day swing stretched over the wait"}. A noisier or clumpier item, or a longer lead time, raises this; a steady one lowers it.
+                              We hold <span className="font-semibold">{mlData.safetyStock}</span> spare units to cover demand swings during the {lt}-day wait about {p.servicePct}% of the time{p.achievedPct != null ? ` (replayed against your history: ${p.achievedPct}%, since real demand has a longer tail than the bell curve the buffer assumes)` : ""}. The swing comes from how far past forecasts missed over real {lt}-day stretches{widened ? "; this item sells in clumps, so it's wider than a steady seller's and earns extra buffer" : ", and here it matches the day-to-day swing stretched over the wait"}. A noisier or clumpier item, or a longer lead time, raises this; a steadier one lowers it.
                             </p>
                           </div>
                         );
@@ -1111,7 +1255,7 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
           {/* ── Coverage Window ── */}
           <div>
             <label className={lbl}>
-              <Tip text="How many days of stock the order should cover, starting from when it arrives. Bigger = larger orders, longer runway between reorders.">Coverage Window (days)</Tip>
+              <Tip text="How many days of stock the order should cover, starting when it arrives. Bigger means larger orders and a longer runway between reorders.">Coverage Window (days)</Tip>
             </label>
             <input type="number" min="1" value={draftParams.coverage} onChange={e => updateDraft("coverage", Math.max(1, Number(e.target.value) || 1))} className={inp} />
             {mlData?.daysUntilStockout > 0 && (() => {
@@ -1140,11 +1284,11 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
                   </div>
                   {gapDays > 0 && (
                     <div className={`px-3 py-1.5 border-t text-[14px] leading-relaxed ${"border-[var(--t-bad-line)] bg-[var(--t-bad-soft)] text-[var(--t-bad)]"}`}>
-                      ⚠ Even ordering today, stock won't arrive until {fmt(deliveryDate)} — expect ~{gapDays} day{gapDays !== 1 ? "s" : ""} out of stock before then.
+                      ⚠ Even ordering today, stock won't arrive until {fmt(deliveryDate)}. Expect ~{gapDays} day{gapDays !== 1 ? "s" : ""} out of stock before then.
                     </div>
                   )}
                   <div className={`px-3 py-1.5 border-t text-[14px] leading-relaxed ${"border-[var(--t-line)] bg-[var(--t-sunken)] text-[var(--t-dim)]"}`}>
-                    Estimated from current forecast. Actual window may vary — demand above forecast shortens it, below extends it. Delivery delays shift the start date.
+                    Estimated from the current forecast. Demand above forecast shortens the window, below extends it. Delivery delays shift the start date.
                   </div>
                 </div>
               );
@@ -1192,8 +1336,8 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
         <div className={`border-t ${divider} pt-4 space-y-2`}>
           <div className={`${infoHead} mb-1`}>Model Info</div>
           {[
-            ["Yearly pattern",  mlData.activeYearly ? "Detected" : "—",       mlData.activeYearly ? ("text-[var(--t-good)]") : ""],
-            ["Weekly pattern",  mlData.activeWeekly ? "Detected" : "—",       mlData.activeWeekly ? ("text-[var(--t-good)]") : ""],
+            ["Yearly pattern",  mlData.activeYearly ? "Detected" : "-",       mlData.activeYearly ? ("text-[var(--t-good)]") : ""],
+            ["Weekly pattern",  mlData.activeWeekly ? "Detected" : "-",       mlData.activeWeekly ? ("text-[var(--t-good)]") : ""],
             ...(mlData.priceModeled ? [["Price tracking",  mlData.priceWellSampled ? "Active" : "Limited",
               mlData.priceWellSampled ? ("text-[var(--t-good)]") : ("text-[var(--t-warn)]")]] : []),
             ["History",         `${mlData.daysOfHistory}d`,                   infoVal],
@@ -1208,8 +1352,15 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
               <span>Zero-stock days excluded</span><span>{mlData.stockoutRowsDropped}</span>
             </div>
           )}
-          {mlData.priceModeled && (mlData.currentPrice ?? mlData.lastPrice) != null && (
-            <div className={`flex justify-between ${infoLabel}`}><span>Current price</span><span className={infoVal}>${(mlData.currentPrice ?? mlData.lastPrice).toFixed(2)}</span></div>
+          {(mlData.currentPrice ?? mlData.lastPrice) != null && (
+            <div className={`flex justify-between ${infoLabel}`}><span>Current price</span>
+              <span className={infoVal}>
+                {mlData.priceDiscounted && mlData.listPrice != null && (
+                  <s className="text-[var(--t-dim)] mr-1.5">${mlData.listPrice.toFixed(2)}</s>
+                )}
+                <span className={mlData.priceDiscounted ? "text-[var(--t-warn)] font-bold" : ""}>${(mlData.currentPrice ?? mlData.lastPrice).toFixed(2)}</span>
+              </span>
+            </div>
           )}
           {mlData.events?.length > 0 && (
             <div className={`flex justify-between ${infoLabel}`}><span>Events logged</span><span className={"text-[var(--t-accent)]"}>{mlData.events.length}</span></div>
@@ -1221,65 +1372,33 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
 
       {/* Main content */}
       <div className={`flex-1 overflow-y-auto p-7 space-y-6 ${mainBg}`}>
-        <div className="flex items-start justify-between gap-4">
+        <div className="space-y-4">
           <div>
             <h2 className={`text-xl font-bold ${textMain} tracking-tight`}>{mlData.skuName}</h2>
-            <p className={`text-[15px] ${textMuted} font-mono mt-1`}>{mlData.skuId} · {mlData.filename || "—"}</p>
+            <p className={`text-[15px] ${textMuted} font-mono mt-1`}>
+              {mlData.skuId} · {mlData.filename || "-"}
+              {mlData.horizonCapped && (
+                <span className="opacity-70"
+                  title={`Only ${mlData.forecastDays} days of projection are supported by ${mlData.daysOfHistory ?? "this product's"} days of history. The forecast looks ahead only as far as the history looks back.`}>
+                  {" "}· {mlData.forecastDays}d projected
+                </span>
+              )}
+            </p>
           </div>
-          <div className="flex items-center gap-2 flex-wrap justify-end">
-            <button onClick={onExport} disabled={!!exporting} title="Download this SKU's forecast, daily projection, and monthly breakdown as Excel"
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[15px] font-semibold bg-[var(--t-btn-bg)] hover:bg-[var(--t-btn-bg)] disabled:opacity-60 text-[var(--t-btn-fg)] transition-all">
-              <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2M7 10l5 5 5-5M12 15V3" /></svg>
-              {exporting ? "Preparing…" : "Export"}
-            </button>
-            {mlData.forecastDetails && (
-              <button onClick={() => setShowForecastDetails(true)} title="See how this forecast was produced"
-                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[15px] font-semibold border transition-all ${"bg-[var(--t-panel)] border-[var(--t-line2)] text-[var(--t-accent)] hover:border-[var(--t-accent-line)] hover:text-[var(--t-accent)]"}`}>
-                <svg className="h-3 w-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                </svg>
-                Forecast details
-              </button>
-            )}
-            <button onClick={() => setShowEvents(true)}
-              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[15px] font-semibold border transition-all ${
-                mlData.events?.length > 0
-                  ? ("bg-[var(--t-accent-soft)] border-[var(--t-accent-line)] text-[var(--t-accent)] hover:border-[var(--t-accent-line)]")
-                  : ("bg-[var(--t-panel)] border-[var(--t-line2)] text-[var(--t-soft)] hover:border-[var(--t-line2)] hover:text-[var(--t-ink)]")
-              }`}>
-              <svg className="h-3 w-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M7 7h.01M7 3h5c.512 0 1.024.195 1.414.586l7 7a2 2 0 010 2.828l-7 7a2 2 0 01-2.828 0l-7-7A1.994 1.994 0 013 12V7a4 4 0 014-4z" />
-              </svg>
-              Events{mlData.events?.length > 0 ? ` (${mlData.events.length})` : ""}
-            </button>
-            {!hasOpenPO && (
-              <button onClick={() => setShowPoModal(true)}
-                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[15px] font-semibold border transition-all ${"bg-[var(--t-panel)] border-[var(--t-line2)] text-[var(--t-soft)] hover:border-[var(--t-line2)] hover:text-[var(--t-ink)]"}`}>
-                <svg className="h-3 w-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M20 13V6a2 2 0 00-2-2H6a2 2 0 00-2 2v7m16 0v5a2 2 0 01-2 2H6a2 2 0 01-2-2v-5m16 0h-2.586a1 1 0 00-.707.293l-2.414 2.414a1 1 0 01-.707.293h-3.172a1 1 0 01-.707-.293l-2.414-2.414A1 1 0 006.586 13H4" />
-                </svg>
-                Mark Order In Transit
-              </button>
-            )}
-            <div className={`h-2 w-2 rounded-full ${statusCfg.dot}`} />
-            <span className={`text-[15px] ${textMuted}`}>{statusCfg.label}</span>
-          </div>
+          {/* One row of actions, each saying the one thing worth knowing before you
+              click it. Forecast health is the colour of the first tile. */}
+          <SkuActionBar mlData={mlData} statusCfg={statusCfg} statusReason={statusReason}
+            hasOpenPO={hasOpenPO} openPO={openPO} exporting={exporting}
+            onForecastDetails={() => setShowForecastDetails(true)}
+            onPriceHistory={() => setShowPriceHistory(true)}
+            onHolidays={() => setShowHolidays(true)}
+            onEvents={() => setShowEvents(true)}
+            onOrder={() => setShowPoModal(true)}
+            onExport={onExport} />
         </div>
 
-        {mlData.hasPrice && !mlData.priceModeled && (
-          <div className={`border rounded-2xl p-4 flex items-start gap-3 ${"bg-[var(--t-warn-soft)] border-[var(--t-warn-line)]"}`}>
-            <span className="text-base mt-0.5 shrink-0">⚠️</span>
-            <div>
-              <div className={`text-[16.5px] font-bold mb-1 ${"text-[var(--t-warn)]"}`}>PRICE SENSITIVITY UNAVAILABLE</div>
-              <p className={`text-[15px] leading-relaxed ${"text-[var(--t-warn)]"}`}>
-                This product is forecast by <span className="font-semibold">{mlData.winningModel}</span> because it's new/sparse with no established history to learn a price response from.
-                Price effects can't be estimated reliably here, so price history, ranges, the safe-extrapolation zone, and the effect of price changes are hidden to avoid implying a precision that isn't there.
-                Price still feeds margin in the scorecard — it just doesn't move this forecast. Once the product builds up history (or is grouped with priced siblings), it can route to a price-aware model.
-              </p>
-            </div>
-          </div>
-        )}
-
+        {/* "Price changes won't move this forecast" used to be a full-width banner here.
+            The Price history tile says it at the top of the page, and its panel says why. */}
         {mlData.priceModeled && mlData.priceChangeWarning && (() => {
           const isInfo = mlData.priceChangeLevel === "info";
           return (
@@ -1309,7 +1428,7 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
           <div className={`border rounded-2xl p-4 flex items-start gap-3 ${"bg-[var(--t-accent-soft)] border-[var(--t-accent-line)]"}`}>
             <span className="text-base mt-0.5 shrink-0">📦</span>
             <div className="flex-1">
-              <div className={`text-[16.5px] font-bold mb-1 ${"text-[var(--t-accent)]"}`}>ORDER IN TRANSIT — REORDER ALERT SUPPRESSED</div>
+              <div className={`text-[16.5px] font-bold mb-1 ${"text-[var(--t-accent)]"}`}>ORDER IN TRANSIT: REORDER ALERT SUPPRESSED</div>
               <p className={`text-[15px] leading-relaxed ${"text-[var(--t-accent)]"}`}>
                 <span className={`font-semibold ${textMain}`}>{openPO.qty.toLocaleString()} units</span>
                 {openPO.supplier ? ` ordered from ${openPO.supplier}` : " on order"}.
@@ -1324,7 +1443,7 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
           <div className={`border rounded-2xl p-4 flex items-start gap-3 ${"bg-[var(--t-sunken)] border-[var(--t-line2)]"}`}>
             <span className="text-base mt-0.5 shrink-0">💤</span>
             <div className="flex-1">
-              <div className={`text-[16.5px] font-bold mb-1 ${"text-[var(--t-soft)]"}`}>INACTIVE — likely discontinued</div>
+              <div className={`text-[16.5px] font-bold mb-1 ${"text-[var(--t-soft)]"}`}>INACTIVE: likely discontinued</div>
               <p className={`text-[15px] leading-relaxed ${"text-[var(--t-soft)]"}`}>{mlData.inactiveMessage}</p>
             </div>
           </div>
@@ -1334,7 +1453,7 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
           <div className={`border rounded-2xl p-4 flex items-start gap-3 ${"bg-[var(--t-accent-soft)] border-[var(--t-accent-line)]"}`}>
             <span className="text-base mt-0.5 shrink-0">🌱</span>
             <div className="flex-1">
-              <div className={`text-[16.5px] font-bold mb-1 ${"text-[var(--t-accent)]"}`}>ESTABLISHING BASELINE — {mlData.ownDays} of {mlData.baselineDays} days</div>
+              <div className={`text-[16.5px] font-bold mb-1 ${"text-[var(--t-accent)]"}`}>ESTABLISHING BASELINE: {mlData.ownDays} of {mlData.baselineDays} days</div>
               <p className={`text-[15px] leading-relaxed ${"text-[var(--t-accent)]"}`}>{mlData.tooNewMessage}</p>
             </div>
           </div>
@@ -1344,10 +1463,10 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
           <div className={`border rounded-2xl p-4 flex items-start gap-3 ${"bg-[var(--t-warn-soft)] border-[var(--t-warn-line)]"}`}>
             <span className="text-base mt-0.5 shrink-0">🌿</span>
             <div className="flex-1">
-              <div className={`text-[16.5px] font-bold mb-1 ${"text-[var(--t-warn)]"}`}>YOUNG PRODUCT — {mlData.ownDays} of {mlData.youngThreshold} days · forecast is provisional</div>
+              <div className={`text-[16.5px] font-bold mb-1 ${"text-[var(--t-warn)]"}`}>YOUNG PRODUCT: {mlData.ownDays} of {mlData.youngThreshold} days · forecast is provisional</div>
               <p className={`text-[15px] leading-relaxed ${"text-[var(--t-warn)]"}`}>
                 {mlData.youngMessage}
-                {showReorder ? ` Heads-up: at this early pace, stock looks like it'll run low around ${formatDate(mlData.daysUntilStockout)} — consider ordering ~${mlData.orderQty?.toLocaleString()} when you're ready. It's not a hard deadline yet; the estimate firms up as more sales come in.` : ""}
+                {showReorder ? ` At this early pace, stock may run low around ${formatDate(mlData.daysUntilStockout)}, so consider ordering ~${mlData.orderQty?.toLocaleString()} when you're ready. Not a hard deadline yet: the estimate firms up as more sales come in.` : ""}
               </p>
             </div>
           </div>
@@ -1357,7 +1476,7 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
           <div className={`border rounded-2xl p-4 flex items-start gap-3 ${"bg-[var(--t-bad-soft)] border-[var(--t-bad-line)]"}`}>
             <span className="text-base mt-0.5 shrink-0">🚨</span>
             <div className="flex-1">
-              <div className={`text-[16.5px] font-bold mb-1 ${"text-[var(--t-bad)]"}`}>{mlData.daysUntilReorder === 0 ? "REORDER DUE TODAY" : `REORDER OVERDUE — ${Math.abs(mlData.daysUntilReorder)} day${Math.abs(mlData.daysUntilReorder) !== 1 ? "s" : ""} ago`}</div>
+              <div className={`text-[16.5px] font-bold mb-1 ${"text-[var(--t-bad)]"}`}>{mlData.daysUntilReorder === 0 ? "REORDER DUE TODAY" : `REORDER OVERDUE: ${Math.abs(mlData.daysUntilReorder)} day${Math.abs(mlData.daysUntilReorder) !== 1 ? "s" : ""} ago`}</div>
               <p className={`text-[15px] leading-relaxed ${"text-[var(--t-bad)]"}`}>
                 {mlData.daysUntilReorder === 0 ? "Today is your reorder deadline." : "Your reorder deadline has passed."} Stock projected to run out <span className={`font-semibold ${textMain}`}>{formatDate(mlData.daysUntilStockout)}</span>. Place your order immediately.
               </p>
@@ -1368,7 +1487,7 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
           <div className={`border rounded-2xl p-4 flex items-start gap-3 ${"bg-[var(--t-warn-soft)] border-[var(--t-warn-line)]"}`}>
             <span className="text-base mt-0.5 shrink-0">⚠️</span>
             <div className="flex-1">
-              <div className={`text-[16.5px] font-bold mb-1 ${"text-[var(--t-warn)]"}`}>UPCOMING REORDER — {mlData.daysUntilReorder} days</div>
+              <div className={`text-[16.5px] font-bold mb-1 ${"text-[var(--t-warn)]"}`}>UPCOMING REORDER: {mlData.daysUntilReorder} days</div>
               <p className={`text-[15px] leading-relaxed ${"text-[var(--t-warn)]"}`}>
                 Place order by <span className={`font-semibold ${textMain}`}>{formatDate(mlData.daysUntilReorder)}</span> to cover your {params.leadTime}-day lead time.
                 Stockout projected <span className={`font-semibold ${textMain}`}>{formatDate(mlData.daysUntilStockout)}</span>.
@@ -1378,21 +1497,24 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
           </div>
         ))}
 
-        <SkuSignalStrip key={mlData.skuId} mlData={mlData} statusCfg={statusCfg} apiKey={apiKey} lm={lm} />
+        {/* Forecast health moved into Forecast details; its verdict colours that tile. */}
 
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-          <MetricCard lm={lm} label="In Stock" value={params.stock.toLocaleString()}
-            sub={mlData.stockDataAvailable === false ? "assumed — no stock data" : hasOpenPO ? `+ ${openPO.qty.toLocaleString()} on order` : "units on hand"}
+          <MetricCard lm={lm} label="In Stock"
+            value={stockCounted ? params.stock.toLocaleString() : "-"}
+            sub={!stockCounted ? "not counted: set a stock count"
+                 : mlData.stockDataAvailable === false ? "assumed (no stock data)"
+                 : hasOpenPO ? `+ ${openPO.qty.toLocaleString()} on order` : "units on hand"}
             valueColor={mlData.stockDataAvailable === false ? ("text-[var(--t-warn)]") : undefined} />
           <MetricCard lm={lm}
             label={<Tip text="When your current stock is predicted to run out if no new order arrives.">Stockout Date</Tip>}
-            value={mlData.daysUntilStockout != null ? formatDate(mlData.daysUntilStockout).split(",")[0] : "—"}
+            value={mlData.daysUntilStockout != null ? formatDate(mlData.daysUntilStockout).split(",")[0] : "-"}
             sub={mlData.daysUntilStockout != null ? `${mlData.daysUntilStockout} days away` : "Sufficient stock"}
             valueColor="text-[var(--t-bad)]" />
           <MetricCard lm={lm}
             label={<Tip text="The last safe date to place an order so it arrives before you run out of stock.">Order By</Tip>}
-            value={hasOpenPO ? "On Order" : mlData.daysUntilReorder > 0 ? formatDate(mlData.daysUntilReorder).split(",")[0] : mlData.daysUntilReorder === 0 ? "Today" : mlData.daysUntilReorder != null ? `${Math.abs(mlData.daysUntilReorder)}d` : "—"}
-            sub={hasOpenPO ? `Est. ${isoToDisplay(openPO.delivery)}` : mlData.daysUntilReorder > 0 ? `${mlData.daysUntilReorder} days from now` : mlData.daysUntilReorder === 0 ? "Order today" : mlData.daysUntilReorder != null ? "overdue" : "—"}
+            value={hasOpenPO ? "On Order" : mlData.daysUntilReorder > 0 ? formatDate(mlData.daysUntilReorder).split(",")[0] : mlData.daysUntilReorder === 0 ? "Today" : mlData.daysUntilReorder != null ? `${Math.abs(mlData.daysUntilReorder)}d` : "-"}
+            sub={hasOpenPO ? `Est. ${isoToDisplay(openPO.delivery)}` : mlData.daysUntilReorder > 0 ? `${mlData.daysUntilReorder} days from now` : mlData.daysUntilReorder === 0 ? "Order today" : mlData.daysUntilReorder != null ? "overdue" : "-"}
             valueColor={hasOpenPO ? ("text-[var(--t-accent)]") : mlData.daysUntilReorder <= 0 && mlData.daysUntilReorder != null ? "text-[var(--t-bad)]" : ("text-[var(--t-warn)]")} />
           <MetricCard lm={lm}
             label={<Tip text="Recommended order quantity: covers your coverage window demand plus a safety buffer for forecast uncertainty.">Units to Order</Tip>}
@@ -1403,7 +1525,7 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
         {showReorder && (
           <div className={`flex items-start gap-2 text-[14px] leading-relaxed ${"text-[var(--t-dim)]"}`}>
             <span className="shrink-0">ℹ️</span>
-            <span>The stockout date, order-by date, and order quantity assume you place the order <span className="font-semibold">today</span>. They don't reduce the demand forecast for any stockout — that stays true demand (you simply lose those sales). Ordering later pushes delivery out and lengthens any out-of-stock gap.</span>
+            <span>The stockout date, order-by date and order quantity assume you order <span className="font-semibold">today</span>. The demand forecast isn't reduced for stockouts; it stays true demand (you just lose those sales). Ordering later pushes delivery out and lengthens any out-of-stock gap.</span>
           </div>
         )}
 
@@ -1430,12 +1552,12 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
           <div className={`${cardBg} border rounded-2xl p-5 h-[320px]`}>
             <ForecastChart historyPoints={mlData.chartDataHistory} futurePoints={[]} rangePoints={[]}
               stockoutTime={null} reorderTime={null} intervalWidth={mlData.intervalWidth}
-              upcomingPromos={mlData.upcomingPromos} lm={lm} />
+              upcomingPromos={mlData.upcomingPromos} lm={lm} todaySales={mlData.todaySales} />
           </div>
           <div className={`${cardBg} border rounded-2xl p-6`}>
             <div className="flex items-center gap-2 mb-2">
               <span className="text-lg">🌱</span>
-              <span className={`text-[16.5px] font-bold ${textMain}`}>Forecast paused — establishing baseline</span>
+              <span className={`text-[16.5px] font-bold ${textMain}`}>Forecast paused: establishing baseline</span>
             </div>
             <p className={`text-[15px] leading-relaxed mb-5 ${textMuted}`}>
               We start forecasting once this product has about a week of its own sales ({mlData.ownDays}/{mlData.baselineDays} days so far). Until then, here's what we can track straight from inventory.
@@ -1447,7 +1569,7 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
               <div className={`mb-4 rounded-xl border px-4 py-3 text-[15px] leading-relaxed ${"bg-[var(--t-info-soft)] border-[var(--t-info-line)] text-[var(--t-soft)]"}`}>
                 <span className="font-semibold">How this product sells: </span>{mlData.demandStory}
                 <div className={`mt-1 ${textMuted}`}>
-                  Orders aren&apos;t sized from one day — they add this rate up across your lead time and coverage window.
+                  Orders aren&apos;t sized from one day. They add this rate up across your lead time and coverage window.
                 </div>
               </div>
             )}
@@ -1458,12 +1580,12 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
             )}
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
               <div><div className={`text-[14px] uppercase tracking-widest font-bold mb-1 ${textMuted}`}>In stock</div><span className={`text-2xl font-bold tabular-nums ${textMain}`}>{params.stock.toLocaleString()}</span></div>
-              <div><div className={`text-[14px] uppercase tracking-widest font-bold mb-1 ${textMuted}`}>Sold so far</div><span className={`text-2xl font-bold tabular-nums ${textMain}`}>{mlData.currentMonth?.unitsSoFar?.toLocaleString() ?? "—"}</span></div>
-              <div><div className={`text-[14px] uppercase tracking-widest font-bold mb-1 ${textMuted}`}>Observed pace</div><span className={`text-2xl font-bold tabular-nums ${textMain}`}>{mlData.observedDailyRate ?? "—"}</span><span className={`text-[15px] ${textMuted}`}>/day</span>
+              <div><div className={`text-[14px] uppercase tracking-widest font-bold mb-1 ${textMuted}`}>Sold so far</div><span className={`text-2xl font-bold tabular-nums ${textMain}`}>{mlData.currentMonth?.unitsSoFar?.toLocaleString() ?? "-"}</span></div>
+              <div><div className={`text-[14px] uppercase tracking-widest font-bold mb-1 ${textMuted}`}>Observed pace</div><span className={`text-2xl font-bold tabular-nums ${textMain}`}>{mlData.observedDailyRate ?? "-"}</span><span className={`text-[15px] ${textMuted}`}>/day</span>
                 {mlData.observedDailyRate != null && mlData.observedDailyRate < 1 && (
                   <div className={`text-[14px] ${textMuted}`}>≈ {Math.round(mlData.observedDailyRate * 30)}/month</div>
                 )}</div>
-              <div><div className={`text-[14px] uppercase tracking-widest font-bold mb-1 ${textMuted}`}>Stock covers</div><span className={`text-2xl font-bold tabular-nums ${textMain}`}>{mlData.observedRunwayDays != null ? `~${mlData.observedRunwayDays}` : "—"}</span><span className={`text-[15px] ${textMuted}`}>{mlData.observedRunwayDays != null ? " days" : ""}</span></div>
+              <div><div className={`text-[14px] uppercase tracking-widest font-bold mb-1 ${textMuted}`}>Stock covers</div><span className={`text-2xl font-bold tabular-nums ${textMain}`}>{mlData.observedRunwayDays != null ? `~${mlData.observedRunwayDays}` : "-"}</span><span className={`text-[15px] ${textMuted}`}>{mlData.observedRunwayDays != null ? " days" : ""}</span></div>
             </div>
             {mlData.observedRunwayDays != null && (() => {
               const soon = mlData.observedRunwayDays <= (params.leadTime || 14);
@@ -1473,12 +1595,12 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
                   : ("bg-[var(--t-sunken)] border-[var(--t-line)] text-[var(--t-soft)]")}`}>
                   {soon ? "⚠️ " : "ℹ️ "}At its current pace (~{mlData.observedDailyRate}/day), this runs out around{" "}
                   <span className="font-semibold">{mlData.observedStockoutTs ? new Date(mlData.observedStockoutTs).toLocaleDateString("en-US", { month: "short", day: "numeric" }) : `~${mlData.observedRunwayDays} days`}</span>
-                  {" "}— about {mlData.observedRunwayDays} days of stock left.
+                  , about {mlData.observedRunwayDays} days of stock left.
                   {soon ? ` That's inside your ${params.leadTime}-day lead time, so it's worth ordering now even though the forecast is still warming up.` : ""}
                 </div>
               );
             })()}
-            <p className={`text-[14px] mt-4 ${textMuted}`}>Pace and runway are raw observations from the days seen so far — not a forecast.</p>
+            <p className={`text-[14px] mt-4 ${textMuted}`}>Pace and runway are raw observations from the days so far, not a forecast.</p>
           </div>
           </>
         ) : (
@@ -1527,15 +1649,35 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
           </div>
             )}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
-          <div className={`lg:col-span-2 ${cardBg} border rounded-2xl p-5 h-[420px]`}>
-            <ForecastChart historyPoints={mlData.chartDataHistory}
-              futurePoints={mlData.inactive ? [] : mlData.chartDataFuture}
-              rangePoints={mlData.inactive ? [] : mlData.chartDataRange}
-              stockoutTime={mlData.inactive ? null : mlData.stockoutTimestamp}
-              reorderTime={mlData.inactive ? null : mlData.reorderTimestamp} intervalWidth={mlData.intervalWidth}
-              poLandsTime={openPO?.delivery ? new Date(`${openPO.delivery}T12:00:00Z`).getTime() : null}
-              upcomingPromos={mlData.upcomingPromos} lm={lm} />
-          </div>
+          {(() => {
+            /* Holidays inside the chart's horizon, named once under it (the shading has
+               no labels: neighbouring holidays would print over each other). */
+            const fut = mlData.inactive ? [] : (mlData.chartDataFuture || []);
+            const endX = fut.length ? fut[fut.length - 1].x : 0;
+            const wins = ((mlData.holidays || {}).windows || [])
+              .filter(w => new Date(`${w.start}T00:00:00Z`).getTime() <= endX);
+            const fmt = (iso) => new Date(`${iso}T12:00:00Z`).toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: "UTC" });
+            return (
+              <div className={`lg:col-span-2 ${cardBg} border rounded-2xl p-5 h-[420px] flex flex-col`}>
+                <div className="flex-1 min-h-0">
+                  <ForecastChart historyPoints={mlData.chartDataHistory}
+                    futurePoints={fut}
+                    rangePoints={mlData.inactive ? [] : mlData.chartDataRange}
+                    stockoutTime={mlData.inactive ? null : mlData.stockoutTimestamp}
+                    reorderTime={mlData.inactive ? null : mlData.reorderTimestamp} intervalWidth={mlData.intervalWidth}
+                    poLandsTime={openPO?.delivery ? new Date(`${openPO.delivery}T12:00:00Z`).getTime() : null}
+                    upcomingPromos={mlData.upcomingPromos} holidayWindows={wins} lm={lm} todaySales={mlData.todaySales} />
+                </div>
+                {wins.length > 0 && (
+                  <div className={`pt-2 text-[13.5px] leading-snug ${textMuted} truncate`}
+                    title={wins.map(w => `${w.name} ${w.pct > 0 ? "+" : ""}${w.pct}% (${fmt(w.start)}${w.end !== w.start ? ` to ${fmt(w.end)}` : ""})`).join(" · ")}>
+                    <span className="inline-block h-2.5 w-2.5 mr-1.5 align-middle rounded-sm bg-[var(--t-sunken)] border border-[var(--t-line2)]" />
+                    Holidays: {wins.map(w => `${w.name} ${w.pct > 0 ? "+" : ""}${w.pct}% (${fmt(w.start)})`).join(" · ")}
+                  </div>
+                )}
+              </div>
+            );
+          })()}
           {/* Current Month — standalone card aligned with chart */}
           <div className={`${cardBg} border rounded-2xl p-6 flex flex-col justify-between h-[360px]`}>
             {/* Top: header + big number */}
@@ -1556,6 +1698,13 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
               <div>
                 <div className={`text-[14px] uppercase tracking-widest font-bold mb-1 ${textMuted}`}>Sold so far</div>
                 <span className={`text-3xl font-bold tabular-nums ${textMain}`}>{mlData.currentMonth.unitsSoFar.toLocaleString()}</span>
+                {/* TODAY, which is in none of the figures above it.
+                    The sales sync runs at 00:15 and the training data deliberately stops
+                    at the last COMPLETE day, so every month-to-date number on this card
+                    is current through yesterday and silent about the hours since. Without
+                    this line a shop that traded all day reads as though it had not, and
+                    there is no way to tell that from a product that genuinely stopped. */}
+                <TodaySoFar data={mlData} muted={textMuted} />
               </div>
               <div>
                 <div className={`text-[14px] uppercase tracking-widest font-bold mb-1 ${textMuted}`}>Remaining</div>
@@ -1599,6 +1748,10 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
         priceVaried={mlData.priceVaried} priceWellSampled={mlData.priceWellSampled} lastPrice={mlData.lastPrice}
         priceTiers={mlData.priceTiers} priceTrainedMin={mlData.priceTrainedMin} priceTrainedMax={mlData.priceTrainedMax}
         priceSafeMin={mlData.priceSafeMin} priceSafeMax={mlData.priceSafeMax} priceModeled={mlData.priceModeled}
+        priceResponse={mlData.priceResponse} priceMixedDays={mlData.priceMixedDays || 0}
+        holidays={((mlData.holidays || {}).effects || []).filter(h => h.active)}
+        posEvents={mlData.posEvents || []} livePrice={mlData.livePrice}
+        lastRecordedDate={mlData.lastRecordedDate}
         onSave={handleSaveEvents} onClose={() => setShowEvents(false)} lm={lm} />}
     </div>
   );

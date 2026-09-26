@@ -53,7 +53,7 @@ export function ReliabilityBadge({ color, message, intervalWidth, demandVolatili
             {ds.label}
           </span>
           <div className={`text-[14px] leading-snug ${"text-[var(--t-dim)]"}`}>
-            <span className={`font-semibold ${"text-[var(--t-soft)]"}`}>Forecast data quality — </span>
+            <span className={`font-semibold ${"text-[var(--t-soft)]"}`}>Forecast data quality: </span>
             how much history you have vs. how far ahead you're forecasting
           </div>
         </div>
@@ -65,7 +65,7 @@ export function ReliabilityBadge({ color, message, intervalWidth, demandVolatili
               {vs.label}
             </span>
             <div className={`text-[14px] leading-snug ${"text-[var(--t-dim)]"}`}>
-              <span className={`font-semibold ${"text-[var(--t-soft)]"}`}>Demand noise — </span>
+              <span className={`font-semibold ${"text-[var(--t-soft)]"}`}>Demand noise: </span>
               how random sales are after removing seasonality & trend
               {intervalWidth && (
                 <span className={`ml-1 font-mono font-semibold ${"text-[var(--t-dim)]"}`}>→ {intervalWidth}% forecast band</span>
@@ -107,7 +107,7 @@ export function MonthForecastCard({ card, lm }) {
           <span className={`text-3xl font-bold ${textMain} tabular-nums`}>{card.projectedTotal.toLocaleString()}</span>
           <span className={`text-[15px] ${textMuted}`}>units expected</span>
         </div>
-        <div className={`text-[15px] ${textMuted} mt-1.5`}>Range: <span className={textSub}>{card.rangeLow.toLocaleString()} – {card.rangeHigh.toLocaleString()}</span></div>
+        <div className={`text-[15px] ${textMuted} mt-1.5`}>Range: <span className={textSub}>{card.rangeLow.toLocaleString()} to {card.rangeHigh.toLocaleString()}</span></div>
       </div>
       {card.isCurrent && card.actualsSoFar > 0 && (
         <div className={`grid grid-cols-2 gap-3 text-[15px] pt-3 border-t ${divider}`}>
@@ -197,7 +197,7 @@ export function PriceTierTable({ tiers, lm }) {
         );
       })}
       <p className={`text-[13px] mt-1 ${"text-[var(--t-dim)]"}`}>
-        Reliable ≥90d · Moderate 60–89d · Weak 30–59d · Insufficient &lt;30d
+        Reliable ≥90d · Moderate 60-89d · Weak 30-59d · Insufficient &lt;30d
       </p>
     </div>
   );

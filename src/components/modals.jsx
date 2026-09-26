@@ -93,7 +93,7 @@ export function OrderInTransitModal({ skuId, existing, onSave, onClear, onClose,
       <div className={panel} onClick={e => e.stopPropagation()}>
         <div>
           <h3 className={title}>Mark Order In Transit</h3>
-          <p className={desc}>Record an open PO so the system knows stock is incoming and suppresses the reorder alert.</p>
+          <p className={desc}>Record an open PO so incoming stock is counted and the reorder alert is suppressed.</p>
         </div>
         <div className="space-y-3">
           <div>
@@ -111,7 +111,7 @@ export function OrderInTransitModal({ skuId, existing, onSave, onClear, onClose,
                 onChange={e => { setDelivery(e.target.value); setDateTouched(true); }} className={inp} />
               <div className={desc}>
                 {dateTouched
-                  ? "Your date — nothing will override it."
+                  ? "Your date. Nothing will override it."
                   : basis
                     ? <><span className="font-semibold">{basis.label}.</span> {basis.detail}</>
                     : <>Change it if you know better.</>}
@@ -150,7 +150,7 @@ export function OrderInTransitModal({ skuId, existing, onSave, onClear, onClose,
               <select value={supplierId} onChange={e => handleSupChange(e.target.value)} className={inp}>
                 {/* Says what leaving it blank actually does, so the fallback needs no
                     paragraph underneath explaining itself. */}
-                <option value="">No supplier — order still tracked</option>
+                <option value="">No supplier (order still tracked)</option>
                 {supList.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
                 <option value="_new">+ Add new supplier…</option>
               </select>
@@ -190,8 +190,87 @@ export function OrderInTransitModal({ skuId, existing, onSave, onClear, onClose,
 
 // ─── EVENTS MODAL ─────────────────────────────
 
+/** "Buy X get Y free" as the per-unit discount it amounts to: Y free in every X+Y. */
+function multibuyFields(buy, get) {
+  const b = Math.max(1, Math.round(buy)), g = Math.max(1, Math.round(get));
+  return { discount_pct: Math.round(g / (b + g) * 10000) / 100, multibuy: { buy: b, get: g },
+           label: `Buy ${b} get ${g} free` };
+}
+
 export function EventsModal({ skuId, events, hasPrice, hasPromotion, priceVaried, priceWellSampled, lastPrice,
-  priceTiers, priceTrainedMin, priceTrainedMax, priceSafeMin, priceSafeMax, priceModeled = true, onSave, onClose, lm }) {
+  priceTiers, priceTrainedMin, priceTrainedMax, priceSafeMin, priceSafeMax, priceModeled = true, onSave, onClose, lm,
+  priceResponse = null, priceMixedDays = 0, lastRecordedDate = null, posEvents = [], livePrice = null,
+  holidays = [] }) {
+  /* Whether a price change can move THIS product's forecast, decided by the server. When
+     it can't, adding one used to be a silent no-op: save, nothing changes, no reason given.
+     Every refusal has a real cause — too few selling days to measure, a relationship in
+     the data that points backwards, a price that never moved — and each is now said at
+     the moment it matters, which is while the change is being entered. */
+  const priceInert = priceResponse && priceResponse.applies === false;
+  const priceLive = !!(priceResponse && priceResponse.applies);
+  // `bounds` are the hard limits the model is evaluated within; `observed` the range of
+  // prices with 30+ days behind them. Between the two a price is extrapolated — allowed,
+  // but with a wider forecast range and more safety stock.
+  const borrowed = priceLive && priceResponse.reason === "borrowed";
+  const bounds = !priceLive ? null
+    : (!borrowed && priceSafeMin != null && priceSafeMax != null) ? [priceSafeMin, priceSafeMax]
+    : (priceResponse.bounds || null);
+  const observed = !priceLive ? null
+    : (!borrowed && priceTrainedMin != null && priceTrainedMax != null) ? [priceTrainedMin, priceTrainedMax]
+    : (priceResponse.knownRange || null);
+  const basePrice = livePrice?.listPrice ?? lastPrice;
+
+  /* Events are FORECAST inputs. Days up to lastRecordedDate already have real sales,
+     and those — not an event — say what was charged and sold. So an event is judged
+     against where recorded history ends, and against the prices actually observed. */
+  const overlapDays = (a, b) => a.date <= (b.end_date || b.date) && b.date <= (a.end_date || a.date);
+  const eventNotes = (ev) => {
+    const notes = [];
+    /* Promotions don't add up: a shopper takes one deal. On days two overlap, the deeper
+       discount is the one forecast (same rule as the server). */
+    if (ev.type === "promotion" && ev.discount_pct && ev.date) {
+      const others = [...localEvents, ...posEvents].filter(o => o !== ev && o.type === "promotion"
+        && o.discount_pct && o.date && overlapDays(ev, o));
+      if (others.length) {
+        const deepest = Math.max(ev.discount_pct, ...others.map(o => o.discount_pct));
+        const names = others.map(o => o.label || `${Math.round(o.discount_pct)}% off`).join(", ");
+        notes.push({ tone: "dim", text: `Overlaps with ${names}. Promotions don't add up: on shared days the deepest discount (${Math.round(deepest)}%) is used.` });
+      }
+    }
+    const end = ev.end_date || ev.date;
+    const isPrice = ev.type === "price_change_permanent" || ev.type === "price_change_temporary";
+    if (lastRecordedDate && ev.date && ev.date <= lastRecordedDate) {
+      if (ev.type !== "price_change_permanent" && end <= lastRecordedDate) {
+        notes.push({ tone: "dim", text: "Already happened. Recorded sales for these dates are used as is, so this event has no effect." });
+      } else if (ev.type === "price_change_permanent") {
+        notes.push({ tone: "dim", text: `Dated before your latest recorded day (${isoToDisplay(lastRecordedDate)}). Past days keep the prices actually charged. This only affects the forecast.` });
+        if (lastPrice != null && ev.new_price != null && Math.abs(ev.new_price - lastPrice) < 0.005) {
+          notes.push({ tone: "dim", text: "Your recorded sales are already at this price." });
+        }
+      } else {
+        notes.push({ tone: "dim", text: `Partly past. Only days after ${isoToDisplay(lastRecordedDate)} are affected.` });
+      }
+    }
+    if (ev.type === "promotion" && !ev.discount_pct) {
+      notes.push({ tone: "dim", text: "No discount, so this doesn't change the forecast." });
+    }
+    if (bounds) {
+      let p = isPrice ? ev.new_price : null;
+      if (ev.type === "promotion" && ev.discount_pct && basePrice != null) p = basePrice * (1 - ev.discount_pct / 100);
+      if (p != null && !isNaN(p)) {
+        if (p < bounds[0] || p > bounds[1]) {
+          const edge = p < bounds[0] ? bounds[0] : bounds[1];
+          notes.push({ tone: "warn", text: `Forecast as if $${edge.toFixed(2)}. $${p.toFixed(2)} is past the furthest the model goes from prices you've sold at.` });
+        } else if (observed && (p < observed[0] - 0.005 || p > observed[1] + 0.005)) {
+          const below = p < observed[0];
+          const ref = below ? observed[0] : observed[1];
+          const pct = Math.round(Math.abs(p - ref) / ref * 100);
+          notes.push({ tone: "warn", text: `Extrapolated: $${p.toFixed(2)} is ${pct}% ${below ? "below the lowest" : "above the highest"} price with 30+ days of history ($${ref.toFixed(2)}). The forecast range and safety stock are widened for it.` });
+        }
+      }
+    }
+    return notes;
+  };
   const [localEvents, setLocalEvents] = useState(events || []);
   const [adding, setAdding]           = useState(null);
   const [form, setForm]               = useState({});
@@ -210,7 +289,7 @@ export function EventsModal({ skuId, events, hasPrice, hasPromotion, priceVaried
 Event types:
 - "price_change_permanent" — a lasting price change
 - "price_change_temporary" — a price change with start and end date
-- "promotion" — a promotional discount window
+- "promotion" — a promotional discount window. For "buy X get Y free" deals, also return buy_qty and get_qty.
 
 Return JSON with these fields (omit fields that are absent or unclear):
 {
@@ -219,6 +298,8 @@ Return JSON with these fields (omit fields that are absent or unclear):
   "end_date": "YYYY-MM-DD",
   "new_price": <number>,
   "discount_pct": <number>,
+  "buy_qty": <number>,
+  "get_qty": <number>,
   "label": "<brief label>"
 }
 
@@ -268,12 +349,25 @@ User input: "${nlText.trim()}"`;
     if (nlParsed.new_price)     ev.new_price    = parseFloat(nlParsed.new_price);
     if (nlParsed.end_date)      ev.end_date     = nlParsed.end_date;
     if (nlParsed.discount_pct)  ev.discount_pct = parseFloat(nlParsed.discount_pct);
+    if (nlParsed.type === "promotion" && nlParsed.buy_qty > 0 && nlParsed.get_qty > 0) {
+      Object.assign(ev, multibuyFields(nlParsed.buy_qty, nlParsed.get_qty));
+      if (!ev.end_date) ev.end_date = ev.date;
+    }
     setLocalEvents(prev => [...prev, ev].sort((a, b) => a.date.localeCompare(b.date)));
     setNlMode(false); setNlText(""); setNlParsed(null); setNlError(null);
   };
 
   const addEvent = () => {
     if (!form.date) return;
+    if (adding === "multibuy") {
+      const buy = parseInt(form.buy_qty || "1", 10), get = parseInt(form.get_qty || "1", 10);
+      if (!(buy > 0) || !(get > 0)) return;
+      const ev = { type: "promotion", date: form.date, end_date: form.end_date || form.date,
+                   ...multibuyFields(buy, get), ...(form.label ? { label: form.label } : {}) };
+      setLocalEvents(prev => [...prev, ev].sort((a, b) => a.date.localeCompare(b.date)));
+      setAdding(null); setForm({});
+      return;
+    }
     const ev = { type: adding, date: form.date, label: form.label || "" };
     if (adding === "price_change_permanent" || adding === "price_change_temporary") {
       if (!form.new_price) return;
@@ -294,6 +388,7 @@ User input: "${nlText.trim()}"`;
     price_change_permanent: { label: "Permanent Price Change", color: "text-[var(--t-warn)]", bg: "bg-[var(--t-warn-soft)] border-[var(--t-warn-line)]" },
     price_change_temporary: { label: "Temporary Price Change", color: "text-[var(--t-warn)]", bg: "bg-[var(--t-warn-soft)] border-[var(--t-warn-line)]" },
     promotion:              { label: "Promotion Window",       color: "text-[var(--t-accent)]", bg: "bg-[var(--t-accent-soft)] border-[var(--t-accent-line)]" },
+    multibuy:               { label: "Multi-buy Deal",         color: "text-[var(--t-accent)]", bg: "bg-[var(--t-accent-soft)] border-[var(--t-accent-line)]" },
   };
 
   const panel = "bg-[var(--t-panel)] border border-[var(--t-line2)] text-[var(--t-ink)]";
@@ -302,59 +397,47 @@ User input: "${nlText.trim()}"`;
   const addPanel = "border border-[var(--t-line2)] rounded-xl p-4 space-y-3 bg-[var(--t-sunken)]";
   const labelClass = "block text-[14px] text-[var(--t-dim)] uppercase tracking-widest mb-1";
 
+  const MixedNote = () => priceMixedDays > 0 ? (
+    <p className={`text-[13px] mt-1 ${muted}`}>
+      {priceMixedDays} day{priceMixedDays === 1 ? "" : "s"} sold at more than one price (e.g. some units discounted) and {priceMixedDays === 1 ? "is" : "are"} not counted toward any price.
+    </p>
+  ) : null;
+
   const PriceContextBanner = () => {
-    if (hasPrice && !priceModeled) return (
-      <div className={`${"bg-[var(--t-warn-soft)] border-[var(--t-warn-line)]"} border rounded-xl p-3 flex gap-2.5 items-start`}>
-        <span className="text-[16.5px] shrink-0">⚠️</span>
-        <div>
-          <div className={`text-[14px] font-bold mb-0.5 ${"text-[var(--t-warn)]"}`}>Price changes won't affect this forecast</div>
-          <p className={`text-[14px] leading-relaxed ${"text-[var(--t-warn)]"}`}>This product is forecast by a non-price model (new/sparse — its price response can't be estimated reliably). You can still log a price change for your records and the scorecard margin, but it will not move the forecast.</p>
-        </div>
-      </div>
-    );
     if (!hasPrice) return (
       <div className={`${"bg-[var(--t-sunken)] border-[var(--t-line2)]"} border rounded-xl p-3 flex gap-2.5 items-start`}>
         <span className="text-[16.5px] shrink-0">!</span>
         <div>
-          <div className={`text-[14px] font-bold mb-0.5 ${"text-[var(--t-soft)]"}`}>No price data in upload</div>
-          <p className={`text-[14px] ${muted} leading-relaxed`}>Your Excel sheet has no <span className="font-mono">Price</span> column. Promotions can still be logged, but price changes will not affect the forecast until price history is included.</p>
+          <div className={`text-[14px] font-bold mb-0.5 ${"text-[var(--t-soft)]"}`}>No price data</div>
+          <p className={`text-[14px] ${muted} leading-relaxed`}>There is no price history for this product. Promotions can still be logged, but price changes will not affect the forecast.</p>
         </div>
       </div>
     );
-    if (!priceVaried) return (
+    /* The server's verdict decides this banner. It used to be worked out here from
+       different flags, and could say "price sensitivity active" on a product where a
+       price change did nothing. */
+    if (priceInert) return (
       <div className={`${"bg-[var(--t-warn-soft)] border-[var(--t-warn-line)]"} border rounded-xl p-3 flex gap-2.5 items-start`}>
         <span className="text-[16.5px] shrink-0">$</span>
-        <div>
-          <div className={`text-[14px] font-bold mb-0.5 ${"text-[var(--t-warn)]"}`}>Single price point in history</div>
-          <p className={`text-[14px] leading-relaxed ${"text-[var(--t-warn)]"}`}>This SKU has only been sold at <span className="font-mono">${lastPrice?.toFixed(2)}</span>. The model has no price-response data to learn from yet.</p>
+        <div className="flex-1 min-w-0">
+          <div className={`text-[14px] font-bold mb-0.5 ${"text-[var(--t-warn)]"}`}>Price changes won't affect this forecast</div>
+          <p className={`text-[14px] leading-relaxed ${"text-[var(--t-warn)]"}`}>{priceResponse.text}</p>
+          {priceTiers?.length > 0 && <PriceTierTable tiers={priceTiers} lm={lm} />}
         </div>
       </div>
     );
-    if (!priceWellSampled) {
-      const hasInsufficient = priceTiers?.some(t => t.quality === "insufficient");
-      return (
-        <div className={`${"bg-[var(--t-warn-soft)] border-[var(--t-warn-line)]"} border rounded-xl p-3 flex gap-2.5 items-start`}>
-          <span className="text-[16.5px] shrink-0">$</span>
-          <div className="flex-1 min-w-0">
-            <div className={`text-[14px] font-bold mb-0.5 ${"text-[var(--t-warn)]"}`}>
-              {hasInsufficient ? "Insufficient data on some price tiers" : "Limited price variation data"}
-            </div>
-            <p className={`text-[14px] leading-relaxed ${"text-[var(--t-warn)]"}`}>
-              {hasInsufficient
-                ? "Some price points have fewer than 30 days of data — the price coefficient for those tiers is unreliable."
-                : "Price variation detected, but some tiers have fewer than 90 days of data."}
-            </p>
-            {priceTiers?.length > 0 && <PriceTierTable tiers={priceTiers} lm={lm} />}
-          </div>
-        </div>
-      );
-    }
     return (
       <div className={`${"bg-[var(--t-good-soft)] border-[var(--t-good-line)]"} border rounded-xl p-3 flex gap-2.5 items-start`}>
         <span className="text-[16.5px] shrink-0">✓</span>
-        <div>
-          <div className={`text-[14px] font-bold mb-0.5 ${"text-[var(--t-good)]"}`}>Price sensitivity active</div>
-          <p className={`text-[14px] leading-relaxed ${"text-[var(--t-good)]"}`}>The model has sufficient price history to estimate demand response.</p>
+        <div className="flex-1 min-w-0">
+          <div className={`text-[14px] font-bold mb-0.5 ${"text-[var(--t-good)]"}`}>Price changes move this forecast</div>
+          <p className={`text-[14px] leading-relaxed ${"text-[var(--t-good)]"}`}>
+            {borrowed ? priceResponse.text : bounds && observed
+              ? `At least two prices each have 30+ days of history ($${observed[0].toFixed(2)} to $${observed[1].toFixed(2)}). Prices outside that range are extrapolated, down to $${bounds[0].toFixed(2)} and up to $${bounds[1].toFixed(2)}, with a wider forecast range and more safety stock.`
+              : "At least two prices each have 30+ days of history."}
+          </p>
+          {priceTiers?.length > 0 && <PriceTierTable tiers={priceTiers} lm={lm} />}
+          <MixedNote />
         </div>
       </div>
     );
@@ -362,18 +445,51 @@ User input: "${nlText.trim()}"`;
 
   return (
     <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50" onClick={onClose}>
-      <div className={`${panel} rounded-2xl p-6 w-[480px] max-h-[85vh] flex flex-col shadow-2xl`} onClick={e => e.stopPropagation()}>
+      <div className={`${panel} rounded-2xl p-6 w-[480px] max-w-[calc(100vw-32px)] max-h-[85vh] flex flex-col shadow-2xl`} onClick={e => e.stopPropagation()}>
+        {/* Everything above the Save row scrolls as one: the price table alone can be taller
+            than the window, and a separately scrolling list inside it got squeezed to nothing. */}
+        <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain -mx-6 px-6">
         <div className="mb-4">
           <h3 className="text-[16.5px] font-bold">Pricing & Promotion Events</h3>
-          <p className={`text-[14px] ${muted} mt-1`}>Declare planned price changes and promotions. The model will apply these when forecasting future demand.</p>
+          <p className={`text-[14px] ${muted} mt-1`}>Declare planned price changes and promotions. These only shape the forecast{lastRecordedDate ? ` for days after ${isoToDisplay(lastRecordedDate)}` : ""}. Recorded sales and prices are never changed.</p>
+          {holidays.length > 0 && (
+            <p className={`text-[14px] ${muted} mt-1.5`}>
+              Holidays are already counted on their own dates ({holidays.slice(0, 3).map(h => `${h.name} ${h.pct > 0 ? "+" : ""}${h.pct}%`).join(", ")}{holidays.length > 3 ? ", …" : ""}). Enter only the deal you run, not the holiday itself.
+            </p>
+          )}
         </div>
 
         <PriceContextBanner />
 
-        <div className="flex-1 overflow-y-auto space-y-2 my-4 pr-1">
-          {localEvents.length === 0 && <div className={`text-[15px] text-center py-6 ${muted}`}>No events declared yet.</div>}
+        <div className="space-y-2 my-4">
+          {/* Read from the POS, not typed here: refreshed every hour, and it ends when
+              the POS says it ends. Shown so the forecast never has an unexplained input. */}
+          {posEvents.filter(ev => ev.type === "promotion").map((ev, i) => {
+            const src = livePrice?.source ? livePrice.source[0].toUpperCase() + livePrice.source.slice(1) : "your POS";
+            return (
+              <div key={`pos${i}`} className="border rounded-xl p-3 bg-[var(--t-accent-soft)] border-[var(--t-accent-line)]">
+                <div className="text-[15px] font-bold text-[var(--t-accent)]">Live discount · from {src}</div>
+                <div className="text-[15px] mt-0.5 flex gap-3 flex-wrap text-[var(--t-soft)]">
+                  <span>{ev.label}</span>
+                  <span>{Math.round(ev.discount_pct)}% off{livePrice?.listPrice ? ` → $${(livePrice.currentPrice ?? livePrice.listPrice).toFixed(2)}` : ""}</span>
+                  <span>{ev.openEnded ? "no end date set" : `until ${isoToDisplay(ev.end_date)}`}</span>
+                </div>
+                <div className={`text-[13px] mt-1 leading-snug ${muted}`}>
+                  Checked every hour. It shapes the forecast from today and stops when {src} says the discount has ended.
+                </div>
+                {eventNotes({ type: "promotion", date: ev.date, end_date: ev.end_date, discount_pct: ev.discount_pct })
+                  .filter(n => n.tone === "warn").map((n, j) => (
+                    <div key={j} className="text-[13px] mt-1 leading-snug text-[var(--t-warn)]">{n.text}</div>
+                  ))}
+                {priceInert && (
+                  <div className="text-[13px] mt-1 leading-snug text-[var(--t-warn)]">The lower price won't move this forecast yet (see above).</div>
+                )}
+              </div>
+            );
+          })}
+          {localEvents.length === 0 && posEvents.length === 0 && <div className={`text-[15px] text-center py-6 ${muted}`}>No events declared yet.</div>}
           {localEvents.map((ev, i) => {
-            const cfg = typeLabel[ev.type] || { label: ev.type, color: "text-[var(--t-soft)]", bg: "bg-[var(--t-sunken)] border-[var(--t-line)]" };
+            const cfg = typeLabel[ev.multibuy ? "multibuy" : ev.type] || { label: ev.type, color: "text-[var(--t-soft)]", bg: "bg-[var(--t-sunken)] border-[var(--t-line)]" };
             return (
               <div key={i} className={`border rounded-xl p-3 flex items-start justify-between gap-3 ${cfg.bg}`}>
                 <div className="min-w-0">
@@ -381,9 +497,16 @@ User input: "${nlText.trim()}"`;
                   <div className={`text-[15px] mt-0.5 flex gap-3 flex-wrap ${"text-[var(--t-soft)]"}`}>
                     <span>{isoToDisplay(ev.date)}{ev.end_date && ev.end_date !== ev.date ? ` -> ${isoToDisplay(ev.end_date)}` : ""}</span>
                     {ev.new_price && <span>{`-> $${ev.new_price.toFixed(2)}`}</span>}
-                    {ev.discount_pct && <span className={"text-[var(--t-accent)]"}>{ev.discount_pct}% off</span>}
+                    {ev.new_price && priceInert && (
+                      <span title={priceResponse.text} className={"text-[var(--t-warn)]"}>no effect on forecast</span>
+                    )}
+                    {ev.multibuy && <span className={"text-[var(--t-accent)]"}>Buy {ev.multibuy.buy} get {ev.multibuy.get} free</span>}
+                    {ev.discount_pct && <span className={"text-[var(--t-accent)]"}>{ev.multibuy ? `(${Math.round(ev.discount_pct)}% off per unit)` : `${ev.discount_pct}% off`}</span>}
                     {ev.label && <span className={`${muted} italic`}>{ev.label}</span>}
                   </div>
+                  {eventNotes(ev).map((n, j) => (
+                    <div key={j} className={`text-[13px] mt-1 leading-snug ${n.tone === "warn" ? "text-[var(--t-warn)]" : muted}`}>{n.text}</div>
+                  ))}
                 </div>
                 <button onClick={() => removeEvent(i)} className={`h-5 w-5 rounded flex items-center justify-center shrink-0 transition-colors ${"bg-[var(--t-panel)] hover:bg-[var(--t-bad-soft)] text-[var(--t-dim)] hover:text-[var(--t-bad)]"}`}>
                   <svg className="h-2.5 w-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M6 18L18 6M6 6l12 12" /></svg>
@@ -397,36 +520,45 @@ User input: "${nlText.trim()}"`;
           <div className={addPanel}>
             <div className={`text-[15px] font-bold ${"text-[var(--t-soft)]"}`}>{typeLabel[adding]?.label}</div>
             <div className="grid grid-cols-2 gap-3">
-              <div><label className={labelClass}>{adding === "promotion" ? "Promo Start" : "Effective Date"}</label><input type="date" value={form.date || ""} onChange={e => setForm(p => ({...p, date: e.target.value}))} className={input} /></div>
-              {(adding === "price_change_temporary" || adding === "promotion") && <div><label className={labelClass}>End Date</label><input type="date" value={form.end_date || ""} onChange={e => setForm(p => ({...p, end_date: e.target.value}))} className={input} /></div>}
+              <div><label className={labelClass}>{adding === "promotion" || adding === "multibuy" ? "Start" : "Effective Date"}</label><input type="date" value={form.date || ""} onChange={e => setForm(p => ({...p, date: e.target.value}))} className={input} /></div>
+              {(adding === "price_change_temporary" || adding === "promotion" || adding === "multibuy") && <div><label className={labelClass}>End Date</label><input type="date" value={form.end_date || ""} onChange={e => setForm(p => ({...p, end_date: e.target.value}))} className={input} /></div>}
               {(adding === "price_change_permanent" || adding === "price_change_temporary") && <div><label className={labelClass}>New Price ($)</label><input type="number" step="0.01" value={form.new_price || ""} onChange={e => setForm(p => ({...p, new_price: e.target.value}))} className={input} placeholder="e.g. 19.99" /></div>}
+              {adding === "multibuy" && <div><label className={labelClass}>Buy</label><input type="number" step="1" min="1" value={form.buy_qty ?? "1"} onChange={e => setForm(p => ({...p, buy_qty: e.target.value}))} className={input} /></div>}
+              {adding === "multibuy" && <div><label className={labelClass}>Get free</label><input type="number" step="1" min="1" value={form.get_qty ?? "1"} onChange={e => setForm(p => ({...p, get_qty: e.target.value}))} className={input} /></div>}
               {adding === "promotion" && <div><label className={labelClass}>Discount % (optional)</label><input type="number" step="1" min="1" max="99" value={form.discount_pct || ""} onChange={e => setForm(p => ({...p, discount_pct: e.target.value}))} className={input} placeholder="e.g. 20" /></div>}
             </div>
-            {/* Out-of-range warning for price change events */}
-            {(adding === "price_change_permanent" || adding === "price_change_temporary") && (() => {
-              const newPriceVal = parseFloat(form.new_price);
-              if (isNaN(newPriceVal) || !hasPrice || !priceModeled || priceTrainedMin == null || priceTrainedMax == null) return null;
-              const outsideTrained = newPriceVal < priceTrainedMin || newPriceVal > priceTrainedMax;
-              const outsideSafe    = priceSafeMin != null && priceSafeMax != null &&
-                                     (newPriceVal < priceSafeMin || newPriceVal > priceSafeMax);
-              if (!outsideTrained && !outsideSafe) return null;
-              const isCritical = outsideSafe;
+            {/* Said BEFORE the change is saved, not discovered afterwards. */}
+            {(adding === "price_change_permanent" || adding === "price_change_temporary") && priceInert && (
+              <div className={`flex items-start gap-2 rounded-lg p-2.5 ${"bg-[var(--t-warn-soft)] border border-[var(--t-warn-line)]"}`}>
+                <span className="text-[15px] shrink-0">ⓘ</span>
+                <p className={`text-[14px] leading-relaxed ${"text-[var(--t-warn)]"}`}>{priceResponse.text}</p>
+              </div>
+            )}
+            {/* What the forecast will actually use, said before saving. */}
+            {adding === "promotion" && (
+              <p className={`text-[13px] leading-relaxed ${muted}`}>A promotion counts as a price cut of its discount. With no discount it won't change the forecast.</p>
+            )}
+            {adding === "multibuy" && (() => {
+              const b = parseInt(form.buy_qty || "1", 10), g = parseInt(form.get_qty || "1", 10);
+              if (!(b > 0) || !(g > 0)) return null;
+              const pct = Math.round(g / (b + g) * 100);
               return (
-                <div className={`flex items-start gap-2 rounded-lg p-2.5 ${isCritical
-                  ? ("bg-[var(--t-bad-soft)] border border-[var(--t-bad-line)]")
-                  : ("bg-[var(--t-warn-soft)] border border-[var(--t-warn-line)]")}`}>
-                  <span className="text-[15px] shrink-0">⚠</span>
-                  <div>
-                    <p className={`text-[14px] leading-relaxed font-semibold mb-0.5 ${isCritical ? ("text-[var(--t-bad)]") : ("text-[var(--t-warn)]")}`}>
-                      {isCritical ? "Outside safe extrapolation range" : "Outside trained price range"}
-                    </p>
-                    <p className={`text-[14px] leading-relaxed ${isCritical ? ("text-[var(--t-bad)]") : ("text-[var(--t-warn)]")}`}>
-                      ${newPriceVal.toFixed(2)} is {outsideSafe
-                        ? `beyond the safe extrapolation zone ($${priceSafeMin?.toFixed(2)}–$${priceSafeMax?.toFixed(2)})`
-                        : `outside the trained range ($${priceTrainedMin.toFixed(2)}–$${priceTrainedMax.toFixed(2)})`
-                      }. The model is extrapolating linearly — actual demand response at this price is unknown.
-                    </p>
-                  </div>
+                <p className={`text-[13px] leading-relaxed ${muted}`}>
+                  Buy {b} get {g} free is forecast as {pct}% off per unit{basePrice != null ? ` ($${(basePrice * b / (b + g)).toFixed(2)} each)` : ""}. Shoppers who only want one still pay full price, so the real lift may be smaller.
+                </p>
+              );
+            })()}
+            {(adding === "price_change_permanent" || adding === "price_change_temporary" || adding === "promotion" || adding === "multibuy") && (() => {
+              const mb = adding === "multibuy" ? multibuyFields(parseInt(form.buy_qty || "1", 10) || 1, parseInt(form.get_qty || "1", 10) || 1) : null;
+              const notes = eventNotes({ type: mb ? "promotion" : adding, date: form.date, end_date: form.end_date,
+                new_price: form.new_price ? parseFloat(form.new_price) : null,
+                discount_pct: mb ? mb.discount_pct : (form.discount_pct ? parseFloat(form.discount_pct) : null) });
+              if (!notes.length) return null;
+              return (
+                <div className={`rounded-lg p-2.5 space-y-1 ${"bg-[var(--t-warn-soft)] border border-[var(--t-warn-line)]"}`}>
+                  {notes.map((n, j) => (
+                    <p key={j} className={`text-[14px] leading-relaxed ${"text-[var(--t-warn)]"}`}>{n.text}</p>
+                  ))}
                 </div>
               );
             })()}
@@ -480,15 +612,17 @@ User input: "${nlText.trim()}"`;
               <button onClick={() => setAdding("price_change_permanent")} className={`${typeLabel.price_change_permanent.bg} ${typeLabel.price_change_permanent.color} border hover:brightness-105 text-[14px] font-bold py-2.5 px-2 rounded-lg transition-colors text-center leading-tight`}>Permanent<br/>Price Change</button>
               <button onClick={() => setAdding("price_change_temporary")} className={`${typeLabel.price_change_temporary.bg} ${typeLabel.price_change_temporary.color} border hover:brightness-105 text-[14px] font-bold py-2.5 px-2 rounded-lg transition-colors text-center leading-tight`}>Temporary<br/>Price Change</button>
               <button onClick={() => setAdding("promotion")} className={`${typeLabel.promotion.bg} ${typeLabel.promotion.color} border hover:brightness-105 text-[14px] font-bold py-2.5 px-2 rounded-lg transition-colors text-center leading-tight`}>Promotion<br/>Window</button>
+              <button onClick={() => { setAdding("multibuy"); setForm({ buy_qty: "1", get_qty: "1" }); }} className={`${typeLabel.multibuy.bg} ${typeLabel.multibuy.color} border hover:brightness-105 text-[14px] font-bold py-2.5 px-2 rounded-lg transition-colors text-center leading-tight`}>Multi-buy<br/>(buy X get Y)</button>
               <button onClick={() => setNlMode(true)}
-                className={`border hover:brightness-105 text-[14px] font-bold py-2.5 px-2 rounded-lg transition-colors text-center leading-tight ${"bg-[var(--t-accent-soft)] border-[var(--t-accent-line)] text-[var(--t-accent)]"}`}>
+                className={`col-span-2 border hover:brightness-105 text-[14px] font-bold py-2.5 px-2 rounded-lg transition-colors text-center leading-tight ${"bg-[var(--t-accent-soft)] border-[var(--t-accent-line)] text-[var(--t-accent)]"}`}>
                 ✨ Describe it<br/>(AI parse)
               </button>
             </div>
           </div>
         )}
+        </div>
 
-        <div className={`flex gap-2 pt-4 border-t mt-4 ${"border-[var(--t-line)]"}`}>
+        <div className={`flex gap-2 pt-4 border-t mt-4 shrink-0 ${"border-[var(--t-line)]"}`}>
           <button onClick={() => onSave(localEvents)} className="flex-1 bg-[var(--t-accent-soft)] hover:bg-[var(--t-accent-soft)] text-[var(--t-ink)] text-[15px] font-bold py-2.5 rounded-xl transition-colors">Save & Update Forecast</button>
           <button onClick={onClose} className={`px-4 text-[15px] font-bold py-2.5 rounded-xl transition-colors ${"bg-[var(--t-panel)] border border-[var(--t-line2)] hover:bg-[var(--t-sunken)] text-[var(--t-soft)]"}`}>Cancel</button>
         </div>
@@ -535,7 +669,7 @@ export function AssignFolderModal({ skuId, skuName, folders, onAssign, onClose, 
             </button>
           ))}
           {Object.keys(folders).length === 0 && (
-            <p className={`text-[15px] text-center py-3 ${"text-[var(--t-dim)]"}`}>No folders yet — create one first.</p>
+            <p className={`text-[15px] text-center py-3 ${"text-[var(--t-dim)]"}`}>No folders yet. Create one first.</p>
           )}
         </div>
         <button onClick={onClose} className={cancel}>Cancel</button>

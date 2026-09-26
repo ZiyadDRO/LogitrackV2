@@ -194,7 +194,7 @@ def explain(summary: dict) -> str:
     tail = f" ({'; '.join(bits)})." if bits else "."
     if summary.get("understatedPct"):
         tail += (f" Sales understate demand by roughly {summary['understatedPct']}% "
-                 f"— about {summary['hiddenUnits']:.0f} units you couldn't sell.")
+                 f"(about {summary['hiddenUnits']:.0f} units you couldn't sell).")
     return head + tail
 
 
@@ -291,6 +291,7 @@ def apply_to_frame(df, availability_map=None, *, stock_col="units_in_stock",
              if hasattr(out[date_col], "dt") else out[date_col].astype(str))
 
     kinds, ests, weights = [], [], []
+    prev_close = None
     for i, (_, row) in enumerate(out.iterrows()):
         day = dates.iloc[i]
         stock = row.get(stock_col) if stock_col in out.columns else None
@@ -300,7 +301,17 @@ def apply_to_frame(df, availability_map=None, *, stock_col="units_in_stock",
         # No hours tracked but a zero closing stock still tells us the day was capped —
         # that's the signal an uploaded spreadsheet carries, and it must not be lost just
         # because Shopify polling wasn't running.
-        est = estimate_demand(row.get(value_col), stock, hours)
+        # ...and a day that OPENED empty (yesterday closed at zero), sold nothing and
+        # closed at zero had nothing on the shelf all day: no information about demand,
+        # exactly like a tracked day with zero hours in stock. Counted as a real zero it
+        # dragged the level down and read as a holiday dip (a Black Friday spent out of
+        # stock measured as -74%).
+        units_ = row.get(value_col)
+        if (hours is None and stock is not None and float(stock) <= 0 and prev_close is not None
+                and float(prev_close) <= 0 and float(units_ or 0) <= 0):
+            hours = 0.0
+        prev_close = stock
+        est = estimate_demand(units_, stock, hours)
         kinds.append(est["kind"])
         ests.append(est["estimate"])
         weights.append(est["weight"])

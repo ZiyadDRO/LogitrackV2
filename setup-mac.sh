@@ -54,7 +54,14 @@ PY312="$(brew --prefix python@3.12)/bin/python3.12"
 say "Setting up the forecasting engine (a few minutes the first time)"
 [ -d .venv ] || "$PY312" -m venv .venv
 ./.venv/bin/python -m pip install --upgrade pip --quiet
-./.venv/bin/python -m pip install -r engine_statsforecast/requirements.txt
+# Prophet is installed from the requirements file below like everything else; what it
+# needs is the cmdstanpy upper bound pinned there (see the note in requirements.txt —
+# cmdstanpy 1.3.0 rejects the trimmed cmdstan tree Prophet's wheel ships, and Prophet
+# reports it as a missing `stan_backend` attribute). --only-binary is belt-and-braces
+# for a second failure mode: with no wheel for this platform pip would fall back to the
+# sdist and try to compile Stan, which fails on a Mac without a full toolchain. Better
+# to fail here, loudly, than to install something that can't forecast.
+./.venv/bin/python -m pip install --only-binary=:all: -r engine_statsforecast/requirements.txt
 
 # ── 4. Frontend packages + build ─────────────────────────────────────────────
 say "Setting up the browser app"
@@ -76,6 +83,27 @@ if missing:
     sys.exit("Missing Python packages: " + ", ".join(missing))
 import numpy, pandas
 print(f"  Python {sys.version.split()[0]} · numpy {numpy.__version__} · pandas {pandas.__version__}")
+
+# find_spec only proves the FILES are on disk. A Prophet installed from source with a
+# failed Stan build passes that test and then throws on the first fit, which is how a
+# "successful" setup turned into products silently dropping out of the forecast. The
+# only check worth making is the thing the app actually does: fit a model.
+import logging, warnings
+logging.getLogger("cmdstanpy").setLevel(logging.ERROR)
+logging.getLogger("prophet").setLevel(logging.ERROR)
+warnings.filterwarnings("ignore")
+try:
+    from prophet import Prophet
+    df = pandas.DataFrame({"ds": pandas.date_range("2025-01-01", periods=90),
+                           "y": numpy.linspace(50, 60, 90)})
+    Prophet(weekly_seasonality=False, yearly_seasonality=False).fit(df)
+except Exception as e:
+    sys.exit("Prophet installed but can't fit a model (" + type(e).__name__ + ": " + str(e)[:120] + ").\n"
+             "  Almost always the cmdstanpy pin: 1.3.0+ rejects the cmdstan tree Prophet ships.\n"
+             "  Repair it with:\n"
+             "    ./.venv/bin/python -m pip install --force-reinstall --no-cache-dir \\\n"
+             "        --only-binary=:all: prophet 'cmdstanpy>=1.2,<1.3'")
+print("  Prophet fits a model.")
 PYCHECK
 [ -f dist/index.html ] || die "The browser app didn't build (no dist/index.html)."
 echo "  Browser app built."

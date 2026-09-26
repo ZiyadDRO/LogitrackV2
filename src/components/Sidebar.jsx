@@ -1,8 +1,9 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { urgencyLevel, URGENCY_STYLES, URGENCY_STYLES_LM } from '../lib/helpers';
+import { urgencyLevel, URGENCY_STYLES, URGENCY_STYLES_LM, availabilityChip,
+         statusInfo, SC_STATUS_KEY } from '../lib/helpers';
 
 // ─── SKU LIST ITEM ────────────────────────────
-export function SkuListItem({ sku, isActive, onClick, onDelete, reorderDays, hasOpenPO, indented = false, lm, secondaryAction, provisional, healthStatus }) {
+export function SkuListItem({ sku, isActive, onClick, onDelete, reorderDays, hasOpenPO, indented = false, lm, secondaryAction, provisional, healthStatus, availability, samplerEnabled = true }) {
   // Baseline/young SKUs are provisional — never show a hard urgency badge for them.
   const urgency = provisional ? "none" : urgencyLevel(reorderDays ?? null, hasOpenPO);
   const us = lm ? URGENCY_STYLES_LM[urgency] : URGENCY_STYLES[urgency];
@@ -19,25 +20,41 @@ export function SkuListItem({ sku, isActive, onClick, onDelete, reorderDays, has
   const iconBtn = lm
     ? "text-[var(--t-dim)] hover:text-[var(--t-soft)] hover:bg-[var(--t-sunken)]"
     : "text-[var(--t-dim)] hover:text-[var(--t-ink)] hover:bg-[var(--t-line)]";
-  const badgeText = provisional
-    ? "NEW"
-    : healthStatus === "Dead stock"
-    ? "DEAD"
-    : healthStatus === "Overstocked"
-    ? "SLOW"
-    : urgency === "on_order"
+  /* The badge comes from the SHARED status definitions, not from a chain of string
+     comparisons. The chain knew about exactly two statuses — "Dead stock" and
+     "Overstocked" — and anything else fell through to a reorder countdown that is null
+     for a product with no measured position, so it rendered NOTHING. A whole catalogue
+     of products came back blank, and adding a status to the backend could silently
+     produce that again. Reading SKU_STATES means a new status arrives with its own badge
+     or is a visible, fixable gap rather than an invisible one.
+
+     `provisional` used to win outright, which is worse than blank: a product that had
+     sold twice and then stopped was labelled NEW because its history was short. A
+     verdict the tool has actually reached outranks "we haven't been watching long" —
+     NEW rides alongside as an overlay, which is what SKU_OVERLAYS says it is for. */
+  const info = statusInfo(healthStatus);
+  const statusKey = SC_STATUS_KEY[healthStatus] || null;
+  const countdown = urgency === "on_order"
     ? "ON ORDER"
-    : (urgency !== "none" && reorderDays !== undefined)
+    : (urgency !== "none" && reorderDays != null)
       ? (reorderDays < 0 ? "OVERDUE" : reorderDays === 0 ? "TODAY" : `${reorderDays}d`)
       : null;
+  // For the two timing statuses the countdown says more than the word does ("3d" beats
+  // "REORDER"), so it wins there and only there.
+  const timingStatus = statusKey === "stockout" || statusKey === "reorder";
+  const badgeText = (timingStatus && countdown) ? countdown
+    : (info.badge || countdown || (provisional ? "NEW" : null));
+  // Shown next to the badge, never instead of it.
+  const showNewOverlay = provisional && badgeText !== "NEW" && badgeText != null;
   return (
     <div onClick={onClick}
          className={`relative group flex items-center gap-3 px-3 py-2.5 rounded-xl cursor-pointer transition-all border ${
            indented ? "ml-4" : ""
          } ${isActive ? activeClass : hoverClass}`}>
       <div className={`h-2 w-2 rounded-full shrink-0 ${
-        healthStatus === "Dead stock" ? "bg-[var(--t-sunken)]"
-        : healthStatus === "Overstocked" ? "bg-[var(--t-warn-soft)]"
+        statusKey === "dead" ? "bg-[var(--t-sunken)]"
+        : statusKey === "uncounted" ? "bg-[var(--t-line2)]"
+        : statusKey === "overstock" ? "bg-[var(--t-warn-soft)]"
         : healthStatus === "Stockout risk" ? "bg-[var(--t-bad-soft)] animate-pulse"
         : us.dot
       }`} />
@@ -45,19 +62,44 @@ export function SkuListItem({ sku, isActive, onClick, onDelete, reorderDays, has
         <div className={`text-[15px] font-semibold ${nameClass} truncate`}>{sku.name}</div>
         <div className="flex items-center gap-1.5 mt-0.5">
           <div className={`text-[14px] ${idClass} font-mono truncate`}>{sku.id}</div>
+          {/* Live availability from the hourly stock readings. The dot is always drawn once
+              a product has been sampled — that is the "this is being watched" signal — but
+              only the exceptions get words. See availabilityChip for why. */}
+          {(() => {
+            const chip = availabilityChip(availability, { samplerEnabled });
+            if (!chip) return null;
+            return (
+              <span title={chip.title} className="flex items-center gap-1 shrink-0">
+                <span className={`h-1.5 w-1.5 rounded-full ${chip.dot}`} />
+                {chip.label && (
+                  <span className={`text-[13px] whitespace-nowrap ${
+                    chip.key === "out" ? "text-[var(--t-bad)]" : "text-[var(--t-warn)]"
+                  }`}>{chip.label}</span>
+                )}
+              </span>
+            );
+          })()}
         </div>
       </div>
       {/* Right side: urgency badge by default; on hover it yields to the action
           buttons (same slot), so nothing overlaps. */}
       <div className="shrink-0 flex items-center">
         {badgeText && (
-          <span className={`text-[14px] font-mono font-bold ${hasActions ? "group-hover:hidden" : ""} ${
-            healthStatus === "Dead stock" ? ("text-[var(--t-dim)]")
-            : healthStatus === "Overstocked" ? ("text-[var(--t-warn)]")
-            : provisional ? ("text-[var(--t-accent)]")
+          <span title={info.help || undefined}
+            className={`text-[14px] font-mono font-bold ${hasActions ? "group-hover:hidden" : ""} ${
+            statusKey === "dead" ? ("text-[var(--t-dim)]")
+            : statusKey === "uncounted" ? ("text-[var(--t-soft)]")
+            : statusKey === "overstock" ? ("text-[var(--t-warn)]")
+            : (provisional && badgeText === "NEW") ? ("text-[var(--t-accent)]")
             : urgency === "on_order" ? "text-[var(--t-accent)]" : us.text
           }`}>
             {badgeText}
+          </span>
+        )}
+        {/* NEW alongside a real verdict, never in place of one. */}
+        {showNewOverlay && (
+          <span className={`ml-1 text-[12px] font-mono ${hasActions ? "group-hover:hidden" : ""} ${"text-[var(--t-accent)]"}`}>
+            NEW
           </span>
         )}
         {hasActions && (
@@ -87,7 +129,8 @@ export function SkuListItem({ sku, isActive, onClick, onDelete, reorderDays, has
 
 // ─── FOLDER ROW ───────────────────────────────
 export function FolderRow({ folderId, folder, allFolders = {}, skuList, skuForecasts, openPOs, activeSku, onSelectSku, onDeleteSku,
-                     onRename, onDelete, onToggleCollapse, onRemoveSkuFromFolder, onAddSubfolder, lm, scoreBySku = {}, depth = 0 }) {
+                     onRename, onDelete, onToggleCollapse, onRemoveSkuFromFolder, onAddSubfolder, lm, scoreBySku = {}, depth = 0,
+                     availability = {}, samplerEnabled = true }) {
   const [editingName, setEditingName] = useState(false);
   const [nameVal, setNameVal]         = useState(folder.name);
   const [showMenu, setShowMenu]       = useState(false);
@@ -188,13 +231,15 @@ export function FolderRow({ folderId, folder, allFolders = {}, skuList, skuForec
             <FolderRow key={subId} folderId={subId} folder={subFolder} allFolders={allFolders} skuList={skuList} skuForecasts={skuForecasts}
               openPOs={openPOs} activeSku={activeSku} onSelectSku={onSelectSku} onDeleteSku={onDeleteSku}
               onRename={onRename} onDelete={onDelete} onToggleCollapse={onToggleCollapse}
-              onRemoveSkuFromFolder={onRemoveSkuFromFolder} onAddSubfolder={onAddSubfolder} lm={lm} scoreBySku={scoreBySku} depth={depth + 1} />
+              onRemoveSkuFromFolder={onRemoveSkuFromFolder} onAddSubfolder={onAddSubfolder} lm={lm} scoreBySku={scoreBySku} depth={depth + 1}
+              availability={availability} samplerEnabled={samplerEnabled} />
           ))}
           {folderSkus.map(({ sku, fc }) => (
             <SkuListItem key={sku.id} sku={sku} isActive={activeSku === sku.id} onClick={() => onSelectSku(sku.id)}
               onDelete={onDeleteSku} reorderDays={fc?.daysUntilReorder} hasOpenPO={!!openPOs[sku.id]} indented lm={lm}
               healthStatus={scoreBySku[sku.id]?.status}
               provisional={fc?.tooNew || fc?.young}
+              availability={availability[sku.id]} samplerEnabled={samplerEnabled}
               secondaryAction={{ title: "Remove from folder", onClick: () => onRemoveSkuFromFolder(folderId, sku.id), iconPath: "M11 7l-4 4m0 0l4 4m-4-4h14M3 5v14" }} />
           ))}
           {folderSkus.length === 0 && subfolders.length === 0 && (
@@ -236,8 +281,8 @@ export function FleetAlertBanner({ skuForecasts, openPOs, lm, leadTimeOf = null 
             <span key={s.skuId} className="font-mono">
               {s.skuName}{" "}
               {s.daysUntilReorder <= 0
-                ? <span className={"text-[var(--t-bad)]"}>— {Math.abs(s.daysUntilReorder)}d overdue</span>
-                : <span className={"text-[var(--t-warn)]"}>— {s.daysUntilReorder}d left</span>}
+                ? <span className={"text-[var(--t-bad)]"}>({Math.abs(s.daysUntilReorder)}d overdue)</span>
+                : <span className={"text-[var(--t-warn)]"}>({s.daysUntilReorder}d left)</span>}
             </span>
           ))}
         </div>

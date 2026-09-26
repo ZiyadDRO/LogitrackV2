@@ -86,7 +86,7 @@ export function ArrivalPromptList({ found = [], skuList = [], lm = false,
     <div className={`${card} border rounded-2xl overflow-hidden mb-5`}>
       <div className={`px-4 py-3 border-b ${"border-[var(--t-good-line)]"}`}>
         <div className={`text-[16.5px] font-bold ${head}`}>
-          New units detected — log {found.length === 1 ? "this arrival" : "these arrivals"}?
+          New units detected. Log {found.length === 1 ? "this arrival" : "these arrivals"}?
         </div>
         <div className={`text-[14px] mt-0.5 ${body}`}>
           Stock went up on {found.length === 1 ? "a product" : "products"} with an order outstanding.
@@ -101,7 +101,7 @@ export function ArrivalPromptList({ found = [], skuList = [], lm = false,
             <div className={`text-[14px] ${body}`}>{f.message}</div>
             {(f.partial || f.over || f.confidence < 0.8) && (
               <div className={`text-[13px] mt-0.5 ${faint}`}>
-                Worth a look before confirming — the quantity doesn&apos;t match the order exactly.
+                The quantity doesn&apos;t match the order exactly. Check before confirming.
               </div>
             )}
           </div>

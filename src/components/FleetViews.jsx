@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { urgencyLevel, URGENCY_STYLES, URGENCY_STYLES_LM, formatDate,
          skuState, SKU_STATES } from '../lib/helpers';
 import { Tip } from './common';
+import { loadStorage, saveStorage } from '../lib/storage';
 import { FleetAlertBanner } from './Sidebar';
 import { terminal, projFill, projFillSoft, MONO, SANS } from '../lib/theme';
 
@@ -131,6 +132,12 @@ export function projectCycles({ curve, stock, firstDay, firstQty, lead, coverage
   return out;
 }
 
+// The kinds of product the fleet list can show, in the order the boxes appear.
+const FLEET_TYPES = ["stockout", "reorder", "overstock", "uncounted", "dead", "healthy", "unrated"];
+const DEFAULT_FLEET_TYPES = ["stockout", "reorder", "overstock", "uncounted"];
+const ATTENTION_TYPES = new Set(["stockout", "reorder", "overstock", "uncounted", "dead"]);
+const FLEET_FILTER_KEY = "logitrack_fleet_filter";
+
 export function FleetBento({ skuForecasts, getParams, openPOs, onSelectSku, lm, onExportFleet, onExportAll, exporting, scorecardRows = [], onEditCosts = null }) {
   const T = terminal(lm);
   const PROJ_FILL = projFill(T);        // bars — texture reads at size
@@ -142,7 +149,18 @@ export function FleetBento({ skuForecasts, getParams, openPOs, onSelectSku, lm, 
   const stateOf = s => skuState(s, scoreBySku[s.skuId], !!openPOs[s.skuId],
                                Number(getParams(s.skuId)?.leadTime) || null);
   const bucket = s => stateOf(s).key;
-  const counts = { stockout:0, reorder:0, overstock:0, dead:0, healthy:0, unrated:0 };
+  const counts = { stockout:0, reorder:0, overstock:0, dead:0, healthy:0, uncounted:0, unrated:0 };
+  /* Which kinds of product the list on the right shows. Chosen by the viewer and
+     remembered in this browser; dead stock is off by default because it is a standing
+     condition to review occasionally, not work for today. */
+  const [show, setShowRaw] = useState(() => {
+    const v = loadStorage(FLEET_FILTER_KEY, null);
+    return (v && Array.isArray(v.types)) ? { types: v.types, onOrder: !!v.onOrder }
+                                         : { types: DEFAULT_FLEET_TYPES, onOrder: false };
+  });
+  const setShow = next => { setShowRaw(next); saveStorage(FLEET_FILTER_KEY, next); };
+  const toggleType = k => setShow({ ...show, types: show.types.includes(k)
+    ? show.types.filter(t => t !== k) : [...show.types, k] });
   /* Overlays, counted OVER the statuses rather than instead of them. As buckets they
      stole from the five — a Healthy product with a PO left the healthy count, a young
      one became "new" — so the fleet's totals could never match the scorecard's. */
@@ -164,6 +182,9 @@ export function FleetBento({ skuForecasts, getParams, openPOs, onSelectSku, lm, 
     ["overstock", T.over,    SKU_STATES.overstock.label],
     ["reorder",   T.blue,    SKU_STATES.reorder.label],
     ["healthy",   T.green,   SKU_STATES.healthy.label],
+    // Nobody has counted it and the store reports no level. This was missing from both
+    // the bar and the counts, so a catalogue of uncounted products drew an empty bar.
+    ["uncounted", T.soft, SKU_STATES.uncounted.label],
     // Products /api/scorecard never classified (no fitted forecast). Shown rather
     // than folded into healthy, so the bar still sums to the catalogue.
     ["unrated",   T.faint,   SKU_STATES.unrated.label],
@@ -171,8 +192,8 @@ export function FleetBento({ skuForecasts, getParams, openPOs, onSelectSku, lm, 
   // The colour a status owns, used by the pills AND the grid cells so a red cell and
   // a red legend block always mean the same thing.
   const STATUS_COLOR = { stockout:T.red, dead:T.dead, overstock:T.over, reorder:T.blue,
-                         healthy:T.green, unrated:T.faint };
-  skuForecasts.forEach(s => counts[bucket(s)]++);
+                         healthy:T.green, uncounted:T.soft, unrated:T.faint };
+  skuForecasts.forEach(s => { const k = bucket(s); counts[k] = (counts[k] || 0) + 1; });
   const total = skuForecasts.length || 1;
   /* The stock-position axis (dead / overstocked) only exists once the scorecard has
    * answered. Printing "0 dead stock" off a check that never ran reads as a clean
@@ -222,8 +243,23 @@ export function FleetBento({ skuForecasts, getParams, openPOs, onSelectSku, lm, 
   const dataAge = ages.length ? Math.min(...ages) : null;
   const vintage = dataAge == null ? null
     : dataAge <= 1 ? { text: "Sales data is current.", stale: false }
-    : { text: `Sales data is ${dataAge} days old — nothing has been imported since.`,
+    : { text: `Sales data is ${dataAge} days old. Nothing has been imported since.`,
         stale: dataAge >= 7 };
+
+  /* TODAY, stated separately from everything else on this page.
+     The sales sync runs at 00:15 and the training data stops at the last COMPLETE day,
+     so every figure above is current through yesterday and says nothing about the hours
+     since. That gap is invisible: a shop that traded all day looks identical to one that
+     did not. The hourly tick knows the answer, so the page says it out loud rather than
+     leaving the reader to assume the silence means zero. */
+  const todayRows = skuForecasts.map(s => s.todaySales).filter(t => t && t.forToday && !t.unsupported);
+  const soldToday = todayRows.reduce((n, t) => n + (Number(t.units) || 0), 0);
+  const todaySkus = todayRows.filter(t => (Number(t.units) || 0) > 0).length;
+  const todayStale = todayRows.length > 0 && todayRows.every(t => t.stale);
+  const todayText = todayRows.length === 0 ? null
+    : soldToday > 0
+      ? `${soldToday.toLocaleString()} sold today across ${todaySkus} product${todaySkus === 1 ? "" : "s"} (not in the figures below yet).`
+      : "Nothing sold yet today.";
 
   // Upcoming reorders by week — the forecast turned into a purchasing schedule (cash, or
   // units when cost is unknown). This is the tool's unique value: a forward buying plan.
@@ -248,15 +284,15 @@ export function FleetBento({ skuForecasts, getParams, openPOs, onSelectSku, lm, 
   const weekStart = i => addDays(i * 7 - dow);
   const weekEnd   = i => addDays(i * 7 - dow + 6);
   const fmtDay = dt => dt.toLocaleDateString(undefined, { month:"short", day:"numeric" });
-  const weekRange = i => `${fmtDay(weekStart(i))} – ${fmtDay(weekEnd(i))}`;
+  const weekRange = i => `${fmtDay(weekStart(i))} - ${fmtDay(weekEnd(i))}`;
   /* The header form. "Sep 6 – Sep 12" wraps in a narrow column and the second line
      reads as a stray number, so the month is only repeated when the week actually
      crosses one. */
   const weekRangeShort = i => {
     const a = weekStart(i), b = weekEnd(i);
     return a.getMonth() === b.getMonth()
-      ? `${fmtDay(a)}–${b.getDate()}`
-      : `${fmtDay(a)} – ${fmtDay(b)}`;
+      ? `${fmtDay(a)}-${b.getDate()}`
+      : `${fmtDay(a)} - ${fmtDay(b)}`;
   };
 
   /* ONE purchasing number on this page, and the schedule is it. There used to be a
@@ -390,12 +426,17 @@ export function FleetBento({ skuForecasts, getParams, openPOs, onSelectSku, lm, 
       background: solid ? T.btnBg : "transparent", color: solid ? T.btnFg : T.soft,
       border: solid ? "2px solid transparent" : `2px solid ${T.line2}` }}>{txt}</div>);
 
-  /* The attention list is a top-N, not the whole catalogue — a panel beside another
-     panel cannot hold thirty rows without becoming the page again. The count in the
-     corner is the full figure, so nothing is hidden, only deferred. */
-  const SHOWN = 6;
-  const listed = urgent.slice(0, SHOWN);
-  const moreCount = urgent.length - listed.length;
+  /* The list shows EVERY product of the kinds ticked above it, and scrolls. It used to
+     stop at six and send you to "the Scorecard" for the rest — a tab that no longer
+     exists. Most urgent first: status, then how soon the reorder falls due. */
+  const RANK = { stockout:0, reorder:1, uncounted:2, overstock:3, dead:4, unrated:5, healthy:6 };
+  const listed = skuForecasts
+    .filter(s => show.types.includes(bucket(s)))
+    .filter(s => show.onOrder || !openPOs[s.skuId])
+    .filter(s => !newSoonIds.has(s.skuId))
+    .sort((a,b) => (RANK[bucket(a)] ?? 9) - (RANK[bucket(b)] ?? 9)
+                || (a.daysUntilReorder ?? 999) - (b.daysUntilReorder ?? 999));
+  const onlyWork = show.types.every(k => ATTENTION_TYPES.has(k));
 
   /* CHART — the row is full width and the plot is more than twice as tall.
      Squeezed into a half-width panel these eight bars were 40px apart with a 76px
@@ -419,7 +460,7 @@ export function FleetBento({ skuForecasts, getParams, openPOs, onSelectSku, lm, 
         <div style={{ display:"flex", alignItems:"center", gap:9 }}>
           {onEditCosts && (
             <button onClick={onEditCosts} style={btnGhost}
-              title="What you pay per unit and any per-unit fees — drives margin, profit grade and protection levels">
+              title="What you pay per unit, plus any per-unit fees. Drives margin, profit grade and protection levels.">
               Costs &amp; fees
             </button>
           )}
@@ -481,6 +522,11 @@ export function FleetBento({ skuForecasts, getParams, openPOs, onSelectSku, lm, 
                           color: vintage.stale ? T.over : T.faint }}>
               <span style={{ width:7, height:7, flexShrink:0, background: vintage.stale ? T.over : T.green }} />
               {vintage.text}
+              {todayText && (
+                <span style={{ marginLeft: 8, color: todayStale ? T.over : T.faint }}>
+                  {todayText}{todayStale ? " (a check was missed)" : ""}
+                </span>
+              )}
             </div>
           )}
         </div>
@@ -504,7 +550,7 @@ export function FleetBento({ skuForecasts, getParams, openPOs, onSelectSku, lm, 
 
         <div style={{ ...card, padding:"14px 16px", display:"flex", flexDirection:"column", justifyContent:"center" }}>
           <div style={cap}>Inventory value</div>
-          <div style={{ ...mono, fontSize:28, fontWeight:500, letterSpacing:"-.03em", marginTop:7, lineHeight:1 }}>{invKnown ? fmt(invValue) : "—"}</div>
+          <div style={{ ...mono, fontSize:28, fontWeight:500, letterSpacing:"-.03em", marginTop:7, lineHeight:1 }}>{invKnown ? fmt(invValue) : "-"}</div>
           <div style={{ fontSize:14.5, marginTop:6, color:T.soft, fontWeight:500 }}>
             {invKnown ? "stock on hand" : addCostsLink("add unit costs to value stock")}
           </div>
@@ -535,15 +581,44 @@ export function FleetBento({ skuForecasts, getParams, openPOs, onSelectSku, lm, 
           borderLeft: urgent.length > 0 ? `3px solid ${T.amber}` : EDGE }}>
           <div style={{ display:"flex", alignItems:"baseline", justifyContent:"space-between", gap:12,
             padding:"16px 20px 12px", borderBottom:RULE }}>
-            <div style={{ fontSize:20.5, fontWeight:600, letterSpacing:"-.02em" }}>Needs attention</div>
-            <div style={{ ...mono, fontSize:16.5, fontWeight:600, color: urgent.length ? T.amber : T.faint }}>
-              {urgent.length}
+            <div style={{ fontSize:20.5, fontWeight:600, letterSpacing:"-.02em" }}>
+              {onlyWork ? "Needs attention" : "Products"}
+            </div>
+            <div style={{ ...mono, fontSize:16.5, fontWeight:600, color: listed.length && onlyWork ? T.amber : T.faint }}>
+              {listed.length}
             </div>
           </div>
 
+          {/* What to list. Counts are the whole catalogue's, so an unticked box still
+              tells you how many of that kind there are. */}
+          <div style={{ display:"flex", flexWrap:"wrap", gap:"6px 14px", padding:"10px 20px", borderBottom:RULE }}>
+            {FLEET_TYPES.map(k => (
+              <label key={k} title={SKU_STATES[k].help}
+                style={{ display:"flex", alignItems:"center", gap:6, fontSize:14, cursor:"pointer",
+                  color: show.types.includes(k) ? T.ink : T.faint, userSelect:"none" }}>
+                <input type="checkbox" checked={show.types.includes(k)} onChange={() => toggleType(k)}
+                  style={{ accentColor:T.amber, margin:0, cursor:"pointer" }} />
+                <span style={{ width:9, height:9, background:STATUS_COLOR[k], flexShrink:0 }} />
+                {SKU_STATES[k].title}
+                <span style={{ ...mono, color:T.faint }}>{counts[k] || 0}</span>
+              </label>
+            ))}
+            <label title="Products with an order already on its way. When off, they are hidden whatever their status."
+              style={{ display:"flex", alignItems:"center", gap:6, fontSize:14, cursor:"pointer",
+                color: show.onOrder ? T.ink : T.faint, userSelect:"none" }}>
+              <input type="checkbox" checked={show.onOrder} onChange={() => setShow({ ...show, onOrder: !show.onOrder })}
+                style={{ accentColor:T.amber, margin:0, cursor:"pointer" }} />
+              On order
+              <span style={{ ...mono, color:T.faint }}>{onOrderCount}</span>
+            </label>
+          </div>
+
+          <div style={{ maxHeight:560, overflowY:"auto", flex:1, minHeight:0 }}>
           {listed.length === 0 && (
             <div style={{ fontSize:15.5, color:T.soft, padding:"26px 20px" }}>
-              Nothing to order — every product is covered. ✓
+              {show.types.length === 0 ? "Tick a type above to list those products."
+                : onlyWork && urgent.length === 0 ? "Nothing to order. Every product is covered. ✓"
+                : "No products of the ticked types."}
             </div>
           )}
 
@@ -552,11 +627,16 @@ export function FleetBento({ skuForecasts, getParams, openPOs, onSelectSku, lm, 
             const tag = b === "dead" ? pill(T.deadBg, T.deadFg, "Dead stock", SKU_STATES.dead.help)
               : b === "overstock" ? pill(T.overBg, T.overFg, sc?.sellThrough != null ? `Overstocked · ${Math.round(sc.sellThrough * 100)}% sold` : "Overstocked", SKU_STATES.overstock.help)
               : b === "stockout" ? pill(T.redBg, T.redFg, d == null ? "Stockout risk" : d < 0 ? `Overdue ${Math.abs(d)}d` : d === 0 ? "Due today" : `Due in ${d}d`, SKU_STATES.stockout.help)
-              : pill(T.blueBg, T.blueFg, d != null ? `Due in ${d}d` : "Due", SKU_STATES.reorder.help);
+              : b === "reorder" ? pill(T.blueBg, T.blueFg, d != null ? `Due in ${d}d` : "Due", SKU_STATES.reorder.help)
+              : b === "healthy" ? pill(T.greenBg, T.greenFg, "Healthy", SKU_STATES.healthy.help)
+              : b === "uncounted" ? pill(T.sunken, T.soft, "Not counted", SKU_STATES.uncounted.help)
+              : pill("transparent", T.faint, "Not rated", SKU_STATES.unrated.help);
             const action = b === "dead" ? "Review / clear"
               : b === "overstock" ? "Reduce orders"
-              : `Order ${s.orderQty?.toLocaleString() ?? "—"}`;
-            const plain = b === "dead" || b === "overstock";
+              : b === "uncounted" ? "Count stock"
+              : (b === "healthy" || b === "unrated") ? "View"
+              : `Order ${s.orderQty?.toLocaleString() ?? "-"}`;
+            const plain = !(b === "stockout" || b === "reorder") || !!openPOs[s.skuId];
             return (
               <div key={s.skuId} className="lt-row" onClick={() => onSelectSku(s.skuId)}
                 style={{ display:"flex", alignItems:"center", justifyContent:"space-between", gap:14,
@@ -571,8 +651,9 @@ export function FleetBento({ skuForecasts, getParams, openPOs, onSelectSku, lm, 
                   </div>
                 </div>
                 <div style={{ display:"flex", alignItems:"center", gap:10, flexShrink:0 }}>
+                  {openPOs[s.skuId] && pill(T.blueBg, T.blueFg, "On order")}
                   {tag}
-                  {actionBtn(action, !plain)}
+                  {actionBtn(openPOs[s.skuId] ? "View" : action, !plain)}
                 </div>
               </div>);
           })}
@@ -599,11 +680,7 @@ export function FleetBento({ skuForecasts, getParams, openPOs, onSelectSku, lm, 
               </div>);
           })}
 
-          {moreCount > 0 && (
-            <div style={{ fontSize:14.5, color:T.faint, padding:"11px 20px", borderTop:RULE, marginTop:"auto" }}>
-              {moreCount} more below the top {SHOWN} — the Scorecard lists every one.
-            </div>
-          )}
+          </div>
         </div>
       </div>
 
@@ -613,8 +690,8 @@ export function FleetBento({ skuForecasts, getParams, openPOs, onSelectSku, lm, 
           <div>
             <div style={cap}>Upcoming reorders · next {WEEKS} weeks</div>
             <div style={{ fontSize:17.5, color:T.ink, marginTop:5, fontWeight:500 }}>
-              {chartVal ? "Purchasing cash coming due — plan your POs ahead"
-                        : <>Units coming due — {addCostsLink("add unit costs")} to see this as money</>}
+              {chartVal ? "Purchasing cash coming due. Plan your POs ahead."
+                        : <>Units coming due. {addCostsLink("Add unit costs")} to see this as money.</>}
             </div>
           </div>
           <div style={{ textAlign:"right", flexShrink:0 }}>
@@ -634,8 +711,8 @@ export function FleetBento({ skuForecasts, getParams, openPOs, onSelectSku, lm, 
             const h = v > 0 ? Math.max(Math.round(v / maxBar * BAR_MAX), 4) : 0;
             const hProj = v > 0 ? Math.round(proj / v * h) : 0;
             const tip = (i===0 ? `Already overdue, plus everything due by ${fmtDay(weekEnd(0))}` : weekRange(i))
-              + `\n${money(firm)} — next order`
-              + (proj > 0 ? `\n${money(proj)} — projected repeat orders` : "");
+              + `\nNext order: ${money(firm)}`
+              + (proj > 0 ? `\nProjected repeat orders: ${money(proj)}` : "");
             return (
               <div key={i} title={tip} style={{ display:"flex", flexDirection:"column", alignItems:"center", gap:7 }}>
                 <div style={{ ...mono, fontSize:14.5, fontWeight:600, height:16, whiteSpace:"nowrap",
@@ -676,7 +753,7 @@ export function FleetBento({ skuForecasts, getParams, openPOs, onSelectSku, lm, 
               Next order · dated by the forecast
             </span>
             <span style={{ display:"flex", alignItems:"center", gap:8, cursor:"help" }}
-              title="Each later cycle is simulated against that product's own forecast: stock is drawn down day by day, the reorder falls where the shelf can no longer cover the lead time plus its buffer, and the quantity is sized from the forecast across that cycle's coverage window. So a busier stretch orders more, and orders sooner. Still a projection rather than a dated order, which is why it is drawn hatched. Overstocked and dead stock are left out.">
+              title="Each later cycle is simulated on the product's own forecast: it reorders when stock can't cover the lead time plus buffer, sized to that cycle's coverage window. A busier stretch orders more, and sooner. Hatched because it is a projection, not a dated order; overstocked and dead stock are left out.">
               <span style={{ width:13, height:13, background:PROJ_FILL, border:`2px dashed ${T.amber}99`,
                 boxSizing:"border-box", flexShrink:0 }} />
               Projected repeat · the same product coming round again
@@ -713,7 +790,7 @@ export function FleetSummaryView({ skuList, skuForecasts, onSelectSku, openPOs, 
           <div className={`flex items-center gap-2 mb-3 pb-3 border-b ${"border-[var(--t-bad-line)]"}`}>
             <span className="text-[16.5px]">🚨</span>
             <span className={`text-[15px] font-bold ${"text-[var(--t-bad)]"}`}>
-              {s.daysUntilReorder === 0 ? "REORDER DUE TODAY" : `REORDER OVERDUE — ${Math.abs(s.daysUntilReorder)} day${Math.abs(s.daysUntilReorder) !== 1 ? "s" : ""} ago`}
+              {s.daysUntilReorder === 0 ? "REORDER DUE TODAY" : `REORDER OVERDUE: ${Math.abs(s.daysUntilReorder)} day${Math.abs(s.daysUntilReorder) !== 1 ? "s" : ""} ago`}
             </span>
           </div>
         )}
@@ -739,18 +816,18 @@ export function FleetSummaryView({ skuList, skuForecasts, onSelectSku, openPOs, 
             <div className="text-[15px]">
               <div className={`${textMuted} uppercase tracking-widest text-[13px] flex items-center justify-end gap-0.5`}><Tip text="The latest date you should place a reorder to avoid running out of stock, based on lead time and coverage window.">Order By</Tip></div>
               <div className={`font-bold tabular-nums mt-0.5 ${hasPO ? "text-[var(--t-accent)]" : isOverdue ? "text-[var(--t-bad)]" : urgency === "high" ? "text-[var(--t-warn)]" : textMain}`}>
-                {hasPO ? "On Order" : isOverdue ? (s.daysUntilReorder === 0 ? "Today" : `${Math.abs(s.daysUntilReorder)}d overdue`) : s.daysUntilReorder != null ? formatDate(s.daysUntilReorder).split(",")[0] : "—"}
+                {hasPO ? "On Order" : isOverdue ? (s.daysUntilReorder === 0 ? "Today" : `${Math.abs(s.daysUntilReorder)}d overdue`) : s.daysUntilReorder != null ? formatDate(s.daysUntilReorder).split(",")[0] : "-"}
               </div>
             </div>
             <div className="text-[15px]">
               <div className={`${textMuted} uppercase tracking-widest text-[13px] flex items-center justify-end gap-0.5`}><Tip text="How many days remain before you need to place a reorder. Negative means you're already overdue.">Reorder In</Tip></div>
               <div className={`font-bold tabular-nums mt-0.5 ${us.text}`}>
-                {hasPO ? "—" : s.daysUntilReorder == null ? "—" : s.daysUntilReorder === 0 ? "Today" : s.daysUntilReorder < 0 ? `${Math.abs(s.daysUntilReorder)}d overdue` : `${s.daysUntilReorder}d`}
+                {hasPO ? "-" : s.daysUntilReorder == null ? "-" : s.daysUntilReorder === 0 ? "Today" : s.daysUntilReorder < 0 ? `${Math.abs(s.daysUntilReorder)}d overdue` : `${s.daysUntilReorder}d`}
               </div>
             </div>
             <div className="text-[15px]">
               <div className={`${textMuted} uppercase tracking-widest text-[13px] flex items-center justify-end gap-0.5`}><Tip text="Suggested order quantity to restore your stock to the target coverage window, based on forecast demand.">Units to Order</Tip></div>
-              <div className={`font-bold tabular-nums mt-0.5 ${"text-[var(--t-accent)]"}`}>{s.orderQty?.toLocaleString() ?? "—"}</div>
+              <div className={`font-bold tabular-nums mt-0.5 ${"text-[var(--t-accent)]"}`}>{s.orderQty?.toLocaleString() ?? "-"}</div>
             </div>
           </div>
         </div>

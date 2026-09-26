@@ -79,8 +79,8 @@ export default function LiveAccuracy({ api, lm = false, onPickSku = null }) {
       });
       const d = await r.json();
       await load();
-      if (d?.score?.error) setErr(`Couldn't read the store — nothing was graded, and every week is still queued. (${d.score.error})`);
-      else if (d?.score?.sourceFailed) setErr("Couldn't read the store — nothing was graded, and every week is still queued.");
+      if (d?.score?.error) setErr(`Couldn't read the store. Nothing was graded, and every week is still queued. (${d.score.error})`);
+      else if (d?.score?.sourceFailed) setErr("Couldn't read the store. Nothing was graded, and every week is still queued.");
     } catch { setErr("Couldn't reach the engine."); }
   }, [api, load]);
 
@@ -203,8 +203,8 @@ export default function LiveAccuracy({ api, lm = false, onPickSku = null }) {
             </div>
           )}
           <p style={{ fontSize: fs.body, color: T.soft, marginTop: 6, maxWidth: 680, lineHeight: 1.6 }}>
-            One tile per week. Each Sunday the tool seals what it expects every product to sell over the
-            following seven days, then grades itself once that week is over. Unlike the backtest, none of
+            One tile per week. Each Sunday the tool locks in what it expects each product to sell over the
+            next seven days, then grades itself when the week is over. Unlike the backtest, none of
             these forecasts could see what came next.
           </p>
         </div>
@@ -232,10 +232,10 @@ export default function LiveAccuracy({ api, lm = false, onPickSku = null }) {
       {/* ── the numbers that matter ────────────────────────────────────────── */}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(190px,1fr))", gap: 12 }}>
         <Head label="Calibration" tone={calTone}
-          value={cal.hitRate != null ? `${cal.hitRate}%` : "—"}
+          value={cal.hitRate != null ? `${cal.hitRate}%` : "-"}
           sub={cal.hitRate != null ? `${calLabel} · target ${cal.nominal}%` : calLabel} />
-        <Head label="Typical miss" value={acc.wape != null ? `${acc.wape}%` : "—"} sub="weighted, vs actual" />
-        <Head label="Bias" value={acc.bias != null ? `${acc.bias > 0 ? "+" : ""}${acc.bias}%` : "—"}
+        <Head label="Typical miss" value={acc.wape != null ? `${acc.wape}%` : "-"} sub="weighted, vs actual" />
+        <Head label="Bias" value={acc.bias != null ? `${acc.bias > 0 ? "+" : ""}${acc.bias}%` : "-"}
           sub={acc.bias == null ? "nothing graded yet"
             : acc.bias > 2 ? "forecasting high" : acc.bias < -2 ? "forecasting low" : "balanced"} />
         <Head label="Weeks graded" value={`${s.scored ?? 0}`}
@@ -245,8 +245,8 @@ export default function LiveAccuracy({ api, lm = false, onPickSku = null }) {
       {cal.verdict === "overconfident" && (
         <div style={{ border: `2px solid ${T.red}55`, background: `${T.red}12`, color: T.red,
           padding: "11px 14px", fontSize: fs.body, lineHeight: 1.6 }}>
-          <b>The bands are too narrow.</b> Reality lands outside the {cal.nominal}% band more often than it
-          should, so buffers sized from these intervals are thin and your real service level is below target.
+          <b>The bands are too narrow.</b> Actual sales land outside the {cal.nominal}% band more often than they
+          should, so safety buffers built on them are too thin and you stay in stock less often than your target.
         </div>
       )}
 
@@ -256,8 +256,8 @@ export default function LiveAccuracy({ api, lm = false, onPickSku = null }) {
           <div style={{ fontSize: 15, fontWeight: 600 }}>Waiting for the first week to close</div>
           <div style={{ fontSize: fs.body, color: T.soft, marginTop: 7, maxWidth: 460, marginLeft: "auto",
             marginRight: "auto", lineHeight: 1.6 }}>
-            Nothing to do — this runs on its own. A tile appears for the current week straight away, and
-            fills in with a result once those seven days have actually happened.
+            Nothing to do: this runs on its own. A tile for the current week appears straight away and
+            fills in with a result once those seven days are over.
           </div>
         </div>
       ) : byMonth.map(({ month, weeks: ws }) => (
@@ -282,7 +282,7 @@ export default function LiveAccuracy({ api, lm = false, onPickSku = null }) {
                       border: "none", cursor: "pointer", color: T.ink, fontFamily: SANS }}>
                     <div style={{ display: "flex", alignItems: "center", gap: 9 }}>
                       <span style={{ ...mono, fontSize: fs.row, fontWeight: 600, color: T.ink }}>
-                        {fmtDay(w.week)} – {fmtDay(w.endsOn)}
+                        {fmtDay(w.week)} to {fmtDay(w.endsOn)}
                       </span>
                       {w.amended > 0 && (
                         <span title="A forecast in this week was revised mid-week after a promotion was declared. Both figures are kept."
@@ -298,7 +298,7 @@ export default function LiveAccuracy({ api, lm = false, onPickSku = null }) {
                       <>
                         <div style={{ display: "flex", alignItems: "baseline", gap: 9, marginTop: 10 }}>
                           <span style={{ ...mono, fontSize: 30, fontWeight: 600, lineHeight: 1, color: t.tx }}>
-                            {w.hitRate != null ? `${w.hitRate}%` : "—"}
+                            {w.hitRate != null ? `${w.hitRate}%` : "-"}
                           </span>
                           <span style={{ fontSize: fs.body, color: T.soft }}>
                             {w.inBand} of {w.scored} in band
@@ -344,10 +344,10 @@ export default function LiveAccuracy({ api, lm = false, onPickSku = null }) {
                           </span>
                           <span style={{ ...mono, textAlign: "right", color: T.soft }}>
                             {Math.round(e.predicted)}
-                            {e.lo != null && <span style={{ color: T.faint }}> ({Math.round(e.lo)}–{Math.round(e.hi)})</span>}
+                            {e.lo != null && <span style={{ color: T.faint }}> ({Math.round(e.lo)}-{Math.round(e.hi)})</span>}
                           </span>
                           <span style={{ ...mono, textAlign: "right", color: e.scoredAt ? T.ink : T.faint }}>
-                            {e.scoredAt ? Math.round(e.actual) : "—"}
+                            {e.scoredAt ? Math.round(e.actual) : "-"}
                           </span>
                           {/* The verdict belongs to the BAND, not the product. A product that
                               sold more than expected did not fail; the range it was given was
@@ -375,8 +375,8 @@ export default function LiveAccuracy({ api, lm = false, onPickSku = null }) {
 
       <p style={{ fontSize: fs.small, color: T.soft, lineHeight: 1.65, margin: 0 }}>
         Weeks run Sunday to Saturday and are filed under the month holding most of their days. Forecasts are
-        sealed when made; if a promotion is declared mid-week the tile is marked <b>revised</b> and
-        keeps both figures, so a campaign is never mistaken for a modelling win.
+        locked when made. If a promotion is added mid-week, the tile is marked <b>revised</b> and
+        keeps both figures, so a promo&apos;s extra sales never count as forecast skill.
       </p>
     </div>
   );

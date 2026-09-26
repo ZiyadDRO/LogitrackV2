@@ -30,7 +30,8 @@ function Section({ title, children, lm }) {
   );
 }
 
-export default function ForecastDetailsDrawer({ data, lm = false, open = false, onClose = () => {} }) {
+export default function ForecastDetailsDrawer({ data, lm = false, open = false, onClose = () => {},
+                                               health = null, healthBody = null }) {
   const d = data?.forecastDetails || null;
 
   // Theming tokens (mirror the rest of the app)
@@ -60,11 +61,26 @@ export default function ForecastDetailsDrawer({ data, lm = false, open = false, 
             </div>
 
             <div className="px-5 py-5">
+              {/* Forecast health — the verdict the tile on the product page is coloured by,
+                  then the detail behind it (grade, data strength, noise, AI explanation). */}
+              {health && (
+                <Section title="Forecast health" lm={lm}>
+                  <div className="rounded-xl border p-4 mb-3"
+                    style={{ background: `var(--t-${health.tone}-soft)`, borderColor: `var(--t-${health.tone}-line)` }}>
+                    <div className="flex items-center gap-2">
+                      <span className="h-2.5 w-2.5 rounded-full" style={{ background: `var(--t-${health.tone})` }} />
+                      <span className="text-[16px] font-bold" style={{ color: `var(--t-${health.tone})` }}>{health.word}</span>
+                    </div>
+                    <div className={`text-[14.5px] mt-1 ${textBody}`}>{health.grade} · {health.data}</div>
+                  </div>
+                  {healthBody}
+                </Section>
+              )}
               {!d ? (
                 <div className={`rounded-xl border ${cardBg} p-4 text-[15px] leading-relaxed ${textBody}`}>
-                  Detailed model breakdown is available when the dashboard is connected to the
+                  The model breakdown needs the
                   <span className="font-semibold"> statsforecast engine</span>. The current backend didn’t return
-                  these details (you may be running the original Prophet model).
+                  it (it may be the original Prophet model).
                 </div>
               ) : (
                 <>
@@ -97,8 +113,8 @@ export default function ForecastDetailsDrawer({ data, lm = false, open = false, 
                         {data.inactive
                           ? <><span className="font-semibold">Discontinued / dormant.</span> {data.inactiveMessage}</>
                           : data.tooNew
-                          ? <><span className="font-semibold">Establishing baseline — {data.ownDays}/{data.baselineDays} days.</span> {data.tooNewMessage}{data.observedRunwayDays != null ? ` At ~${data.observedDailyRate}/day, about ${data.observedRunwayDays} days of stock left.` : ''}</>
-                          : <><span className="font-semibold">Young / provisional — {data.ownDays}/{data.youngThreshold} days.</span> {data.youngMessage}</>}
+                          ? <><span className="font-semibold">Establishing baseline: {data.ownDays}/{data.baselineDays} days.</span> {data.tooNewMessage}{data.observedRunwayDays != null ? ` At ~${data.observedDailyRate}/day, about ${data.observedRunwayDays} days of stock left.` : ''}</>
+                          : <><span className="font-semibold">Young / provisional: {data.ownDays}/{data.youngThreshold} days.</span> {data.youngMessage}</>}
                       </div>
                     </Section>
                   )}
@@ -109,12 +125,12 @@ export default function ForecastDetailsDrawer({ data, lm = false, open = false, 
                       <div className={`rounded-xl border ${cardBg} p-4`}>
                         <p className={`text-[15px] ${textBody} leading-relaxed`}>
                           {data.route === 'global'
-                            ? <>It borrows its seasonal shape from {data.clusterInfo.chosen?.length} behaviourally-similar product{data.clusterInfo.chosen?.length !== 1 ? 's' : ''}: <span className="font-semibold">{(data.clusterInfo.chosen || []).join(', ')}</span>. They were grouped because their weekly/seasonal patterns line up, not just because they share a category label.</>
+                            ? <>It borrows its seasonal shape from {data.clusterInfo.chosen?.length} behaviourally-similar product{data.clusterInfo.chosen?.length !== 1 ? 's' : ''}: <span className="font-semibold">{(data.clusterInfo.chosen || []).join(', ')}</span>. They were grouped because their weekly/seasonal patterns match, not just their category label.</>
                             : <>Within its category it clusters with: <span className="font-semibold">{(data.clusterInfo.chosen || []).join(', ')}</span>.</>}
                         </p>
                         <p className={`mt-1.5 text-[14px] ${textMute}`}>Matched by: {data.clusterInfo.basis}.</p>
                         {data.clusterInfo.clusters?.length > 1 && (
-                          <p className={`mt-1.5 text-[14px] ${textMute}`}>This category splits into {data.clusterInfo.clusters.length} behavioural groups — only the matching one is pooled; the others behave differently and were left out.</p>
+                          <p className={`mt-1.5 text-[14px] ${textMute}`}>This category splits into {data.clusterInfo.clusters.length} behavioural groups. Only the matching one is pooled; the others behave differently and are left out.</p>
                         )}
                       </div>
                     </Section>
@@ -142,8 +158,21 @@ export default function ForecastDetailsDrawer({ data, lm = false, open = false, 
                         <span className={d.price?.used ? 'text-[var(--t-good)]' : 'text-[var(--t-dim)]'}>•</span>
                         <span>{d.price?.text}</span>
                       </li>
+                      {d.recentCheck?.text && (
+                        <li className={`text-[15px] ${textBody} leading-relaxed flex gap-2`}>
+                          <span className="text-[var(--t-info)]">•</span>
+                          <span>{d.recentCheck.text}</span>
+                        </li>
+                      )}
+                      {d.holidays?.text && (
+                        <li className={`text-[15px] ${textBody} leading-relaxed flex gap-2`}>
+                          <span className={d.holidays.count ? 'text-[var(--t-good)]' : 'text-[var(--t-dim)]'}>•</span>
+                          <span>{d.holidays.text}</span>
+                        </li>
+                      )}
                     </ul>
                   </Section>
+
 
                   {/* Consistency */}
                   <Section title="Demand consistency" lm={lm}>
@@ -182,7 +211,7 @@ export default function ForecastDetailsDrawer({ data, lm = false, open = false, 
                               <span className={`text-[15px] ${c.chosen ? `font-semibold ${textMain}` : textBody}`}>{c.label}</span>
                             </div>
                             <span className={`font-mono text-[14px] ${textMute}`}>
-                              {c.mae == null ? '—' : `MAE ${c.mae}`}
+                              {c.mae == null ? '-' : `MAE ${c.mae}`}
                             </span>
                           </div>
                         ))}

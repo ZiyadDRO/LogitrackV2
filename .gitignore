@@ -65,3 +65,8 @@ engine_statsforecast/catalog_store/
 engine_statsforecast/backtest_store/
 # Hourly inventory readings. Runtime state like the forecast log above, not code.
 engine_statsforecast/stock_log.json
+
+# When the nightly sync last ran. Runtime state, not code — losing it costs one
+# redundant sync, committing it would make every clone think it synced on your machine.
+engine_statsforecast/sync_state.json
+engine_statsforecast/sync_state.json.tmp

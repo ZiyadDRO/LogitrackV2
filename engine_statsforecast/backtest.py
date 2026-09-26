@@ -55,7 +55,19 @@ RECENT_FRACTION = 0.5  # share of cutoffs held at the dense recent step
 # spacing neighbours share 68% of their days, so cramming in 3x more re-measures the same
 # demand rather than adding evidence — 6x the model fits for a fraction of the precision.
 AUTO_CUTOFFS = "auto"
-AUTO_MIN_CUTOFFS = 3
+# 4, not 3, and it has to stay in step with MIN_WINDOWS_REPORTABLE below and with
+# BACKTEST_TIER_MIN_WINDOWS in main.py. At 3 the three numbers disagreed, and the gap was
+# pure waste: a product with 207-299 days of history got floored at 3 windows, was fully
+# backtested — every engine refit at every cutoff — and then had its result DISCARDED,
+# because using a measured tier needs 4. Nothing surfaced it; the product just showed a
+# provisional tier as though it had never been tested.
+#
+# Note this floor only sizes the REQUEST. _cutoff_schedule then places that many cutoffs
+# at `step` (28d), tightening toward MIN_STEP (14d) to make them fit — so the fourth
+# window was always there in 207+ days of history; nothing was ever asking for it.
+# Measured, at the default 44d horizon: usable measured tier now needs ~207 days of
+# history, was ~300. Both scale with the horizon, which is lead + coverage per product.
+AUTO_MIN_CUTOFFS = 4
 
 # Per-SKU metrics computed from fewer than this many windows are too noisy to show.
 MIN_WINDOWS_REPORTABLE = 4
@@ -73,7 +85,7 @@ TRAIN_BUCKETS = [(0, 180, "<180d"), (180, 365, "180-365d"), (365, 10**6, ">365d"
 # while 99.5 is a float ("99.5").
 Z = {90: 1.2816, 95: 1.6449, 98: 2.0537, 99: 2.3263, 99.5: 2.5758}
 RESERVED = {"sku", "sku_name", "date", "ds", "units_sold", "y", "price", "on_promotion",
-            "units_in_stock", "cost", "unit_cost"}
+            "units_in_stock", "cost", "unit_cost", "price_mixed", "price_listed"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -101,9 +113,14 @@ def normalize(raw: pd.DataFrame) -> pd.DataFrame:
     df = df.rename(columns={"date": "ds", "units_sold": "y"})
     # Same daily-calendar fill the app's upload applies: a sheet with rows only on
     # sale days would otherwise hide every zero-sale day from the engines under test.
+    # Filled to the last date in the WHOLE frame, matching what the app's ingest does.
+    # Per-SKU ends would give the backtest a different series from the one being forecast
+    # — in particular it would never see a dormant tail, so it would score a product the
+    # app no longer believes in.
+    _end = df["ds"].max() if len(df) else None
     filled = []
     for sku, g in df.groupby("sku"):
-        gf, _ = fill_daily_gaps(g.drop(columns=["sku"]))
+        gf, _ = fill_daily_gaps(g.drop(columns=["sku"]), end=_end)
         gf["sku"] = sku
         filled.append(gf)
     df = pd.concat(filled, ignore_index=True) if filled else df
@@ -155,6 +172,30 @@ def _relatives_as_of(df: pd.DataFrame, sku: str, cutoff: pd.Timestamp, pool_cach
     coh = (R._cohesion_for_ids(_info["chosen"], catalog, baseline)
            if _info and len(_info.get("chosen") or []) >= 2 else None)
     return rels, n_rel, coh
+
+
+def _peers_as_of(df: pd.DataFrame, sku: str, cutoff: pd.Timestamp, pool_cache: dict | None = None):
+    """Category peers as known at the cutoff, for borrowing holiday lifts and price
+    response (the same R.category_peers production uses)."""
+    key = pd.Timestamp(cutoff).normalize()
+    if pool_cache is None or key not in pool_cache:
+        _relatives_as_of(df, sku, cutoff, pool_cache)
+    if pool_cache is None or key not in pool_cache:
+        return None
+    catalog, groups, _clusters, _baseline = pool_cache[key]
+    return R.category_peers(sku, groups, catalog) if sku in catalog else None
+
+
+def _store_peers_as_of(df, sku, cutoff, pool_cache=None):
+    """Every other product as known at the cutoff: the fallback pool for holiday lifts
+    when a category is too small (same R.category_peers call production makes)."""
+    key = pd.Timestamp(cutoff).normalize()
+    if pool_cache is None or key not in pool_cache:
+        _relatives_as_of(df, sku, cutoff, pool_cache)
+    if pool_cache is None or key not in pool_cache:
+        return None
+    catalog = pool_cache[key][0]
+    return R.category_peers(sku, {}, catalog, limit=40) if sku in catalog else None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -229,7 +270,9 @@ def _run_cutoff(df, sku, sku_df, cutoff, horizon, combos, service_pct,
     # build_entry strips to ds <= cutoff internally → no lookahead.
     entry = build_entry(sku, sku, sku_df, "uploaded", "backtest", cutoff, [], rels, n_rel,
                         pool_cohesion=pool_coh,
-                        calib_windows=BT_CALIB_WINDOWS, force_route=force_route)
+                        calib_windows=BT_CALIB_WINDOWS, force_route=force_route,
+                        peers=_peers_as_of(df, sku, cutoff, pool_cache),
+                        store_peers=_store_peers_as_of(df, sku, cutoff, pool_cache))
     fc = entry["forecast"]
     end = cutoff + pd.Timedelta(days=horizon)
     pred = fc[(fc["ds"] > cutoff) & (fc["ds"] <= end)][["ds", "yhat", "yhat_lower", "yhat_upper"]]

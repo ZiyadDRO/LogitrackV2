@@ -209,11 +209,11 @@ def describe(match: dict, jump: dict, lead=None) -> str:
     if match["exact"]:
         head = f"Stock rose by exactly {j:.0f} on {day}, matching this order."
     elif match["partial"]:
-        head = (f"Stock rose by {j:.0f} on {day} against an order of {q:.0f} — "
-                f"looks like a partial delivery.")
+        head = (f"Stock rose by {j:.0f} on {day} against an order of {q:.0f}. "
+                f"Looks like a partial delivery.")
     else:
-        head = (f"Stock rose by {j:.0f} on {day}, more than the {q:.0f} ordered — "
-                f"possibly this delivery plus something else.")
+        head = (f"Stock rose by {j:.0f} on {day}, more than the {q:.0f} ordered. "
+                f"Possibly this delivery plus something else.")
     if lead is not None:
         head += f" That would make the lead time {lead} days."
     return head

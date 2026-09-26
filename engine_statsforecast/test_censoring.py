@@ -278,6 +278,16 @@ check("...at their observed value, not inflated", adj4["y"].max() == 9.0, str(ad
 check("...which still beats deleting them entirely", adj4["y"].mean() > old_kept["y"].mean(),
       f"{adj4['y'].mean()} vs {old_kept['y'].mean()}")
 
+print("\n— a spreadsheet day that opened empty, sold nothing and closed empty is not a zero —")
+# Yesterday closed at 0 and nothing came in: there was nothing to sell, so the day says
+# nothing about demand (a Black Friday spent out of stock used to read as a -74% holiday).
+oos = pd.DataFrame([{"ds": pd.Timestamp(f"2026-09-{i:02d}"), "y": y, "units_in_stock": st}
+                    for i, (y, st) in enumerate([(5, 20), (6, 14), (14, 0), (0, 0), (0, 0), (0, 30), (7, 23)], 1)])
+adj5, rep5 = C.apply_to_frame(oos, None)
+check("the two empty-shelf days are left out", rep5["removed"] == 2 and len(adj5) == 5, str(rep5))
+check("the day it sold out is kept as a floor", rep5["capped"] == 1 and 14.0 in list(adj5["y"]), str(rep5))
+check("the restock day (sold 0 but ended with 30) counts as a real zero", 0.0 in list(adj5["y"]), list(adj5["y"]))
+
 print("\n— an empty frame doesn't explode —")
 e0, r0 = C.apply_to_frame(pd.DataFrame(), {})
 check("it returns cleanly", r0["days"] == 0, str(r0))

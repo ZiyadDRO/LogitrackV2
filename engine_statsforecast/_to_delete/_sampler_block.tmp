@@ -1,0 +1,173 @@
+# ─────────────────────────────────────────────────────────────────────────────────────
+#  MOMENT READINGS
+# ─────────────────────────────────────────────────────────────────────────────────────
+SAMPLE_SECONDS = 3600.0        # hourly
+_MAX_BACKOFF_MULTIPLIER = 6    # a dead store is retried at most every 6 intervals
+
+
+class IntervalSampler:
+    """A daemon thread that takes a MOMENT READING on a fixed interval.
+
+    WHY THIS IS NOT DailySync. DailySync catches up: a missed nightly run is simply run
+    late, because what it does — fetch, refit, backtest — computes a STATE, and one run
+    against current data produces the same answer as the seven that were missed.
+
+    A stock reading is the opposite kind of thing. It observes a moment. Nobody records
+    how much stock you had at 2pm last Tuesday, so an hour nobody sampled is gone for
+    good — and no amount of running late recovers it. Catching up is therefore not just
+    unnecessary here, it is meaningless, and pretending otherwise would be worse than
+    doing nothing: it would file a reading taken now under an hour it does not describe.
+
+    WHAT THE READINGS ARE FOR. Sales are daily and stay daily. These readings exist only
+    to answer one question per product per day: how many hours was it actually buyable?
+    That number is what lets the engine tell "sold 3 because demand was 3" apart from
+    "sold 3 because it ran out at 11am" — and without it the second case silently teaches
+    the forecast that demand is falling, which orders less, which sells out sooner.
+
+    At one reading a day that question has only two possible answers, ~24h or ~0h, so the
+    partial-day case can never be detected and the correction never fires. Hourly is the
+    coarsest cadence that makes it real. StockLog collapses runs of identical readings,
+    so a product sitting still all week costs two samples, not 168.
+
+    ON FAILURE. A store hiccup must never escape this thread. Failures are counted and
+    back the interval off linearly, to a ceiling, so an expired token doesn't mean 24
+    doomed API calls a day — but the sampler keeps trying, because the cost of staying
+    quiet is unrecoverable and the cost of one wasted call an hour is nothing.
+    """
+
+    def __init__(self, job, *, interval_seconds=SAMPLE_SECONDS, enabled=None, clock=None,
+                 last_sample_at=None, name="stock-sampler"):
+        self.job = job
+        # Returns when a reading was last filed (a datetime, or None). Optional, and
+        # consulted only at boot: a process that restarts every few minutes must not take
+        # a reading every time, and the log itself already knows when it was last written.
+        self.last_sample_at = last_sample_at
+        self.interval_seconds = float(interval_seconds)
+        env_enabled = os.environ.get("LOGITRACK_SAMPLE_ENABLED")
+        self.enabled = (enabled if enabled is not None
+                        else (env_enabled or "1").strip().lower() not in ("0", "false", "no"))
+        self.clock = clock or _now_local
+        self.name = name
+        self._lock = threading.RLock()
+        self._wake = threading.Event()
+        self._thread = None
+        self._running = False
+        self._last = None             # the last attempt's record, whatever happened
+        self._failures = 0
+        self._taken = 0
+
+    # -- config --
+    def configure(self, *, enabled=None, interval_seconds=None):
+        with self._lock:
+            if enabled is not None:
+                self.enabled = bool(enabled)
+            if interval_seconds is not None:
+                self.interval_seconds = max(60.0, float(interval_seconds))
+        self._wake.set()
+        return self.status()
+
+    # -- status --
+    def _last_filed(self):
+        if not self.last_sample_at:
+            return None
+        try:
+            return self.last_sample_at()
+        except Exception:                                 # noqa: BLE001
+            return None
+
+    def _current_interval(self) -> float:
+        """Back off while the store is refusing us, but never give up on it."""
+        mult = min(self._failures, _MAX_BACKOFF_MULTIPLIER) or 1
+        return self.interval_seconds * mult
+
+    def status(self) -> dict:
+        with self._lock:
+            filed = self._last_filed()
+            return {
+                "enabled": bool(self.enabled),
+                "intervalSeconds": self.interval_seconds,
+                "effectiveIntervalSeconds": self._current_interval(),
+                "running": self._running,
+                "samplesTaken": self._taken,
+                "consecutiveFailures": self._failures,
+                "lastAttempt": self._last,
+                "lastFiledAt": filed.isoformat() if filed else None,
+            }
+
+    # -- the run --
+    def sample_now(self, trigger="manual") -> dict:
+        """Take one reading. Never raises, and never blocks a second caller."""
+        with self._lock:
+            if self._running:
+                return {"ok": False, "skipped": "already-running", "lastAttempt": self._last}
+            self._running = True
+        started = self.clock()
+        record = {"startedAt": started.isoformat(), "trigger": trigger}
+        try:
+            result = self.job() or {}
+            ok = bool(result.get("ok", True))
+            record.update({"ok": ok, "result": result})
+            with self._lock:
+                if ok:
+                    self._failures = 0
+                    self._taken += 1
+                else:
+                    self._failures += 1
+        except Exception as exc:                          # noqa: BLE001
+            record.update({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+            with self._lock:
+                self._failures += 1
+        finally:
+            record["finishedAt"] = self.clock().isoformat()
+            with self._lock:
+                self._running = False
+                self._last = record
+        return record
+
+    def due(self, now=None) -> bool:
+        """Is a reading owed right now? Asked at boot, against the LOG rather than against
+        a timer this process has no memory of."""
+        if not self.enabled:
+            return False
+        filed = self._last_filed()
+        if filed is None:
+            return True                                   # nothing on file: start the record
+        now = now or self.clock()
+        try:
+            if filed.tzinfo is None and now.tzinfo is not None:
+                filed = filed.replace(tzinfo=now.tzinfo)
+            elif filed.tzinfo is not None and now.tzinfo is None:
+                now = now.replace(tzinfo=filed.tzinfo)
+            return (now - filed).total_seconds() >= self._current_interval()
+        except (TypeError, ValueError):
+            return True
+
+    # -- lifecycle --
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return self
+        self._wake.clear()
+        self._thread = threading.Thread(target=self._loop, name=self.name, daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self):
+        self._wake.set()
+        self.enabled = False
+        return self
+
+    def _loop(self):
+        # At boot, take a reading only if one is actually owed. A dev restarting the
+        # server every two minutes would otherwise hammer the store with readings that
+        # collapse into the previous one anyway.
+        first = True
+        while True:
+            try:
+                if self.enabled and (self.due() if first else True):
+                    self.sample_now(trigger="boot" if first else "schedule")
+                first = False
+            except Exception as exc:                      # noqa: BLE001
+                print(f"Stock sampler loop error ({exc}).")
+                first = False
+            if self._wake.wait(self._current_interval()):
+                self._wake.clear()                        # config changed; re-evaluate now

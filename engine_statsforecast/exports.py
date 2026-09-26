@@ -19,7 +19,7 @@ SKYD   = "0284C7"   # subtitle / brand
 BAND   = "F1F5F9"   # zebra stripe
 WHITE  = "FFFFFF"
 TEXT   = "0F172A"
-GRADE  = {"A": "16A34A", "B": "D97706", "C": "E11D48", "F": "DC2626", "—": "94A3B8"}
+GRADE  = {"A": "16A34A", "B": "D97706", "C": "E11D48", "F": "DC2626", "—": "94A3B8", "-": "94A3B8"}
 STATUS = {"Stockout risk": "DC2626", "Reorder due": "D97706", "Dead stock": "7C3AED",
           "Overstocked": "0891B2", "Healthy": "16A34A"}
 
@@ -88,7 +88,7 @@ def _kv(ws, start_row, pairs, section=None):
     for i, (k, v) in enumerate(pairs):
         band = _fill(BAND) if i % 2 else _fill(WHITE)
         a = ws.cell(r, 1, k); a.font = Font(size=10, color="475569"); a.fill = band; a.alignment = LEFT; a.border = BORDER
-        b = ws.cell(r, 2, v if v is not None else "—"); b.font = CFONT; b.fill = band; b.alignment = LEFT; b.border = BORDER
+        b = ws.cell(r, 2, v if v is not None else "-"); b.font = CFONT; b.fill = band; b.alignment = LEFT; b.border = BORDER
         r += 1
     return r + 1
 
@@ -114,11 +114,11 @@ def _date(ms):
 def _ts_date(ms):
     """Forecast timestamp (ms) -> 'Mon DD, YYYY' label, or '—' when not applicable."""
     if not ms:
-        return "—"
+        return "-"
     try:
         return datetime.datetime.utcfromtimestamp(ms / 1000).strftime("%b %d, %Y")
     except Exception:
-        return "—"
+        return "-"
 
 
 def _stamp():
@@ -136,20 +136,22 @@ def build_sku_workbook(v: dict) -> Workbook:
     prot = v.get("protection") or {}
     g = v.get("orderGuardrail") or {}
     r = _kv(ws, r, [
-        ("Source", v.get("filename") or ("Demo data" if v.get("mode") == "demo" else "—")),
+        ("Source", v.get("filename") or ("Demo data" if v.get("mode") == "demo" else "-")),
         ("Forecast engine", f"{v.get('winningModel','')} ({v.get('route','')})"),
         ("Data eligibility", v.get("status")),
         ("Days of history", v.get("daysOfHistory")),
         ("Total units sold", v.get("totalUnitsSold")),
         ("Demand pattern", v.get("demandClass")),
-        ("How it sells", v.get("demandStory") or "—"),
+        ("How it sells", v.get("demandStory") or "-"),
         *([("⚠ Forecast below recent sales", (v.get("rateCheck") or {}).get("message"))]
           if v.get("rateCheck") else []),
     ], section="Product & Model")
     dr = v.get("daysUntilReorder", -1)
-    in_stock = (f"{v.get('__stock')}  (ASSUMED default — no stock column in the file; "
-                f"reorder figures are estimates until real stock is entered)"
-                if not v.get("stockDataAvailable", True) else v.get("__stock"))
+    # The old wording said "no stock column in the file" on EVERY live-connected product,
+    # because it tested the training frame for a column a live source never puts there.
+    # Square-supplied counts were being reported as assumptions. Provenance now travels
+    # with the figure, so this says which of the two it actually is.
+    in_stock = _stock_cell(v)
     price_val = v.get("currentPrice") or v.get("lastPrice")
     price_txt = (f"${price_val:.2f}" if (v.get("hasPrice") and price_val is not None)
                  else "Not provided (no price column in the file)")
@@ -165,12 +167,12 @@ def build_sku_workbook(v: dict) -> Workbook:
         ("Order math", f"target {v.get('targetInventory','?')} (cover {v.get('coverageQty','?')} + safety {v.get('safetyStock','?')}) − stock at delivery {v.get('stockAtDelivery','?')}"),
     ], section="Reorder")
     r = _kv(ws, r, [
-        ("Protection level", f"{prot.get('label','—')} ({prot.get('servicePct','—')}% service)"),
+        ("Protection level", f"{prot.get('label','-')} ({prot.get('servicePct','-')}% service)"),
         ("Recommended level", prot.get("recommended")),
         ("Recommendation basis", {"backtest": "Per-SKU backtest cheapest tier",
                                   "economics": "Per-SKU expected cost curve",
                                   "margin": "Margin heuristic",
-                                  "default": "Default (cost missing)"}.get(prot.get("source"), prot.get("source") or "—")),
+                                  "default": "Default (cost missing)"}.get(prot.get("source"), prot.get("source") or "-")),
         # Margin needs a price AND a cost — name whichever is actually missing.
         ("Gross margin", (f"{prot.get('marginPct')}%" if prot.get("marginPct") is not None
                           else ("Not available (no price in the data)" if prot.get("costKnownRaw")
@@ -182,7 +184,7 @@ def build_sku_workbook(v: dict) -> Workbook:
             if prot.get("source") == "backtest" and prot.get("economics") else
             f"Cost curve: margin ${prot.get('economics', {}).get('marginUnit')}/unit; "
             f"holding {prot.get('economics', {}).get('holdingPct')}%/yr"
-            if prot.get("economics") else "—")),
+            if prot.get("economics") else "-")),
         ("Safety buffer", f"{v.get('safetyStock','?')} units (z {v.get('zScore','?')} × σ {v.get('residualStd','?')} × √lead)"),
         ("Why this level", prot.get("reason")),
     ], section="Stockout Protection")
@@ -198,7 +200,7 @@ def build_sku_workbook(v: dict) -> Workbook:
 
     # Daily forecast tab
     wd = wb.create_sheet("Daily Forecast")
-    r = _title(wd, f"{name} — Daily Forecast & History", _stamp(), 5)
+    r = _title(wd, f"{name}: Daily Forecast & History", _stamp(), 5)
     rng = {p["x"]: p["y"] for p in (v.get("chartDataRange") or [])}
     rows = []
     for p in (v.get("chartDataHistory") or []):
@@ -215,11 +217,11 @@ def build_sku_workbook(v: dict) -> Workbook:
 
     # Monthly tab
     wm = wb.create_sheet("Monthly")
-    r = _title(wm, f"{name} — Monthly Forecast", _stamp(), 6)
+    r = _title(wm, f"{name}: Monthly Forecast", _stamp(), 6)
     _bl = bool(v.get("tooNew"))   # baseline week → forecast columns blanked
     mrows = [[c.get("monthLabel"), c.get("actualsSoFar") if c.get("isCurrent") else "",
-              ("—" if _bl else c.get("forecastRemaining")), ("—" if _bl else c.get("projectedTotal")),
-              ("—" if _bl else c.get("rangeLow")), ("—" if _bl else c.get("rangeHigh"))]
+              ("-" if _bl else c.get("forecastRemaining")), ("-" if _bl else c.get("projectedTotal")),
+              ("-" if _bl else c.get("rangeLow")), ("-" if _bl else c.get("rangeHigh"))]
              for c in (v.get("monthCards") or [])]
     _table(wm, r, ["Month", "Actuals so far", "Forecast remaining", "Projected total", "Low (80%)", "High (80%)"],
            mrows, formats={1: INT, 2: INT, 3: INT, 4: INT, 5: INT})
@@ -234,14 +236,14 @@ def _fleet_row(v, folder):
     dr = v.get("daysUntilReorder", -1)
     cm = v.get("currentMonth") or {}
     prot = v.get("protection") or {}
-    stock = f"{v.get('__stock')} (assumed)" if not v.get("stockDataAvailable", True) else v.get("__stock")
+    stock = _stock_cell(v, short=True)
     margin = prot.get("marginPct") if prot.get("marginPct") is not None else "n/a (no cost)"
-    basis = {"backtest": "backtest", "economics": "cost curve", "margin": "margin", "default": "default"}.get(prot.get("source"), prot.get("source") or "—")
+    basis = {"backtest": "backtest", "economics": "cost curve", "margin": "margin", "default": "default"}.get(prot.get("source"), prot.get("source") or "-")
     # A SKU still in its baseline week has no trustworthy forecast: the demand/order
     # columns would otherwise leak the pooled (and possibly volume-mismatched) figures
     # the detail screen deliberately hides. Blank them and say so in the Eligibility col.
     if v.get("tooNew"):
-        D = "—"
+        D = "-"
         return [
             v.get("skuId"), v.get("skuName"), folder or "Ungrouped",
             v.get("winningModel"), f"ESTABLISHING BASELINE ({v.get('ownDays')}/{v.get('baselineDays')} days)",
@@ -293,7 +295,7 @@ def _fleet_summary_sheet(ws, items, title):
 
 
 def _reorder_sheet(ws, items):
-    r = _title(ws, "Reorder Plan — soonest first", _stamp(), 8)
+    r = _title(ws, "Reorder Plan (soonest first)", _stamp(), 8)
 
     def keyf(it):
         d = it["view"].get("daysUntilReorder", 99999)
@@ -310,11 +312,41 @@ def _reorder_sheet(ws, items):
                      _ts_date(v.get("stockoutTimestamp")),
                      v.get("orderQty"), v.get("__stock")])
     if not rows:
-        rows = [["—", "Nothing needs reordering right now", "", "", "", "", "", ""]]
+        rows = [["-", "Nothing needs reordering right now", "", "", "", "", "", ""]]
     _table(ws, r, ["SKU", "Name", "Reorder in", "Reorder By", "Days→Stockout", "Stockout Date", "Order Qty", "In Stock"],
            rows, formats={4: INT, 6: INT, 7: INT},
            colorizer=lambda j0, val: "DC2626" if (j0 == 2 and val == "OVERDUE") else None)
     _autosize(ws)
+
+
+_STOCK_SOURCE_WORD = {"live": "from your store", "manual": "counted by you",
+                      "sheet": "from your file"}
+
+
+def _stock_cell(v, short=False):
+    """The stock figure plus, where it matters, where it came from.
+
+    Three cases, and the middle one is the one that was wrong: a live-connected product
+    whose count came from the store was reported as an assumption, because the old test
+    looked for a `units_in_stock` COLUMN and a live source carries inventory alongside
+    the sales rather than inside them. Every Square product therefore said "assumed".
+
+    An uncounted product says so at length and without hedging. The number beside it is
+    synthetic — it exists so the sheet has a cell, not because anyone believes it — and
+    the figures that would normally be computed from it are deliberately blank.
+    """
+    n = v.get("__stock")
+    if v.get("stockCounted") is False or v.get("stockDataAvailable") is False:
+        if short:
+            return f"{n} (SYNTHETIC: no count in your POS)"
+        return (f"{n}  (SYNTHETIC: your POS has no stock level for this product and nobody "
+                f"has counted it, so this is a placeholder, not a reading. Days of cover, "
+                f"stockout date, reorder date and order quantity are left blank because they "
+                f"come from stock. Enter a count on the product page to get them.)")
+    src = _STOCK_SOURCE_WORD.get(str(v.get("stockSource") or "").lower())
+    if short:
+        return n if src is None else f"{n} ({src})"
+    return n if src is None else f"{n}  ({src})"
 
 
 def _monthly_sheet(ws, items):
@@ -326,14 +358,14 @@ def _monthly_sheet(ws, items):
                 months.append(ml)
             if c.get("isCurrent"):
                 current = ml
-    r = _title(ws, "Monthly Forecast — projected units (current month includes actuals to date)",
+    r = _title(ws, "Monthly Forecast: projected units (current month includes actuals to date)",
                _stamp(), 3 + len(months))
     head = ["SKU", "Name", "Sold MTD"] + [(f"{m} (current)" if m == current else m) for m in months]
     rows = []
     for it in items:
         v = it["view"]; cm = v.get("currentMonth") or {}
         if v.get("tooNew"):   # baseline week → no forecast to report yet
-            rows.append([v.get("skuId"), v.get("skuName"), cm.get("unitsSoFar")] + ["—"] * len(months))
+            rows.append([v.get("skuId"), v.get("skuName"), cm.get("unitsSoFar")] + ["-"] * len(months))
             continue
         m = {c.get("monthLabel"): c.get("projectedTotal") for c in (v.get("monthCards") or [])}
         rows.append([v.get("skuId"), v.get("skuName"), cm.get("unitsSoFar")] + [m.get(mo) for mo in months])
@@ -344,7 +376,7 @@ def _monthly_sheet(ws, items):
 
 def build_fleet_workbook(items: list) -> Workbook:
     wb = Workbook(); ws = wb.active; ws.title = "Fleet Summary"
-    _fleet_summary_sheet(ws, items, "Fleet Summary — all SKUs")
+    _fleet_summary_sheet(ws, items, "Fleet Summary: all SKUs")
     _reorder_sheet(wb.create_sheet("Reorder Plan"), items)
     _monthly_sheet(wb.create_sheet("Monthly Forecast"), items)
     return wb
@@ -373,7 +405,7 @@ def _supplier_kpis(sup):
 
 def build_suppliers_workbook(suppliers: list) -> Workbook:
     wb = Workbook(); ws = wb.active; ws.title = "Suppliers"
-    r = _title(ws, "Suppliers — reliability KPIs", _stamp(), 7)
+    r = _title(ws, "Suppliers: reliability KPIs", _stamp(), 7)
     rows = []; hist = []
     for sup in suppliers:
         avg, on_time, avgvar, ncomp, ntrans = _supplier_kpis(sup)
@@ -386,8 +418,8 @@ def build_suppliers_workbook(suppliers: list) -> Workbook:
                     lt = (datetime.date.fromisoformat(o["receivedDate"][:10]) - datetime.date.fromisoformat(o["orderedDate"][:10])).days
                 except Exception:
                     lt = ""
-            hist.append([sup.get("name"), o.get("skuId") or "—", o.get("qty"),
-                         o.get("orderedDate"), o.get("expectedDate") or "—", o.get("receivedDate") or "—", lt, status])
+            hist.append([sup.get("name"), o.get("skuId") or "-", o.get("qty"),
+                         o.get("orderedDate"), o.get("expectedDate") or "-", o.get("receivedDate") or "-", lt, status])
     if not rows:
         rows = [["No suppliers added yet", "", "", "", "", "", ""]]
     _table(ws, r, ["Supplier", "SKUs", "Completed Orders", "Avg Lead (d)", "On-Time %", "Avg Variance (d)", "In Transit"],
@@ -395,9 +427,9 @@ def build_suppliers_workbook(suppliers: list) -> Workbook:
     _autosize(ws)
 
     wh = wb.create_sheet("Order History")
-    r = _title(wh, "Order History — all suppliers", _stamp(), 8)
+    r = _title(wh, "Order History: all suppliers", _stamp(), 8)
     if not hist:
-        hist = [["—", "—", "", "", "", "", "", "No orders logged"]]
+        hist = [["-", "-", "", "", "", "", "", "No orders logged"]]
     _table(wh, r, ["Supplier", "SKU", "Qty", "Ordered", "Expected", "Received", "Lead (d)", "Status"],
            hist, formats={2: INT, 6: INT})
     _autosize(wh)
@@ -414,11 +446,11 @@ def _scorecard_sheet(ws, rows):
         out.append([sc.get("skuId"), sc.get("skuName"), sc.get("status"),
                     (sc.get("daysOfCover") if sc.get("daysOfCover") is not None else "365+"),
                     (round(sc.get("sellThrough") * 100) if sc.get("sellThrough") is not None else None),
-                    sc.get("returnTier"),
+                    ("-" if sc.get("returnTier") in (None, "—") else sc.get("returnTier")),
                     (sc.get("marginPct") if sc.get("marginPct") is not None else "n/a (no cost)"),
                     (sc.get("carryingValue") if sc.get("carryingValue") is not None else "n/a (no cost)")])
     if not out:
-        out = [["—", "No SKUs", "", "", "", "", "", ""]]
+        out = [["-", "No SKUs", "", "", "", "", "", ""]]
     _table(ws, r, ["SKU", "Name", "Status", "Days of Cover", "Sell-through %", "Profit Grade", "Margin %", "Cash Tied Up"],
            out, formats={3: INT, 4: PCT, 6: PCT1, 7: CUR}, color_col=5, color_map=GRADE)
     _autosize(ws)
@@ -457,7 +489,7 @@ def _backtest_sheets(wb: Workbook, bt: dict) -> None:
     ran = bt.get("ranAt")
     ws = wb.create_sheet("Backtest Summary")
     meta = [
-        ("Test run", (datetime.datetime.fromtimestamp(ran).strftime("%Y-%m-%d %H:%M") if ran else "—")),
+        ("Test run", (datetime.datetime.fromtimestamp(ran).strftime("%Y-%m-%d %H:%M") if ran else "-")),
         ("Products tested", bt.get("tested")), ("Simulated reorders", bt.get("forecasts")),
         ("Failed test windows", bt.get("failedCutoffs") or 0),
         ("Lead time (days)", P.get("lead")), ("Coverage window (days)", P.get("coverage")),
@@ -468,13 +500,13 @@ def _backtest_sheets(wb: Workbook, bt: dict) -> None:
         ("Excluded - sells at or below cost", ", ".join(ta.get("lossMakingSkus") or []) or "none"),
         ("", ""),
         ("Beats a naive forecast (MASE)", ov.get("MASE")),
-        ("MASE 95% CI", " – ".join(str(x) for x in (ov.get("MASE_ci") or [])) or "—"),
+        ("MASE 95% CI", " to ".join(str(x) for x in (ov.get("MASE_ci") or [])) or "-"),
         ("Average miss (WAPE %)", ov.get("WAPE%")),
         ("Runs high/low %", ov.get("bias%")),
         ("Band hit rate %", ov.get("interval_cov%")),
-        ("Band hit rate 95% CI", " – ".join(str(x) for x in (ov.get("interval_cov%_ci") or [])) or "—"),
+        ("Band hit rate 95% CI", " to ".join(str(x) for x in (ov.get("interval_cov%_ci") or [])) or "-"),
         ("Stayed in stock %", ov.get("service_achieved%")),
-        ("Stayed in stock 95% CI", " – ".join(str(x) for x in (ov.get("service_achieved%_ci") or [])) or "—"),
+        ("Stayed in stock 95% CI", " to ".join(str(x) for x in (ov.get("service_achieved%_ci") or [])) or "-"),
     ]
     mp = ta.get("mixedPolicy") or {}
     if mp:
@@ -490,7 +522,7 @@ def _backtest_sheets(wb: Workbook, bt: dict) -> None:
                  ("Mix level spread", " · ".join(f"{n} at {p}%" for p, n in
                                                  sorted((mp.get("tierCounts") or {}).items()) if n)),
                  ("Hindsight would have claimed $/yr", mp.get("inSampleTotal"))]
-    _rows_sheet(ws, "Backtest — summary",
+    _rows_sheet(ws, "Backtest summary",
                 [("Item", lambda r: r[0]), ("Value", lambda r: r[1])], meta,
                 "Measured by re-running the real forecasting engines at past dates and grading them "
                 "against what actually sold next.")
@@ -503,7 +535,7 @@ def _backtest_sheets(wb: Workbook, bt: dict) -> None:
            ("Stayed in stock %", lambda r: r.get("service_achieved%")),
            ("Order size err %", lambda r: r.get("order_err%"))]
     _rows_sheet(wb.create_sheet("Backtest by Product"),
-                "Backtest — per product",
+                "Backtest by product",
                 [("Product", lambda r: r.get("sku")), ("From file", lambda r: r.get("source")),
                  ("Days of history", lambda r: r.get("daysHistory")),
                  ("Engine", lambda r: r.get("engine")),
@@ -512,7 +544,7 @@ def _backtest_sheets(wb: Workbook, bt: dict) -> None:
                 "Products marked 'NO - too few' were measured on too few windows to read individually.")
 
     if bt.get("bySource"):
-        _rows_sheet(wb.create_sheet("Backtest by File"), "Backtest — per uploaded file",
+        _rows_sheet(wb.create_sheet("Backtest by File"), "Backtest by uploaded file",
                     [("File", lambda r: r.get("source")), ("Products", lambda r: r.get("products")), *acc],
                     bt["bySource"],
                     "All products are modelled together; this splits the results by upload.")
@@ -576,7 +608,7 @@ def _open_pos_sheet(ws, items: list) -> None:
 def build_all_workbook(items: list, suppliers: list, scorecard_rows: list,
                        backtest: dict | None = None) -> Workbook:
     wb = Workbook(); ws = wb.active; ws.title = "Fleet Summary"
-    _fleet_summary_sheet(ws, items, "Fleet Summary — all SKUs")
+    _fleet_summary_sheet(ws, items, "Fleet Summary: all SKUs")
     _reorder_sheet(wb.create_sheet("Reorder Plan"), items)
     _monthly_sheet(wb.create_sheet("Monthly Forecast"), items)
     _scorecard_sheet(wb.create_sheet("Scorecard"), scorecard_rows or [])

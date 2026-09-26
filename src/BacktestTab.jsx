@@ -13,9 +13,9 @@ const TIP = {
   name:      "The product or forecasting engine this row is scoring.",
   forecasts: "How many past-date tests ran for this row. More tests = more trustworthy averages.",
   wape:      "WAPE. Average miss size, as a % of sales. Lower is better. Runs high for sparse/sporadic sellers, so don't over-trust it there.",
-  mase:      "MASE. Accuracy vs a naive 'same as last season' guess. Under 1 = beating that guess; over 1 = worse than it. The best single accuracy score.",
-  bias:      "Does the forecast lean high or low? Plus = over-forecasting (you'd over-order). Minus = under-forecasting (stockout risk). Near 0 is ideal.",
-  cov:       "80% interval coverage. How often real sales landed inside the forecast's uncertainty band. Should be ~80%. Lower means the bands are too narrow / overconfident.",
+  mase:      "MASE: accuracy compared with a naive 'same as last season' guess. Under 1 beats that guess, over 1 is worse. The best single accuracy score.",
+  bias:      "Whether the forecast leans high or low. Plus means over-forecasting (you'd over-order), minus means under-forecasting (stockout risk). Near 0 is ideal.",
+  cov:       "80% interval coverage: how often real sales landed inside the forecast's uncertainty band. Should be about 80%. Lower means the band is too narrow (overconfident).",
   order:     "How far off the suggested order size was. Plus = ordered too much, minus = too little. Near 0 means right-sized orders.",
   sku:       "The product this buffer math is for.",
   sigma:     "How much this product's daily sales bounce around. A bigger swing needs a bigger safety buffer.",
@@ -23,15 +23,15 @@ const TIP = {
   z:         "A multiplier set by your service target. A higher target gives a bigger number, so a bigger buffer.",
   rootlead:  "Stretches the buffer for how long a restock takes. Longer lead time = bigger buffer.",
   buffer:    "The resulting safety stock in units (z × σ × √lead): spare units kept on hand so you don't run out.",
-  ci:        "95% confidence interval. Test windows overlap and repeat per product, so the headline number is less certain than the raw count suggests. If your target sits inside this range, you don't have enough evidence to call it a real gap.",
-  windows:   "How many test windows this product got. Products with few windows produce noisy numbers — read them as a hint, not a result.",
-  train:     "How much sales history the model had at the moment it made each forecast. Accuracy naturally improves with history, so this splits 'the model is weak' from 'there wasn't enough data yet'.",
-  block:     "Recent windows test how things work now. Historic windows reach further back and may reflect an older pricing or channel mix — useful for seasonal coverage, but a worse guide to today.",
-  baseline:  "The same tests re-run with ONE engine forced onto every product, instead of picking per product. If routing isn't clearly better, the added complexity isn't paying for itself.",
-  optimal:   "The service level where one more unit of safety stock stops paying for itself, worked out from your own margins and holding rate. It's a continuous answer — the tiers are just the dial settings you can pick from.",
-  achievedVsTarget: "Tiers are TARGETS. The buffer under-delivers, so a 99% target may only achieve 97%. Pick the tier whose ACHIEVED number lands nearest the optimum, not the one whose label looks right.",
-  pcheapest: "How often this tier came out cheapest when we resampled your products. Tier costs come from averages over a handful of windows, so a small dollar gap can be pure chance. Under about 2-to-1 over the runner-up, treat them as equivalent.",
-  capacity:  "How many test windows your sales history can actually support. Asking for more doesn't exclude any product — short-history products just quietly return fewer windows, which then looks like a result when it's really a sample-size problem.",
+  ci:        "95% confidence interval: the range the true number likely sits in. Test windows overlap and repeat per product, so it's less certain than the raw count suggests. If your target is inside this range, there isn't enough evidence to call it a real gap.",
+  windows:   "How many test windows this product got. Few windows give noisy numbers, so read them as a hint, not a result.",
+  train:     "How much sales history the model had when it made each forecast. Accuracy improves with history, so this separates 'weak model' from 'not enough data yet'.",
+  block:     "Recent windows test how things work now. Historic windows reach further back and may reflect older pricing or channels. They help with seasonal coverage but are a worse guide to today.",
+  baseline:  "The same tests re-run with ONE engine on every product instead of picking one per product. If picking per product isn't clearly better, the extra complexity isn't paying off.",
+  optimal:   "The service level where one more unit of safety stock stops paying for itself, based on your margins and holding rate. It can be any value; the tiers are just the settings you can pick from.",
+  achievedVsTarget: "Tiers are targets, and the buffer under-delivers: a 99% target may only achieve 97%. Pick the tier whose ACHIEVED number is nearest the optimum, not the one whose label looks right.",
+  pcheapest: "How often this tier came out cheapest when we resampled your products. Costs average over a handful of windows, so a small dollar gap can be chance. Under about 2-to-1 over the runner-up, treat them as equal.",
+  capacity:  "How many test windows your sales history can support. Asking for more doesn't exclude any product, but short-history products quietly return fewer windows. That looks like a result but is really a sample-size problem.",
 };
 const PTIP = {
   horizon:  "How far ahead each test forecasts before it's graded against what really happened.",
@@ -44,26 +44,26 @@ const PTIP = {
 // don't exist at all on a touchscreen.
 const COLDEF = {
   tests:    ["Tests", "How many past dates we forecast from, then graded against what actually sold.", "More is steadier. Under 4 is too few to read as a result."],
-  avgmiss:  ["Avg miss", "Typical gap between forecast and actual, as a % of units sold. Weighted by volume, so busy weeks count more. (WAPE)", "Lower is better, but it runs high on slow sellers no matter how good the model is — judge those on 'vs naive'."],
+  avgmiss:  ["Avg miss", "Typical gap between forecast and actual, as a % of units sold. Weighted by volume, so busy weeks count more. (WAPE)", "Lower is better. It runs high on slow sellers whatever the model, so judge those on 'vs naive'."],
   vsnaive:  ["vs naive", "Accuracy compared with just repeating what sold this time last week. 0.8 means 20% less error than that guess. (MASE)", "Under 1 beats the naive guess. Over 1 means you'd do better with the simple rule."],
   runs:     ["Runs high/low", "Whether the forecast leans over or under on average. +10% means it predicted 10% more than sold.", "Near 0. Plus builds overstock, minus risks stockouts."],
   bandhit:  ["Band hit rate", "How often real sales landed inside the forecast's uncertainty range. (80% interval coverage)", "About 80%. Lower means the range is too narrow and the tool is overconfident."],
   instock:  ["Stayed in stock", "Share of past reorder cycles where the buffer was big enough to avoid running out.", "Should match your protection target. Below it means the buffer is too thin."],
   ordersize:["Order size", "How far off the suggested order quantity was. +10% means it would have ordered 10% too much.", "Near 0. Plus ties up cash in excess stock, minus risks running short."],
-  bufunits: ["Buffer units", "Spare units carried across the catalog at this level. Multiply by unit cost and your holding rate to get the buffer cost.", "Rises with the level \u2014 this is the stock you're actually paying to hold."],
-  missunits:["Missed units / yr", "Units of demand per year you'd fail to cover at this level. Multiply by profit per unit to get the lost profit.", "Falls as the level rises \u2014 this is what a stockout costs you in product, before money."],
-  tier:     ["Level", "The protection target — how hard the buffer tries to prevent a stockout.", "Higher keeps more spare stock, costs more to hold."],
+  bufunits: ["Buffer units", "Spare units carried across the catalog at this level. Multiply by unit cost and your holding rate to get the buffer cost.", "Rises with the level. This is the stock you're actually paying to hold."],
+  missunits:["Missed units / yr", "Units of demand per year you'd fail to cover at this level. Multiply by profit per unit to get the lost profit.", "Falls as the level rises. This is what stockouts cost you in product, before money."],
+  tier:     ["Level", "The protection target: how hard the buffer tries to prevent a stockout.", "Higher keeps more spare stock, costs more to hold."],
   achieved: ["Achieved", "What that target actually delivered in testing. Targets and outcomes differ because the buffer under-delivers.", "Should land near the level itself. Well below means the buffer is under-sized there."],
   ci:       ["95% CI", "The range the true number is likely to sit in, given how few tests there are.", "Narrower is more certain. If your target sits inside it, you can't call the gap real."],
   vstarget: ["vs target", "Achieved minus the level. Negative means under-protecting.", "Near 0. Marked 'n/s' when the gap is inside the confidence range, i.e. not meaningful."],
   pcheap:   ["P(cheapest)", "How often this level came out cheapest when we re-ran the maths on resampled products.", "Over about 60% is a real preference. Two levels near 50/50 are a coin flip."],
   lostprofit:["Lost profit / yr", "Margin you'd forgo each year to stockouts at this level, across the catalog.", "Falls as the level rises. Trade it against buffer cost."],
-  buffercost:["Buffer holding / yr", "The HOLDING COST on your safety stock each year — tied-up cash, storage, insurance, obsolescence. It is Cash in buffer × your holding rate.", "Rises as the level rises. Trade it against lost profit."],
-  totalcost:["Total $/yr", "Lost profit plus buffer cost. The number to minimise.", "Lowest wins — but check P(cheapest) before trusting a small gap."],
+  buffercost:["Buffer holding / yr", "The yearly cost of holding your safety stock: tied-up cash, storage, insurance, obsolescence. It is Cash in buffer × your holding rate.", "Rises as the level rises. Trade it against lost profit."],
+  totalcost:["Total $/yr", "Lost profit plus buffer cost. The number to minimise.", "Lowest wins, but check P(cheapest) before trusting a small gap."],
   cash:     ["Cash in buffer", "One-time working capital parked in safety stock. Not a yearly cost; its yearly cost is the buffer column.", "Lower frees cash. Worth weighing if capital is tight."],
-  history:  ["History", "How much sales history the model had when it made these forecasts.", "Accuracy usually improves with history — that's data, not model quality."],
+  history:  ["History", "How much sales history the model had when it made these forecasts.", "Accuracy usually improves with more history. That reflects the data, not the model."],
   window:   ["Window", "Recent windows test how things work now; historic ones reach further back for seasonal coverage.", "Similar numbers mean nothing major changed in the business."],
-  policy:   ["Policy", "Which model choice was used — per-product routing, or one model forced on everything.", "If routing isn't clearly better, the complexity isn't paying for itself."],
+  policy:   ["Policy", "Which model choice was used: the best model per product, or one model forced on everything.", "If per-product choice isn't clearly better, the extra complexity isn't paying off."],
 };
 
 // ── metric color logic (green = good, amber = watch, red = bad) ──
@@ -81,8 +81,8 @@ const lvlBias = (v) => (v == null ? "none" : Math.abs(v) < 10 ? "good" : Math.ab
 const lvlCov  = (v) => (v == null ? "none" : v >= 75 && v <= 88 ? "good" : v >= 65 && v <= 92 ? "warn" : "bad");
 const lvlSvc  = (v, t) => (v == null ? "none" : v >= t ? "good" : v >= t - 7 ? "warn" : "bad");
 const lvlOrd  = (v) => (v == null ? "none" : Math.abs(v) < 15 ? "good" : Math.abs(v) < 30 ? "warn" : "bad");
-const fmt = (v, suffix = "") => (v == null ? "—" : `${v}${suffix}`);
-const ciText = (ci, suffix = "") => (Array.isArray(ci) && ci.length === 2 ? `${ci[0]}${suffix} – ${ci[1]}${suffix}` : null);
+const fmt = (v, suffix = "") => (v == null ? "-" : `${v}${suffix}`);
+const ciText = (ci, suffix = "") => (Array.isArray(ci) && ci.length === 2 ? `${ci[0]}${suffix} to ${ci[1]}${suffix}` : null);
 // ── CSV export ───────────────────────────────────────────────────────────────
 // One file, sectioned, so a spreadsheet opens it readably: a titled block per table
 // with a blank line between. Everything on screen is included, including the caveats —
@@ -387,7 +387,7 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
       <td className={`px-3 py-2 text-[15px] font-semibold ${text}`}>
         {name}
         {r.reportable === false && (
-          <span title={`Only ${r.windows} test window${r.windows === 1 ? "" : "s"} — too few to read as a result.`}
+          <span title={`Only ${r.windows} test window${r.windows === 1 ? "" : "s"}, too few to read as a result.`}
             className={`ml-1.5 text-[13px] font-semibold px-1.5 py-0.5 rounded-full cursor-help bg-[var(--t-sunken)] text-[var(--t-dim)]`}>
             {r.windows}w · thin
           </span>
@@ -396,10 +396,10 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
       <td className={`px-3 py-2 text-[15px] tabular-nums ${muted}`}>{r.forecasts}</td>
       <td className={`px-3 py-2 text-[15px] tabular-nums ${muted}`} title={r["WAPE%_unweighted"] != null ? `Volume-weighted. Unweighted (mean of per-window ratios): ${r["WAPE%_unweighted"]}%` : undefined}>{fmt(r["WAPE%"], "%")}</td>
       <td className={`px-3 py-2 text-[15px] font-bold tabular-nums ${tone(lm, lvlMASE(r.MASE))}`}>{fmt(r.MASE)}</td>
-      <td className={`px-3 py-2 text-[15px] font-bold tabular-nums ${tone(lm, lvlBias(r["bias%"]))}`}>{r["bias%"] == null ? "—" : `${r["bias%"] > 0 ? "+" : ""}${r["bias%"]}%`}</td>
+      <td className={`px-3 py-2 text-[15px] font-bold tabular-nums ${tone(lm, lvlBias(r["bias%"]))}`}>{r["bias%"] == null ? "-" : `${r["bias%"] > 0 ? "+" : ""}${r["bias%"]}%`}</td>
       <td className={`px-3 py-2 text-[15px] font-bold tabular-nums ${tone(lm, lvlCov(r["interval_cov%"]))}`}>{fmt(r["interval_cov%"], "%")}</td>
       <td className={`px-3 py-2 text-[15px] font-bold tabular-nums ${tone(lm, lvlSvc(r["service_achieved%"], res?.params?.service ?? 95))}`}>{fmt(r["service_achieved%"], "%")}</td>
-      <td className={`px-3 py-2 text-[15px] font-bold tabular-nums ${tone(lm, lvlOrd(r["order_err%"]))}`}>{r["order_err%"] == null ? "—" : `${r["order_err%"] > 0 ? "+" : ""}${r["order_err%"]}%`}</td>
+      <td className={`px-3 py-2 text-[15px] font-bold tabular-nums ${tone(lm, lvlOrd(r["order_err%"]))}`}>{r["order_err%"] == null ? "-" : `${r["order_err%"] > 0 ? "+" : ""}${r["order_err%"]}%`}</td>
     </tr>
   );
 
@@ -448,8 +448,8 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
           </div>
           <div className={`text-[14px] mt-0.5 text-[var(--t-warn)]`}>
             {waiting.length === 1 ? "It has" : "They have"} no lead time of their own, so the results below
-            assume the default. That makes them a guess about timing rather than evidence. Set a lead time — on
-            the product, or once on its supplier — and the next run measures {waiting.length === 1 ? "it" : "them"} properly.
+            assume the default and are a guess about timing. Set a lead time on the product (or once on its
+            supplier) and the next run measures {waiting.length === 1 ? "it" : "them"} properly.
           </div>
           {/* The list is a drill-down, not the message. Naming fourteen products inline
               pushed the page down and buried the one sentence that says what to do. */}
@@ -498,9 +498,9 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
       <div>
         <h2 className="text-lg font-bold tracking-tight">Forecast Backtest</h2>
         <p className={`text-[14px] ${muted} mt-1 max-w-3xl`}>
-          How your forecasts and reorder suggestions would have performed on your own sales history — re-run at
-          dozens of past dates and graded against what actually sold next. Measured, not projected.
-          It tests whatever is loaded on the Products page and updates itself; products without enough history are listed as untested.
+          How your forecasts and reorder suggestions would have done on your own sales history. They are re-run at
+          dozens of past dates and graded against what actually sold next (measured, not projected).
+          It tests whatever is loaded on the Products page, updates itself, and lists products without enough history as untested.
         </p>
       </div>
 
@@ -512,7 +512,7 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
         <div className="flex items-center gap-3 flex-wrap">
           <button onClick={run} disabled={loading}
             className="px-4 py-2 rounded-lg text-[15px] font-bold bg-[var(--t-btn-bg)] hover:bg-[var(--t-btn-bg)] disabled:opacity-60 text-[var(--t-btn-fg)] transition-all">
-            {loading ? "Testing… (refits every product — give it a few minutes)" : "Re-test now"}
+            {loading ? "Testing… (refits every product, takes a few minutes)" : "Re-test now"}
           </button>
           <span className={`text-[14px] ${muted}`}>
             Runs on its own whenever you load data or change a cost, lead time or coverage window.
@@ -530,8 +530,8 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
               </div>
             ))}
             <div className={`col-span-2 text-[14px] ${muted} mt-2 leading-relaxed`}>
-              Changing either of these changes what a &ldquo;test&rdquo; means, so press <span className="font-semibold">Re-test now</span> afterwards.
-              Everything else is automatic: test count is sized per product, holding rate comes from the Products page, and lead time and coverage come from each product.
+              These change what a &ldquo;test&rdquo; means, so press <span className="font-semibold">Re-test now</span> afterwards.
+              Everything else is automatic: test count is sized per product, holding rate comes from the Products page, and lead time and coverage from each product.
             </div>
           </div>
         )}
@@ -548,14 +548,14 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
           </svg>
           <div className={`text-[15px] ${text}`}>
             <div className="font-semibold">A test is running on your products.</div>
-            <div className={muted}>Results will appear here automatically — usually a few minutes. No need to press anything.</div>
+            <div className={muted}>Results appear here automatically, usually within a few minutes. No need to press anything.</div>
           </div>
         </div>
       )}
       {!res && !loading && autoLoad === "none" && (
         <div className={`${card} border rounded-2xl p-4 text-[15px] ${muted}`}>
           <span className={`font-semibold ${text}`}>No results yet.</span> A test runs automatically when you load
-          products — if nothing is loaded, import a file on the <span className="font-semibold">Products</span> page first.
+          products. If nothing is loaded, import a file on the <span className="font-semibold">Products</span> page first.
         </div>
       )}
 
@@ -589,7 +589,7 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
                   server has: a stored run, a new one, or nothing. */}
             </div>
             <div className={`text-[14px] ${muted}`}>
-              {viewMode === "client" ? "Plain-language summary — safe to share." : "Full metrics, formulas & per-SKU detail."}
+              {viewMode === "client" ? "Plain-language summary, safe to share." : "Full metrics, formulas & per-SKU detail."}
               {res.ranAt && <> · ran {new Date(res.ranAt * 1000).toLocaleString()}{res.trigger === "upload" ? " (automatically, on upload)" : ""}</>}
             </div>
           </div>
@@ -598,7 +598,7 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
           {viewMode === "client" && (() => {
             const ov = res.overall || {};
             const ta = res.tierAnalysis || {};
-            const money = (v) => v == null ? "—" : `$${Math.round(v).toLocaleString()}`;
+            const money = (v) => v == null ? "-" : `$${Math.round(v).toLocaleString()}`;
             const bestRow = (ta.tiers || []).find((t) => t.tier === ta.bestTier);
             const svc = bestRow ? bestRow.achievedService : ov["service_achieved%"];
             const oe = ov["order_err%"];
@@ -618,7 +618,7 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
                "Forecast accuracy" reads at a glance as "the forecast is 17% accurate" —
                the opposite of what it says. The direction word travels with the number so
                the tile can only be read one way. */
-            const accNum = ov.MASE == null ? "—" : maseUnsure ? "Too close to call" : `${Math.abs(betterPct)}%`;
+            const accNum = ov.MASE == null ? "-" : maseUnsure ? "Too close to call" : `${Math.abs(betterPct)}%`;
             const accDir = (ov.MASE == null || maseUnsure) ? null : betterPct >= 0 ? "better" : "worse";
             const accSub = ov.MASE == null ? ""
               : maseUnsure ? "this run can't separate it from a naive last-season guess"
@@ -630,27 +630,27 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
                a number the run is actually entitled to state. Both bounds share the
                headline's sign, because an interval spanning zero is the maseUnsure case. */
             const accRange = (!mci || maseUnsure) ? null
-              : `95% confident: ${Math.round((1 - mci[1]) * 100)}–${Math.round((1 - mci[0]) * 100)}% ${accDir}`;
+              : `95% confident: ${Math.round((1 - mci[1]) * 100)} to ${Math.round((1 - mci[0]) * 100)}% ${accDir}`;
             const costNote = !ta.priced ? ""
               : ta.costBasis === "actual" ? "Based on your real per-unit cost and fees."
-              : `Based on the ${ta.costedSkus} of ${ta.totalSkus} tested products that have a cost entered — add cost for the rest to include them.`;
+              : `Based on the ${ta.costedSkus} of ${ta.totalSkus} tested products with a cost entered. Add costs for the rest to include them.`;
             return (
               <div className="space-y-4">
                 <div className={`${card} border rounded-2xl p-4`}>
                   <h3 className={`text-[16.5px] font-bold ${text}`}>How these reorder suggestions would have performed on your own sales history</h3>
                   <p className={`text-[14px] ${muted} mt-1`}>
-                    Tested across {res.forecasts} simulated past reorder points on {res.tested} product{res.tested !== 1 ? "s" : ""}, each graded against what actually sold next — measured, not projected.
+                    Tested across {res.forecasts} simulated past reorder points on {res.tested} product{res.tested !== 1 ? "s" : ""}, each graded against what actually sold next.
                   </p>
                   {/* Freshness. This is the shareable view, so it must never quietly
                       present a superseded run as current. */}
                   <p className={`text-[14px] mt-1 ${jobRunning ? ("text-[var(--t-warn)]") : muted}`}>
                     {res.ranAt ? <>Test run {whenRan(res.ranAt)}{res.trigger === "upload" ? ", automatically when you uploaded" : ""}.</> : null}
-                    {jobRunning && <> <span className="font-semibold">A newer test is running now</span> — these figures may change when it finishes.</>}
+                    {jobRunning && <> <span className="font-semibold">A newer test is running now.</span> These figures may change when it finishes.</>}
                   </p>
                   <div className="flex flex-wrap gap-3 mt-3">
                     <div className={`flex-1 min-w-[150px] rounded-xl border p-4 bg-[var(--t-panel)] border-[var(--t-line)]`}>
                       <div className={`text-[13px] uppercase tracking-widest font-bold ${muted} mb-1`}>Stayed in stock</div>
-                      <div className={`text-2xl font-bold tabular-nums ${text}`}>{svc == null ? "—" : `${svc}%`}</div>
+                      <div className={`text-2xl font-bold tabular-nums ${text}`}>{svc == null ? "-" : `${svc}%`}</div>
                       <div className={`text-[14px] ${muted} mt-0.5`}>{bestRow ? `at the recommended ${ta.bestTier}% level` : "of past reorder cycles"}</div>
                       {/* Show the range, not just the headline — a single number here reads as
                           far more precise than a few dozen overlapping test windows support. */}
@@ -662,7 +662,7 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
                     </div>
                     <div className={`flex-1 min-w-[150px] rounded-xl border p-4 bg-[var(--t-panel)] border-[var(--t-line)]`}>
                       <div className={`text-[13px] uppercase tracking-widest font-bold ${muted} mb-1`}>Order sizing</div>
-                      <div className={`text-2xl font-bold tabular-nums ${text}`}>{oe == null ? "—" : Math.abs(oe) < 8 ? "On point" : `${oe > 0 ? "+" : ""}${Math.round(oe)}%`}</div>
+                      <div className={`text-2xl font-bold tabular-nums ${text}`}>{oe == null ? "-" : Math.abs(oe) < 8 ? "On point" : `${oe > 0 ? "+" : ""}${Math.round(oe)}%`}</div>
                       <div className={`text-[14px] ${muted} mt-0.5`}>{orderText}</div>
                     </div>
                     <div className={`flex-1 min-w-[150px] rounded-xl border p-4 bg-[var(--t-panel)] border-[var(--t-line)]`}>
@@ -704,8 +704,8 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
                               In use: a level per product ({Object.entries(mp.tierCounts || {}).filter(([, n]) => n).map(([p, n]) => `${n} at ${p}%`).join(", ")})
                             </div>
                             <p className={`text-[15px] mt-1 leading-relaxed text-[var(--t-good)]`}>
-                              Each product carries the level its own numbers call for. Tested against one level
-                              for everything: saves {money(bestUniformCost - mp.totalCost)}/yr. Applied automatically.
+                              Each product gets the level its own numbers call for. Compared with one level
+                              for everything, this saves {money(bestUniformCost - mp.totalCost)}/yr. Applied automatically.
                             </p>
                           </>
                         );
@@ -715,9 +715,9 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
                           <div className={`text-[16.5px] font-bold text-[var(--t-good)]`}>In use: {shown}% on every product</div>
                           <p className={`text-[15px] mt-1 leading-relaxed text-[var(--t-good)]`}>
                             {tied
-                              ? <>Cheapest overall — {other}% costs about the same, but {shown}% lands closer to your optimal in-stock rate ({cr ? `${cr.optimalService}%` : "—"}).</>
+                              ? <>Cheapest overall. {other}% costs about the same, but {shown}% is closer to your optimal in-stock rate ({cr ? `${cr.optimalService}%` : "-"}).</>
                               : <>Cheapest overall at about {money(shownRow?.totalCost)}/yr.</>}
-                            {mp?.totalCost != null && <> A custom level per product was also tested — it didn&apos;t beat this, so one level is used everywhere.</>}
+                            {mp?.totalCost != null && <> A custom level per product was also tested. It didn&apos;t beat this, so one level is used everywhere.</>}
                             {" "}Applied automatically.
                           </p>
                         </>
@@ -747,7 +747,7 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
                           <h3 className={`text-[16.5px] font-bold ${text}`}>What each protection level would have cost you</h3>
                           <p className={`text-[15px] ${muted} mt-1 max-w-[640px] leading-relaxed`}>
                             Replayed against your own sales history. More protection means fewer missed sales but more
-                            cash sitting in buffer stock — the answer is wherever the two together are cheapest.
+                            cash tied up in buffer stock. The best level is where the two together cost least.
                           </p>
                         </div>
                         <div className={`flex gap-4 text-[14.5px] ${muted}`}>
@@ -791,7 +791,7 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
                                 paddingTop: 7, height: 64 }}>
                                 <div className={`text-[15.5px] font-bold ${isBest ? "text-[var(--t-accent)]" : text}`}>{t.tier}%</div>
                                 <div className={`text-[14px] tabular-nums ${muted}`}>
-                                  {t.achievedService != null ? `${t.achievedService}% stayed in stock` : "—"}
+                                  {t.achievedService != null ? `${t.achievedService}% stayed in stock` : "-"}
                                 </div>
                                 {isBest && <div className={`text-[14px] font-bold text-[var(--t-accent)] mt-0.5`}>CHEAPEST</div>}
                               </div>
@@ -808,7 +808,7 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
                     <div className={`px-4 py-2 text-[14px] uppercase tracking-widest font-bold ${muted} border-b border-[var(--t-line)]`}>Protection levels compared</div>
                     <table className="w-full">
                       <thead><tr>
-                        <Th tip="Service-level target — a higher level keeps more spare stock on hand.">Level</Th>
+                        <Th tip="Service-level target. A higher level keeps more spare stock on hand.">Level</Th>
                         <Th tip="How often the buffer would have prevented a stockout in past reorder cycles.">Stayed in stock</Th>
                         <Th tip="Projected yearly cost = profit lost on sales you'd miss + cost of holding the safety buffer. Lowest wins.">Est. cost / yr</Th>
                       </tr></thead>
@@ -834,13 +834,13 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
                               {mp?.totalCost != null && (
                                 <tr className={`border-t-2 border-[var(--t-line2)] ${mixWins ? ("bg-[var(--t-good-soft)]") : ""}`}>
                                   <td className={`px-3 py-2 text-[15px] font-bold ${text}`}
-                                      title="Each product set to its own best level rather than one level for everything. Costed fairly: every simulated reorder is scored with a level chosen before seeing that reorder's outcome.">
+                                      title="Each product on its own best level instead of one level for everything. Costed fairly: each simulated reorder is scored with a level chosen before seeing its outcome.">
                                     A level per product{mixWins && <span className={`ml-2 text-[13px] font-semibold px-1.5 py-0.5 rounded-full bg-[var(--t-good-soft)] text-[var(--t-good)]`}>in use</span>}
                                     <div className={`text-[13px] font-normal ${muted}`}>
                                       {Object.entries(mp.tierCounts || {}).filter(([, n]) => n).map(([p, n]) => `${n} at ${p}%`).join(" · ")}
                                     </div>
                                   </td>
-                                  <td className={`px-3 py-2 text-[15px] font-bold tabular-nums ${text}`}>{mp.achievedService != null ? `${mp.achievedService}%` : "—"}</td>
+                                  <td className={`px-3 py-2 text-[15px] font-bold tabular-nums ${text}`}>{mp.achievedService != null ? `${mp.achievedService}%` : "-"}</td>
                                   <td className={`px-3 py-2 text-[15px] font-bold tabular-nums ${mixWins ? tone(lm, "good") : text}`}>
                                     {money(mp.totalCost)}
                                     {mixWins && <span className={`ml-1.5 text-[13px] font-semibold text-[var(--t-good)]`}>saves {money(bestUniformCost - mp.totalCost)}/yr</span>}
@@ -863,25 +863,24 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
                     just omit its row — it moves the totals and can flip which level wins. */}
                 {ta.priced && ta.uncostedSkus?.length > 0 && (
                   <div className={`text-[15px] rounded-xl border px-4 py-3 bg-[var(--t-warn-soft)] border-[var(--t-warn-line)] text-[var(--t-warn)]`}>
-                    <span className="font-semibold">These costs are incomplete — the totals above will change.</span>{" "}
-                    {ta.costedSkus} of {ta.totalSkus} tested products have a unit cost. The yearly figures add up only
-                    those {ta.costedSkus}, so adding the rest will move every total and may change which level wins.
+                    <span className="font-semibold">These costs are incomplete, so the totals above will change.</span>{" "}
+                    {ta.costedSkus} of {ta.totalSkus} tested products have a unit cost. The yearly figures count only
+                    those {ta.costedSkus}, so adding the rest may change which level wins.
                     <div className="mt-1.5">
                       <span className="font-semibold">Missing a cost:</span>{" "}
                       <span className="font-mono">{ta.uncostedSkus.slice(0, 12).join(", ")}{ta.uncostedSkus.length > 12 ? ` +${ta.uncostedSkus.length - 12} more` : ""}</span>
                     </div>
                     <div className={`mt-1.5 text-[var(--t-warn)]`}>
-                      Add them on each product's page and the test re-runs by itself — accuracy results below are unaffected, they don&apos;t depend on cost.
+                      Add them on each product&apos;s page or in the Fleet tab&apos;s Costs &amp; fees sheet, and the test re-runs by itself. Accuracy results don&apos;t depend on cost.
                     </div>
                   </div>
                 )}
                 {!ta.priced && (
                   <div className={`text-[15px] rounded-xl border px-4 py-3 bg-[var(--t-warn-soft)] border-[var(--t-warn-line)] text-[var(--t-warn)]`}>
-                    <span className="font-semibold">No unit costs yet, so there are no dollar figures.</span> The test still ran and its
-                    accuracy results are valid — those don&apos;t depend on cost. What&apos;s missing is the money comparison:
-                    without a cost there&apos;s no way to weigh a lost sale against the cost of holding stock. Add costs on the
-                    product's page (or include a <span className="font-semibold">Cost</span> column in your file) and the test re-runs
-                    by itself. Until then the table shows how often each level kept you in stock.
+                    <span className="font-semibold">No unit costs yet, so there are no dollar figures.</span> Accuracy results are still
+                    valid, but without costs a lost sale can&apos;t be weighed against the cost of holding stock. Add costs on the
+                    product&apos;s page or in the Fleet tab&apos;s Costs &amp; fees sheet (or include a <span className="font-semibold">Cost</span> column
+                    in your file) and the test re-runs by itself.
                   </div>
                 )}
               </div>
@@ -898,13 +897,13 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
               than after), four diagnostic accuracy tables, and an AI write-up. */}
           {res.tierAnalysis?.tiers?.length > 0 && (() => {
             const ta = res.tierAnalysis;
-            const money = (v) => v == null ? "—" : `$${Math.round(v).toLocaleString()}`;
+            const money = (v) => v == null ? "-" : `$${Math.round(v).toLocaleString()}`;
             const best = ta.bestTier;
             const cyc = ta.cyclesPerYear;
-            const basisNote = !ta.priced ? "no per-SKU cost — calibration only"
+            const basisNote = !ta.priced ? "no per-SKU cost, calibration only"
               : ta.costBasis === "actual" ? `real cost · ${ta.totalSkus} tested SKUs`
-              : `real cost · ${ta.costedSkus}/${ta.totalSkus} tested SKUs — totals incomplete`;
-            const lostProfitTip = `Total profit you'd forgo to stockouts per year at this tier, across the catalog. The shortfall is a counterfactual per tier — at each cutoff we re-pretend you'd ordered to forecast + this tier's buffer and count the demand it wouldn't cover over the lead time — NOT the empty-shelf events in your history (those are excluded). Computed PER PRODUCT (each product's units short/yr × its own profit, price − cost − fees) then summed — see the per-product breakdown below. Costed SKUs only.`;
+              : `real cost · ${ta.costedSkus}/${ta.totalSkus} tested SKUs (totals incomplete)`;
+            const lostProfitTip = `Profit you'd lose to stockouts each year at this tier, across the catalog (costed SKUs only). It's simulated: at each test date we assume you ordered forecast + this tier's buffer and count the demand it wouldn't cover over the lead time, not the stockouts in your history. Worked out per product (units short/yr × its profit: price − cost − fees), then summed; see the per-product tabs.`;
 
             const bySku = ta.bySku || [];
             const tiers = ta.tiers.map((t) => t.tier);
@@ -971,7 +970,7 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
                         <span className="font-semibold" title={TIP.optimal}>Optimal in-stock rate from your margins: ~{cr.optimalService}%.</span>
                         {nt && <> The {nt.tier}% tier lands closest (achieves {nt.achievedService}%).</>}
                         {" "}<span title={TIP.achievedVsTarget}>Judge tiers on <span className="font-semibold">Achieved</span>, not their label.</span>
-                        {disagree && <> <span className="font-semibold">Note:</span> cheapest says {ta.bestTier}%, closest-to-optimal says {ta.nearestTier}% — prefer {ta.nearestTier}% unless the cost gap below is decisive.</>}
+                        {disagree && <> <span className="font-semibold">Note:</span> cheapest says {ta.bestTier}%, closest-to-optimal says {ta.nearestTier}%. Prefer {ta.nearestTier}% unless the cost gap below is decisive.</>}
                       </div>
                     );
                   })()}
@@ -979,15 +978,15 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
                   {/* Is the ranking real, or a coin flip? */}
                   {ta.ranking && !ta.ranking.decisive && (
                     <div className={`px-4 py-3 border-b text-[15px] leading-relaxed border-[var(--t-warn-line)] bg-[var(--t-warn-soft)] text-[var(--t-warn)]`}>
-                      <span className="font-semibold">Cost tie:</span> {ta.ranking.winner}% and {ta.ranking.runnerUp}% are within noise of each other ({ta.ranking.winnerProb}% vs {ta.ranking.runnerUpProb}% of resamples) — the pick falls back to closest-to-optimal.
+                      <span className="font-semibold">Cost tie:</span> {ta.ranking.winner}% and {ta.ranking.runnerUp}% are within noise of each other ({ta.ranking.winnerProb}% vs {ta.ranking.runnerUpProb}% of resamples), so the pick falls back to closest-to-optimal.
                     </div>
                   )}
                   <table className="w-full">
                     <thead><tr>
                       <Th tip="The service-level target. A higher tier carries more safety stock.">Tier</Th>
-                      <Th tip="Share of lead-time windows the tier actually covered, averaged per product first so a long-history product doesn't outvote a short one. Should land ≈ the tier %. Well below = the buffer is under-sized at that tier (a calibration issue), not proof the tier is wrong.">Achieved</Th>
+                      <Th tip="Share of lead-time windows the tier actually covered, averaged per product so long histories don't outweigh short ones. Should be close to the tier %. Well below means the buffer is under-sized at that tier, not that the tier is wrong.">Achieved</Th>
                       <Th tip={TIP.ci}>95% CI</Th>
-                      <Th tip="Achieved service minus the tier's target. Negative = under-protecting — but only if the target falls outside the confidence interval.">vs target</Th>
+                      <Th tip="Achieved minus the tier's target. Negative means under-protecting, but only if the target falls outside the 95% CI.">vs target</Th>
                       {ta.ranking && <Th tip={TIP.pcheapest}>P(cheapest)</Th>}
                       {/* Ordered as two halves of one trade-off, each running units -> money:
                             what stockouts cost you, then what protecting against them costs.
@@ -996,11 +995,11 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
                       <Th tip="Units of demand per year you'd fail to cover at this level, across the catalog. This is the quantity the lost profit is built from: missed units x profit per unit.">Missed units / yr</Th>
                       <Th tip={lostProfitTip}>Lost profit / yr</Th>
                       <Th tip="Spare units you'd carry across the catalog at this level. This is the quantity the holding cost is built from: buffer units x unit cost x holding rate.">Buffer units</Th>
-                      <th className={`${th} border-l border-[var(--t-line)]`} title="Working capital parked in the safety buffer at this tier (buffer units × unit cost). A ONE-TIME amount you tie up — like a till float — NOT a yearly cost. Its yearly cost is the next column. The sub-line is the extra/less cash vs the recommended tier. It is NOT added to Total.">
+                      <th className={`${th} border-l border-[var(--t-line)]`} title="Cash tied up in the safety buffer at this tier (buffer units × unit cost). A one-time amount, not a yearly cost, and not added to Total; its yearly cost is the next column. The sub-line is the cash difference vs the recommended tier.">
                         <span className="underline decoration-dotted decoration-[var(--t-faint)] underline-offset-4 cursor-help">Cash in buffer</span>
                       </th>
-                      <Th tip="HOLDING COST on the safety buffer = Cash in buffer × your holding rate. Covers tied-up capital, storage, insurance and obsolescence. Rises with the tier because more safety stock costs more to hold. This is the yearly figure; Cash in buffer is the one-time amount it's charged on.">Buffer holding / yr</Th>
-                      <Th tip="Lost profit/yr + Buffer holding/yr. The lowest total is the economically right tier — this is the profit decision. Cash in buffer is NOT included: it's capital tied up, not an annual expense.">Total $/yr</Th>
+                      <Th tip="Yearly cost of holding the safety buffer: Cash in buffer × your holding rate. Covers tied-up capital, storage, insurance and obsolescence. Rises with the tier, since more stock costs more to hold.">Buffer holding / yr</Th>
+                      <Th tip="Lost profit/yr + Buffer holding/yr. The lowest total is the most profitable tier. Cash in buffer is not included: it's capital tied up, not a yearly expense.">Total $/yr</Th>
                     </tr></thead>
                     <tbody>
                       {ta.tiers.map((t) => {
@@ -1012,11 +1011,11 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
                               {t.tier}%{isBest && <span className={`ml-2 text-[13px] font-semibold px-1.5 py-0.5 rounded-full bg-[var(--t-good-soft)] text-[var(--t-good)]`}>lowest cost</span>}
                             </td>
                             <td className={`px-3 py-2 text-[15px] font-bold tabular-nums ${tone(lm, lvlSvc(t.achievedService, t.tier))}`}>{t.achievedService}%</td>
-                            <td className={`px-3 py-2 text-[14px] tabular-nums ${muted}`}>{ciText(t.achievedServiceCI, "%") || "—"}</td>
+                            <td className={`px-3 py-2 text-[14px] tabular-nums ${muted}`}>{ciText(t.achievedServiceCI, "%") || "-"}</td>
                             {/* An apparent gap is only evidence when the tier's own target falls
                                 outside the interval; otherwise it reads as "too close to call". */}
                             <td className={`px-3 py-2 text-[15px] tabular-nums ${ciCovers(t.achievedServiceCI, t.tier) ? muted : t.gap < -7 ? tone(lm, "bad") : t.gap < 0 ? tone(lm, "warn") : tone(lm, "good")}`}
-                                title={ciCovers(t.achievedServiceCI, t.tier) ? "The tier's target falls inside the confidence interval — not enough windows to call this a real gap." : undefined}>
+                                title={ciCovers(t.achievedServiceCI, t.tier) ? "The tier's target falls inside the confidence interval, so there aren't enough windows to call this a real gap." : undefined}>
                               {t.gap > 0 ? "+" : ""}{t.gap}
                               {ciCovers(t.achievedServiceCI, t.tier) && <span className={`ml-1 text-[13px] ${muted}`}>n/s</span>}
                             </td>
@@ -1024,13 +1023,13 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
                               const pc = ta.ranking.pCheapest?.[t.tier] ?? ta.ranking.pCheapest?.[String(t.tier)];
                               return (
                                 <td className={`px-3 py-2 text-[15px] font-bold tabular-nums ${pc == null ? muted : pc >= 60 ? tone(lm, "good") : pc >= 25 ? tone(lm, "warn") : muted}`}>
-                                  {pc == null ? "—" : `${pc}%`}
+                                  {pc == null ? "-" : `${pc}%`}
                                 </td>
                               );
                             })()}
-                            <td className={`px-3 py-2 text-[15px] font-semibold tabular-nums ${text}`}>{t.unitsShortYr == null ? "—" : Math.round(t.unitsShortYr).toLocaleString()}</td>
+                            <td className={`px-3 py-2 text-[15px] font-semibold tabular-nums ${text}`}>{t.unitsShortYr == null ? "-" : Math.round(t.unitsShortYr).toLocaleString()}</td>
                             <td className={`px-3 py-2 text-[15px] tabular-nums ${muted}`}>{money(t.stockoutCost)}</td>
-                            <td className={`px-3 py-2 text-[15px] tabular-nums ${muted}`}>{t.safetyUnits == null ? "—" : Math.round(t.safetyUnits).toLocaleString()}</td>
+                            <td className={`px-3 py-2 text-[15px] tabular-nums ${muted}`}>{t.safetyUnits == null ? "-" : Math.round(t.safetyUnits).toLocaleString()}</td>
                             <td className={`px-3 py-2 tabular-nums align-top border-l border-[var(--t-line)]`}>
                               <div className={`text-[15px] font-semibold ${text}`}>{money(t.bufferCash)}</div>
                               <div className={`text-[13px] ${muted}`}>{isBest ? "baseline" : t.bufferCashDelta == null ? "" : `${t.bufferCashDelta > 0 ? "+" : "−"}$${Math.round(Math.abs(t.bufferCashDelta)).toLocaleString()} vs ${best}%`}</div>
@@ -1056,7 +1055,7 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
                             <tr className={`border-t border-[var(--t-line)]`}>
                               <td colSpan={ta.ranking ? 11 : 10} className={`px-3 py-2 text-[14px] ${muted}`}
                                   title="Each product's own best level was tried and scored on unseen weeks. It cost more than the best single level, so one level is used for everything.">
-                                A custom level per product was tested ({spread}) — {money(mp.totalCost)}/yr, no better than the best single level. One level is in use for everything.
+                                A custom level per product was tested ({spread}): {money(mp.totalCost)}/yr, no better than the best single level. One level is in use for everything.
                               </td>
                             </tr>
                           );
@@ -1086,9 +1085,9 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
                   </div>
                   <Guide id="tiers" cols={["tier","achieved","ci","vstarget","pcheap","bufunits","missunits","lostprofit","buffercost","totalcost","cash"]}
                     extra={[
-                      ...(ta.mixedPolicy ? [["Per-product mix", "Every product on its own cheapest level instead of one shared level. Scored fairly: each simulated reorder is graded with a level chosen from that product's OTHER test windows, never the one being graded — otherwise the mix would win automatically by keeping every product's lucky result. Hindsight scoring would have claimed " + money(ta.mixedPolicy.inSampleTotal) + "/yr.", "If it beats the best single level, the app deploys the per-product levels; if not, everyone gets the winning single level. Applied automatically either way."]] : []),
-                      ["How the dollars are built", "Lost profit/yr = missed units/yr × profit per unit (price − cost − fees), summed per product. Buffer holding/yr = buffer units × unit cost × your holding rate. The shortfall is a simulation per tier — would forecast + that tier's buffer have covered the next lead-time's real demand — not the stockouts in your history.", "Costs cover only the safety-stock policy, the part the tier changes."],
-                      ["Cash in buffer vs Buffer holding", "Cash in buffer is one-time working capital parked in safety stock — not a yearly cost and not added to Total. Its yearly cost is already the Buffer holding column (cash × holding rate).", "Use it to judge affordability, not to rank tiers."],
+                      ...(ta.mixedPolicy ? [["Per-product mix", "Every product on its own cheapest level instead of one shared level. Scored fairly: each reorder is graded with a level picked from that product's other test windows, so lucky results can't win it. Hindsight scoring would have claimed " + money(ta.mixedPolicy.inSampleTotal) + "/yr.", "If it beats the best single level, the app uses per-product levels; if not, every product gets the winning single level. Applied automatically either way."]] : []),
+                      ["How the dollars are built", "Lost profit/yr = missed units/yr × profit per unit (price − cost − fees), summed per product. Buffer holding/yr = buffer units × unit cost × your holding rate. The shortfall is simulated per tier (would forecast + that tier's buffer have covered the next lead time's real demand?), not the stockouts in your history.", "Costs cover only the safety-stock policy, the part the tier changes."],
+                      ["Cash in buffer vs Buffer holding", "Cash in buffer is one-time working capital parked in safety stock. It's not a yearly cost and not added to Total; its yearly cost is the Buffer holding column (cash × holding rate).", "Use it to judge affordability, not to rank tiers."],
                     ]} />
                 </>) : bySku.length === 0 ? (
                   <div className={`px-4 py-4 text-[15px] ${muted}`}>No per-product breakdown in this run.</div>
@@ -1096,7 +1095,7 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
                   <div>
                     <div className={`px-4 pt-3 pb-1 text-[15px] uppercase tracking-widest font-bold ${text}`}>
                       Every product at every tier
-                      <span className={`ml-2 font-normal normal-case tracking-normal ${muted}`}>— {metric.label}</span>
+                      <span className={`ml-2 font-normal normal-case tracking-normal ${muted}`}>· {metric.label}</span>
                     </div>
                     <div className="overflow-x-auto">
                       <table className="w-full">
@@ -1125,7 +1124,7 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
                                       style={isOwn ? { boxShadow: "inset 0 0 0 1.5px var(--t-good-line)" } : undefined}
                                       title={isOwn ? `${r.sku}'s own cheapest level` : undefined}
                                       className={`px-3 py-2 text-[16.5px] tabular-nums text-right ${v == null ? muted : text} ${shade(v, lo, hi)} ${colHL(t)}`}>
-                                    {v == null ? "—" : metric.fmt(v)}
+                                    {v == null ? "-" : metric.fmt(v)}
                                   </td>
                                 ); })}
                               </tr>
@@ -1134,16 +1133,16 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
                           <tr className={`border-t-2 border-[var(--t-line2)] bg-[var(--t-sunken)]`}>
                             <td className={`px-3 py-2.5 text-[16.5px] font-bold ${text}`}>Total</td>
                             {ta.tiers.map((t) => { const v = metric.total(t); return (
-                              <td key={t.tier} className={`px-3 py-2.5 text-base font-bold tabular-nums text-right ${text} ${colHL(t.tier)}`}>{v == null ? "—" : metric.fmt(v)}</td>
+                              <td key={t.tier} className={`px-3 py-2.5 text-base font-bold tabular-nums text-right ${text} ${colHL(t.tier)}`}>{v == null ? "-" : metric.fmt(v)}</td>
                             ); })}
                           </tr>
                         </tbody>
                       </table>
                     </div>
                     <div className={`px-4 py-2 text-[14px] leading-relaxed ${muted}`}>
-                      Sorted by exposure. Shading is magnitude within each row, so the shape reads without the digits.
-                      The {best ? `${best}%` : "recommended"} column is the catalog-wide pick; an outlined cell is that product's own cheapest level.
-                      <span className="font-semibold"> Lost profit</span> and <span className="font-semibold">Buffer holding</span> totals both match the Calibration tab, and together they are Total $/yr.
+                      Sorted by exposure; darker shading means a bigger value within the row.
+                      The {best ? `${best}%` : "recommended"} column is the catalog-wide pick, and an outlined cell is that product's own cheapest level.
+                      <span className="font-semibold"> Lost profit</span> and <span className="font-semibold">Buffer holding</span> totals match the Calibration tab and add up to Total $/yr;
                       <span className="font-semibold"> Cash in buffer</span> is one-time working capital, not a yearly cost.
                     </div>
                   </div>
@@ -1154,7 +1153,7 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
 
           {res.tierAnalysis?.lossMakingSkus?.length > 0 && (
             <div className={`text-[15px] rounded-xl border px-4 py-3 bg-[var(--t-warn-soft)] border-[var(--t-warn-line)] text-[var(--t-warn)]`}>
-              <span className="font-semibold">Priced at or below cost:</span> {res.tierAnalysis.lossMakingSkus.join(", ")}. These lose money on every sale, so a stockout forgoes no profit and more safety stock would only lose money faster — they&apos;re <span className="font-semibold">excluded from the cost comparison</span>. This is a pricing/cost issue, not an inventory one: review the price or cost on the product&apos;s page.
+              <span className="font-semibold">Priced at or below cost:</span> {res.tierAnalysis.lossMakingSkus.join(", ")}. These lose money on every sale, so a stockout costs no profit and they&apos;re <span className="font-semibold">excluded from the cost comparison</span>. It&apos;s a pricing issue, not an inventory one: review the price or cost on the product&apos;s page.
             </div>
           )}
 
@@ -1169,7 +1168,7 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
             <div className={`px-4 py-2 text-[14px] ${muted} leading-relaxed border-b border-[var(--t-line)]`}>
               <span className="font-semibold">vs naive</span> under 1 is good, <span className="font-semibold">runs high/low</span> near 0 is unbiased,{" "}
               <span className="font-semibold">band hit rate</span> should sit near 80%. <span className="font-semibold">Avg miss</span> runs high on slow sellers
-              no matter how good the model is — lean on <span className="font-semibold">vs naive</span> there.
+              whatever the model, so lean on <span className="font-semibold">vs naive</span> there.
             </div>
             <table className="w-full"><Head /><tbody>
               {(res.byEngine || []).map((r) => <Row key={r.engine} r={r} name={r.engine} />)}

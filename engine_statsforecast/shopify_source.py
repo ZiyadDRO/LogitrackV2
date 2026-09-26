@@ -32,6 +32,8 @@ import time
 import datetime
 import pandas as pd
 
+from forecast_engine import daily_price_rollup, carry_listed_price
+
 try:
     import requests
 except ImportError:                      # pragma: no cover
@@ -71,13 +73,13 @@ def _graphql(url, headers, query, variables, retries=6):
             continue
         if resp.status_code == 404:
             raise ShopifyError(
-                "Shopify returned 404 Not Found — the store handle is almost certainly wrong. "
+                "Shopify returned 404 Not Found, so the store name is almost certainly wrong. "
                 "Enter only the part before .myshopify.com (e.g. 'my-store' for "
                 "my-store.myshopify.com), not the display name or a custom domain.")
         if resp.status_code in (401, 403):
             raise ShopifyError(
-                f"Shopify rejected the token (HTTP {resp.status_code}) — check the Admin API access "
-                "token (shpat_…) and that the custom app is installed with read_orders / read_products scopes.")
+                f"Shopify rejected the token (HTTP {resp.status_code}). Check the Admin API access "
+                "token (shpat_…) and that the custom app is installed with read_orders and read_products scopes.")
         if resp.status_code != 200:
             raise ShopifyError(f"Shopify API error {resp.status_code}: {resp.text[:200]}")
         body = resp.json()
@@ -90,8 +92,8 @@ def _graphql(url, headers, query, variables, retries=6):
                 continue
             raise ShopifyError(f"Shopify GraphQL: {str(errs)[:200]}")
         return body
-    raise ShopifyError("Shopify is rate-limiting this token and the limit didn't clear "
-                       "after several retries — wait a minute and try again.")
+    raise ShopifyError("Shopify is rate-limiting this token and it didn't clear after "
+                       "several retries. Wait a minute and try again.")
 
 
 def _money(node, *path):
@@ -186,34 +188,68 @@ def fetch_sales(shop=None, token=None, api_version=None, days=None) -> pd.DataFr
     if not records:
         raise ShopifyError("No orders returned from Shopify for the requested window.")
     df = pd.DataFrame(records)
-    df = (df.groupby(["sku", "sku_name", "date"], as_index=False)
-            .agg({"units_sold": "sum", "price": "last", "on_promotion": "max"}))
+    # Units-weighted day price plus a mixed-day flag, instead of whichever line rang up
+    # last. See forecast_engine.daily_price_rollup.
+    df = daily_price_rollup(df)
 
-    # ── CRITICAL: fill in zero-sale days ──────────────────────────────────────
-    # Shopify only returns line items for days that HAD an order, so every day with
-    # no sale is simply ABSENT from the data. If we hand that straight to the engine
-    # it averages demand over sale-days only — it never sees the zeros — and badly
-    # OVER-forecasts (a product that sells on 1 day in 7 looks like it sells every
-    # day), and the demand classifier can't detect intermittency (ADI ≈ 1 always).
-    # An uploaded Excel sheet has a row per calendar day; we make Shopify match by
-    # reindexing each SKU to a continuous daily calendar from its first to its last
-    # sale and filling the gaps: 0 units sold, not on promotion, and the shelf price
-    # carried forward (the listed price persisted on days nothing happened to sell).
+    # THE WINDOW ENDS AT THE LAST COMPLETE DAY — NOT TODAY. See the long note in
+    # square_source.fetch_sales: filling through today asserts a full day of no sales for
+    # a day that is still in progress, and the nightly sync runs minutes after midnight.
+    _last_complete = datetime.datetime.now().astimezone().date() - datetime.timedelta(days=1)
+    df = df[pd.to_datetime(df["date"]).dt.date <= _last_complete]
+    if df.empty:
+        raise ShopifyError(
+            "Shopify returned orders, but none from a completed day yet.")
+    return _fill_zero_days(df, window_end=_last_complete)
+
+
+def _fill_zero_days(df: pd.DataFrame, window_end=None) -> pd.DataFrame:
+    """Fill in the days that had no sale.
+
+    Shopify only returns line items for days that HAD an order, so every day with no sale
+    is simply ABSENT. Handing that to the engine averages demand over sale-days only — it
+    never sees the zeros — so it badly OVER-forecasts (a product selling on 1 day in 7
+    looks like it sells every day) and the demand classifier can't detect intermittency
+    (ADI ~ 1 always). An uploaded sheet has a row per calendar day; this makes Shopify
+    match: 0 units, not on promotion, and the shelf price carried forward (the listed
+    price persisted on days nothing happened to sell).
+
+    EVERY SERIES ENDS AT `window_end`, NOT AT ITS OWN LAST SALE — see the long note in
+    square_source._fill_zero_days for what ending at the last sale cost: a series could
+    never end in a zero, so `trailing_zero_run` was structurally always 0, `is_dormant`
+    could never fire, and a discontinued product was forecast at its old rate forever.
+
+    `window_end` is a parameter rather than an implicit "now" so this is testable against
+    fixed dates; fetch_sales passes the real window end.
+    """
+    df = df.copy()
     df["date"] = pd.to_datetime(df["date"])
+    end = pd.to_datetime(window_end).normalize() if window_end is not None else None
     filled = []
     for (sku, sku_name), g in df.groupby(["sku", "sku_name"]):
         g = g.set_index("date").sort_index()
-        full = pd.date_range(g.index.min(), g.index.max(), freq="D")
+        stop = g.index.max() if end is None else max(g.index.max(), end)
+        full = pd.date_range(g.index.min(), stop, freq="D")
         g = g.reindex(full)
         g["units_sold"]   = g["units_sold"].fillna(0)
         g["on_promotion"] = g["on_promotion"].fillna(0)
-        g["price"]        = g["price"].ffill().bfill()
+        g = carry_listed_price(g)       # last SINGLE price, never a mixed day's blend
         g["sku"], g["sku_name"] = sku, sku_name
         g.index.name = "date"
         filled.append(g.reset_index())
-    df = pd.concat(filled, ignore_index=True)
-    df["date"] = df["date"].dt.strftime("%Y-%m-%d")
-    return df[["date", "sku", "sku_name", "units_sold", "price", "on_promotion"]]
+    out = pd.concat(filled, ignore_index=True)
+    out["date"] = out["date"].dt.strftime("%Y-%m-%d")
+    return out[["date", "sku", "sku_name", "units_sold", "price", "price_mixed", "on_promotion"]]
+
+
+def _dec(x):
+    """Shopify Money scalars arrive as strings ("24.99"), older versions as objects."""
+    if isinstance(x, dict):
+        x = x.get("amount")
+    try:
+        return None if x in (None, "") else float(x)
+    except (TypeError, ValueError):
+        return None
 
 
 def fetch_catalog_meta(shop=None, token=None, api_version=None) -> dict:
@@ -238,6 +274,8 @@ def fetch_catalog_meta(shop=None, token=None, api_version=None) -> dict:
             nodes {
               sku
               inventoryQuantity
+              price
+              compareAtPrice
               inventoryItem { unitCost { amount } }
             }
           }
@@ -255,6 +293,18 @@ def fetch_catalog_meta(shop=None, token=None, api_version=None) -> dict:
                 if sku:
                     meta[sku] = {"category": cat, "stock": v.get("inventoryQuantity"),
                                  "cost": _money(v, "inventoryItem", "unitCost", "amount")}
+                    # Shopify's own sale mechanism: `price` is what the customer pays and
+                    # `compareAtPrice`, when higher, is the original the storefront shows
+                    # struck through. No end date — Shopify doesn't keep one on the
+                    # variant — so a sale is treated as running until a sync sees it stop.
+                    price = _dec(v.get("price"))
+                    compare = _dec(v.get("compareAtPrice"))
+                    if price is not None and price > 0:
+                        listed = compare if (compare is not None and compare > price) else price
+                        meta[sku].update({"listPrice": round(listed, 2),
+                                          "currentPrice": round(price, 2)})
+                        if listed > price:
+                            meta[sku]["discountName"] = "Sale (compare-at price)"
         info = conn.get("pageInfo") or {}
         if info.get("hasNextPage"):
             cursor = info.get("endCursor")

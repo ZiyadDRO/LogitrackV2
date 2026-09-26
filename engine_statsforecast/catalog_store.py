@@ -76,6 +76,9 @@ def save(catalog: dict, extras: dict | None = None) -> bool:
                 "frame": f"{i}.csv",
                 "sku_name": entry.get("sku_name"),
                 "attrs": entry.get("attrs") or {},
+                # Which attributes a person set by hand. Those win over what the store's
+                # own data says on a re-sync; the rest follow the store.
+                "attrs_set": sorted(entry.get("attrs_set") or []),
                 "mode": entry.get("mode") or "uploaded",
                 "filename": entry.get("filename"),
                 "sources": entry.get("sources") or [],
@@ -137,6 +140,7 @@ def load() -> tuple[dict, dict]:
             catalog[sid] = {
                 "df": df.sort_values("ds").reset_index(drop=True),
                 "attrs": meta.get("attrs") or {},
+                "attrs_set": list(meta.get("attrs_set") or []),
                 "sku_name": meta.get("sku_name") or sid,
                 "mode": meta.get("mode") or "uploaded",
                 "filename": meta.get("filename"),

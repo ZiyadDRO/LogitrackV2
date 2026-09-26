@@ -502,7 +502,7 @@ Write a concise, professional reorder brief that:
 5. Lists SKUs needing no action as "healthy" in one line
 6. Closes with one sentence on the biggest risk if any deadline is missed
 
-Use plain text. No markdown, no asterisks. Use • for bullet points.
+Use plain text. No markdown, no asterisks. Use • for bullet points. Never use em dashes or en dashes.
 Write it so it could be forwarded directly to a procurement team.
 
 Fleet data:
@@ -527,7 +527,7 @@ ${skuLines}`;
       recordGroqUsage(data, 600);
       const ran = groqToolsRan(data);
       if (ran) console.warn(`[ai] built-in tools ran despite being disabled: ${ran}`);
-      setBrief((ran ? `[warning: the model ran ${ran} — external content may have influenced this brief]\n\n` : "")
+      setBrief((ran ? `[warning: the model ran ${ran}, so outside content may have influenced this brief]\n\n` : "")
         + (data?.choices?.[0]?.message?.content || "Could not generate brief."));
     } catch {
       setBrief("Failed to generate brief. Check your API key.");
@@ -838,6 +838,7 @@ KEY MECHANICS you must reason with correctly:
 • Uploaded data is re-anchored so the latest row is treated as "yesterday," and stock levels are auto-seeded from the most recent Units_In_Stock; the forecast begins from today.
 Be concise, specific, and actionable. Use plain language — no markdown headers, no asterisks.
 Use bullet lines with the • character when listing multiple items. Keep answers focused and scannable.
+Never use em dashes (—) or en dashes (–); use commas, colons, periods or parentheses instead.
 When asked about a folder, aggregate data across all SKUs in that folder and answer at the folder level.
 Today's date is ${new Date().toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" })}.
 
@@ -906,7 +907,7 @@ ${fleetCtx}
       // context as the catalogue, and the reader has to know that before trusting it.
       const ran = groqToolsRan(data);
       if (ran) console.warn(`[ai] built-in tools ran despite being disabled: ${ran}`);
-      const reply = (ran ? `[warning: the model ran ${ran} — this answer may include content from outside your data]\n\n` : "")
+      const reply = (ran ? `[warning: the model ran ${ran}, so this answer may include content from outside your data]\n\n` : "")
         + (data?.choices?.[0]?.message?.content || "No response received.");
       setMessages(prev => [...prev, { role: "assistant", content: reply }]);
     } catch (err) {
@@ -1033,8 +1034,8 @@ ${fleetCtx}
                 <div className="text-[14px] text-[var(--t-dim)] font-medium">Ask anything about your inventory</div>
                 <div className="text-[14px] text-[var(--t-soft)]">
                   {folderCount > 0
-                    ? `Folders, forecasts, reorders, events — all in context`
-                    : "3-month forecasts, parameters, events, POs — all in context"}
+                    ? `Knows your folders, forecasts, reorders and events`
+                    : "Knows your 3-month forecasts, settings, events and POs"}
                 </div>
               </div>
               <div className="grid grid-cols-1 gap-2">
@@ -1078,7 +1079,7 @@ ${fleetCtx}
           )}
           <div className="flex items-center justify-between mb-2">
             <button onClick={() => setIncludeHistory(v => !v)} role="switch" aria-checked={includeHistory}
-              title="Feeds the assistant each SKU's complete monthly + recent daily sales history so it can answer historical questions. It's large, so it needs a higher Groq tier than the free 12,000 tokens/minute."
+              title="Gives the assistant each SKU's full monthly and recent daily sales so it can answer questions about past sales. It's large, so it needs a Groq tier above the free 12,000 tokens/minute."
               className="flex items-center gap-2 text-[13px] text-[var(--t-dim)] hover:text-[var(--t-soft)] transition-colors select-none">
               <span className={`relative h-4 w-7 rounded-full transition-colors shrink-0 ${includeHistory ? "bg-[var(--t-accent-soft)]" : "bg-[var(--t-line)]"}`}>
                 <span className={`absolute top-0.5 h-3 w-3 rounded-full bg-[var(--t-panel)] transition-all ${includeHistory ? "left-[14px]" : "left-0.5"}`} />

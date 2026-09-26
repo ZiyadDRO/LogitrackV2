@@ -72,7 +72,7 @@ export async function fetchJson(url, opts = undefined, label = "Request") {
     }
     return data;
   } catch {
-    reportApiError(`${label} failed — is the backend running?`);
+    reportApiError(`${label} failed. Is the backend running?`);
     return null;
   }
 }
