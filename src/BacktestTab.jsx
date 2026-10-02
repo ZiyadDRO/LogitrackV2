@@ -231,16 +231,6 @@ const ciCovers = (ci, target) => Array.isArray(ci) && ci.length === 2 && target 
 const HMUTED = "text-[var(--t-dim)]";
 const HTEXT = "text-[var(--t-ink)]";
 const hpct = (v) => (v == null ? "-" : `${v}%`);
-/* A holiday's rate is how far off its weeks have typically run, as a share of their
-   forecast: 0.30 = "within about ±30%". It is set per own-years of history (1, 2, 3+),
-   and fewer years means a wider figure. Shown as the established-product figure, with
-   the wider one for newer products underneath, instead of three bare percentages. */
-const pct = (v) => `±${Math.round(v * 100)}%`;
-const hrateMain = (r) => (r?.["3"] ?? r?.all) == null ? "-" : pct(r["3"] ?? r.all);
-const hrateNewer = (r) => {
-  const main = r?.["3"] ?? r?.all, newer = Math.max(r?.["1"] ?? 0, r?.["2"] ?? 0);
-  return main != null && newer > main + 1e-9 ? `${pct(newer)} for products with under 3 years of history` : null;
-};
 const tierRow = (hc, tier) => (hc?.tiers || []).find((t) => t.tier === tier)
   || (hc?.tiers || []).find((t) => t.tier === 95);
 
@@ -250,18 +240,13 @@ function HolidayWeeksTable({ hc, lm }) {
   return (
     <div>
       <div className={`px-4 py-3 border-b text-[15px] leading-relaxed border-[var(--t-line)] bg-[var(--t-accent-soft)] text-[var(--t-soft)]`}>
-        Orders placed before a holiday carry temporary extra stock. How much depends on how unpredictable that
-        holiday has been in this store: <span className="font-semibold">±30%</span> means its weeks have usually come in
-        within about 30% of forecast, either way. Products with less holiday history get a wider figure, so more cover.
-        A holiday gets its own figure once it has {hc?.rules?.minOwnWindows ?? 100}+ tested weeks across{" "}
-        {hc?.rules?.minOwnSkus ?? 20}+ products; until then it uses the figure measured on all holidays together.
+        Orders placed before a holiday carry temporary extra stock, sized by how far off that holiday&apos;s weeks have
+        run in this store. Below: how often holiday weeks would have stayed in stock without it and with it.
       </div>
       <div className="overflow-x-auto">
         <table className="w-full">
           <thead><tr>
             <th className={th} title="The holiday stretch the forecast reshapes.">Holiday</th>
-            <th className={th} title="How far off this holiday's weeks have typically come in, as a share of their forecast. It sets how much extra stock is carried before it. Products with less holiday history get the wider figure underneath.">How unpredictable</th>
-            <th className={th} title="Measured on this holiday alone, or on all holidays together because it doesn't have enough tested weeks of its own yet.">Measured on</th>
             <th className={th} title="Replayed weeks that carried this holiday.">Weeks</th>
             <th className={th} title="Products those weeks came from.">Products</th>
             <th className={th} title="How often those weeks stayed in stock at the 95% level, without the cover and with it.">In stock: without → with</th>
@@ -275,11 +260,6 @@ function HolidayWeeksTable({ hc, lm }) {
               <tr key={r.key} className="border-t border-[var(--t-line)]"
                 title={thin ? "Too few tested weeks to read: 2 or 3 weeks give 0% or 100% by chance." : undefined}>
                 <td className={`px-3 py-2 text-[15px] font-semibold ${HTEXT}`}>{r.name}{thin && <span className={`ml-1.5 text-[13px] font-normal ${HMUTED}`}>few weeks</span>}</td>
-                <td className="px-3 py-2">
-                  <div className={`text-[15px] font-semibold tabular-nums ${HTEXT}`}>{hrateMain(r.rates)}</div>
-                  {hrateNewer(r.rates) && <div className={`text-[13px] ${HMUTED}`}>{hrateNewer(r.rates)}</div>}
-                </td>
-                <td className={`px-3 py-2 text-[14px] ${r.rateSource === "own" ? HTEXT : HMUTED}`}>{r.rateSource === "own" ? "this holiday" : "all holidays"}</td>
                 <td className={`px-3 py-2 text-[15px] tabular-nums ${HMUTED}`}>{r.windows}</td>
                 <td className={`px-3 py-2 text-[15px] tabular-nums ${HMUTED}`}>{r.skus}</td>
                 <td className="px-3 py-2 text-[15px] tabular-nums">
@@ -295,7 +275,7 @@ function HolidayWeeksTable({ hc, lm }) {
         </table>
       </div>
       <div className={`px-4 py-2 text-[14px] ${HMUTED} border-t border-[var(--t-line)]`}>
-        {hc.windows} holiday weeks and {hc.ordinaryWindows} ordinary weeks replayed. All holidays together: {hrateMain(hc.shared)}{hrateNewer(hc.shared) ? ` (${hrateNewer(hc.shared)})` : ""}.
+        {hc.windows} holiday weeks and {hc.ordinaryWindows} ordinary weeks replayed.
       </div>
     </div>
   );
@@ -310,8 +290,6 @@ function HolidayWeeksCard({ hc, tier, lm, money, holidayCost }) {
   const minWeeks = hc.minWeeksShown ?? 5;
   const rows = all.filter((r) => r.windows >= minWeeks);
   const few = all.filter((r) => r.windows < minWeeks);
-  const shared = rows.filter((r) => r.rateSource !== "own");
-  const own = rows.filter((r) => r.rateSource === "own");
   const th = `text-left text-[14px] uppercase tracking-widest font-bold ${HMUTED} px-3 py-2`;
   return (
     <div className="bg-[var(--t-panel)] border-[var(--t-line)] border rounded-2xl overflow-hidden">
@@ -336,10 +314,10 @@ function HolidayWeeksCard({ hc, tier, lm, money, holidayCost }) {
           <th className={th} title="Typical extra units carried before this holiday, per product, at the 95% level.">Typical cover (95%)</th>
         </tr></thead>
         <tbody>
-          {[...own, ...shared].map((r) => (
+          {rows.map((r) => (
             <tr key={r.key} className="border-t border-[var(--t-line)]">
               <td className={`px-3 py-2 text-[15px] font-semibold ${HTEXT}`}>
-                {r.name}{r.rateSource !== "own" && <span className={HMUTED}>*</span>}
+                {r.name}
               </td>
               <td className={`px-3 py-2 text-[15px] tabular-nums ${HMUTED}`}>{r.windows}</td>
               <td className="px-3 py-2 text-[15px] tabular-nums">
@@ -352,12 +330,11 @@ function HolidayWeeksCard({ hc, tier, lm, money, holidayCost }) {
         </tbody>
       </table>
       </div>
-      {(shared.length > 0 || few.length > 0) && (
+      {few.length > 0 && (
         <div className={`px-4 py-2 text-[14px] ${HMUTED} border-t border-[var(--t-line)] space-y-0.5`}>
-          {shared.length > 0 && <div>* Shares one rate measured on every holiday together: not enough of its own weeks yet to measure it alone.</div>}
           {few.length > 0 && (
             <div>
-              Also covered, with too few tested weeks to show a rate of their own ({minWeeks}+ needed):{" "}
+              Also covered, but with too few tested weeks to show here yet ({minWeeks}+ needed):{" "}
               {few.map((r) => r.name).join(", ")}.
             </div>
           )}
