@@ -15,6 +15,7 @@
 // ─────────────────────────────────────────────────────────────────────────
 import React, { useState, useEffect } from 'react';
 import { loadStorage, saveStorage } from './lib/storage';
+import { CLASSES_STORAGE_KEY } from './lib/restoreClasses';  // skuId → attributes (survives reloads)
 import { fetchJson } from './lib/api';
 import { todayStr } from './lib/helpers';
 import { GROQ_URL, GROQ_MODEL, GROQ_LOW_REASONING } from './lib/ai';
@@ -22,7 +23,6 @@ import { terminal, fs, MONO, SANS, scrim } from './lib/theme';
 
 const ATTR_KEYS = ["category", "subcategory", "brand", "size", "color", "material", "style"];
 const INFO_STORAGE_KEY = "logitrack_product_descriptions";
-const CLASSES_STORAGE_KEY = "logitrack_product_classes";   // skuId → attributes (survives reloads)
 const NOTES_STORAGE_KEY = "logitrack_group_notes";         // clusterKey → AI one-liner
 const AUTOCLASSIFIED_KEY = "logitrack_autoclassified_ids"; // skuIds we've already auto-classified once
 const NO_CATEGORY_RE = /\b(no category|uncategorized|uncategorised|unknown category|no product family)\b/i;
@@ -199,7 +199,9 @@ export default function CategorizePanel({ skuList = [], api = "http://localhost:
     const nextSeen = { ...seen };
     skuList.forEach(s => { nextSeen[s.id] = true; });
     saveStorage(AUTOCLASSIFIED_KEY, nextSeen);
-    classifyAndApply();
+    // A pass that failed (no key, a wrong key, no internet) didn't classify anything, so
+    // it mustn't use up the products' one automatic pass: un-mark them for next time.
+    classifyAndApply().then((ok) => { if (!ok) saveStorage(AUTOCLASSIFIED_KEY, seen); });
   }, [open, embedded, apiKey, skuList, phase, classes, groups]);
 
   function buildClassificationPrompt() {
@@ -263,8 +265,8 @@ ${lines}`
 
   async function classifyAndApply() {
     setErr(null);
-    if (!skuList.length) { setErr("No products loaded yet."); return; }
-    if (!apiKey) { setErr("Add an AI API key before classifying product descriptions."); return; }
+    if (!skuList.length) { setErr("No products loaded yet."); return false; }
+    if (!apiKey) { setErr("Add an AI API key before classifying product descriptions."); return false; }
     setPhase("classifying");
     // Step 1 — AI: read the descriptions and extract tags (this is the same Groq
     // call that powers "Ask AI"). Failures here are about the AI key / connection.
@@ -277,7 +279,7 @@ ${lines}`
       });
       const data = await res.json();
       const parsed = parseJsonLoose(data?.choices?.[0]?.message?.content);
-      if (!parsed) { setErr("Couldn't parse the AI response. Try again or simplify the info."); setPhase("idle"); return; }
+      if (!parsed) { setErr("Couldn't parse the AI response. Try again or simplify the info."); setPhase("idle"); return false; }
       next = {};
       Object.entries(parsed).forEach(([skuId, attrs]) => {
         if (attrs && typeof attrs === "object") {
@@ -288,18 +290,19 @@ ${lines}`
           next[skuId] = merged;
         }
       });
-      if (!Object.keys(next).length) { setErr("The AI did not return any usable tags."); setPhase("idle"); return; }
+      if (!Object.keys(next).length) { setErr("The AI did not return any usable tags."); setPhase("idle"); return false; }
       setClasses(c => ({ ...c, ...next }));
     } catch {
       setErr("Couldn't reach the AI to read your product descriptions. Check your AI key and internet connection.");
       setPhase("idle");
-      return;
+      return false;
     }
     // Step 2 — backend: save the tags and re-group the catalog. A failure here is the
     // local backend, NOT the AI — so say so (the tags were generated fine).
     try {
       setPhase("applying");
       await saveAttributes(next, "ai");
+      return true;
     } catch (e) {
       if (e?.kind === "http") {
         setErr(`Tags were generated, but the backend rejected the save (HTTP ${e.status}). Check the LogiTrack terminal window for the error.`);
@@ -309,6 +312,7 @@ ${lines}`
     } finally {
       setPhase("idle");
     }
+    return false;
   }
 
   async function removeTag(skuId, key) {

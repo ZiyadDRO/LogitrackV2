@@ -4,6 +4,7 @@ import BacktestTab from './BacktestTab';
 import LiveAccuracy from './components/LiveAccuracy';
 import { useArrivalPrompts, ArrivalPromptList, ArrivalPromptBanner } from './components/ArrivalPrompts';
 import CategorizePanel from './CategorizePanel';
+import { restoreSavedClasses } from './lib/restoreClasses';
 import SkuDetailPanel from './components/SkuDetailPanel';
 import SupplierPanel from './components/SupplierPanel';
 import UploadPanel from './components/UploadPanel';
@@ -304,6 +305,20 @@ export default function App() {
   }, [loadSkuList, loadScorecardRows, skuList, skuParams, openPOs]);
 
   useEffect(() => { loadSkuList(skuParams, openPOs); }, []);
+
+  /* Put back categories this browser saved that the server doesn't have (a fresh copy of
+     the project, or one whose saved catalog was lost). Runs whenever the set of products
+     changes, so it also catches a store whose products arrive after the page opened —
+     the Grouping tab only ever tried at the moment it opened, which on a fresh copy was
+     before the store had loaded, and everything stayed Uncategorized. */
+  const restoredFor = useRef("");
+  useEffect(() => {
+    const ids = skuList.map(s => s.id);
+    const key = [...ids].sort().join("|");
+    if (!ids.length || key === restoredFor.current) return;
+    restoredFor.current = key;
+    restoreSavedClasses(API, ids).then(n => { if (n > 0) onCatalogChanged(); });
+  }, [skuList]); // eslint-disable-line react-hooks/exhaustive-deps
 
   /* The backend restores a saved catalog on boot and re-fits it on a background thread,
      which takes about a minute. The page asks for the product list ONCE on mount, so

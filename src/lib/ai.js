@@ -22,7 +22,12 @@
 // The real fix is to stop shipping the key to the browser at all: proxy these
 // calls through the FastAPI backend (POST /api/ai/complete) with the key in a
 // server-side env var. Then it never reaches a client.
-export const GROQ_API_KEY = import.meta.env?.VITE_GROQ_API_KEY ?? "";
+// A placeholder left in .env.local ("<key>", "gsk_your_key_here", "PASTE_KEY_HERE") counts
+// as no key. It used to be sent as one: every AI call failed with an unhelpful error, and
+// the Grouping tab's one automatic pass was spent on it, leaving products Uncategorized.
+const RAW_GROQ_KEY = String(import.meta.env?.VITE_GROQ_API_KEY ?? "").trim();
+export const GROQ_API_KEY =
+  /^gsk_[A-Za-z0-9]{20,}$/.test(RAW_GROQ_KEY) && !/your_key_here/i.test(RAW_GROQ_KEY) ? RAW_GROQ_KEY : "";
 
 export const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
 // Groq retires models on a published schedule, and this one has now been bitten

@@ -182,5 +182,23 @@ M.delete_connection(cid)
 check("its set-aside products go with it", M._WS.store_slot(cid) not in M._WS.parked(), M._WS.parked())
 check("the spreadsheet stays loaded", skus() == ["SHEET-A"], skus())
 
+print("\na store connected with nothing loaded (a fresh copy of the project)")
+_list_active, _showing = M._CONN.list_active, M._showing_store_id
+_saved_cat, _saved_status = dict(M._catalog), M._restore_state.get("status")
+try:
+    M._CONN.list_active = lambda: [{"id": "fresh", "source": "square"}]
+    M._showing_store_id = lambda: "fresh"
+    with M._state_lock:
+        M._catalog.clear()
+    M._restore_state["status"] = "empty"
+    check("is stale, so it syncs now instead of sitting empty until tonight", M._data_is_stale() is True)
+    M._restore_state["status"] = "restoring"
+    check("but not while a saved catalog is still being restored", M._data_is_stale() is False)
+finally:
+    M._CONN.list_active, M._showing_store_id = _list_active, _showing
+    with M._state_lock:
+        M._catalog.update(_saved_cat)
+    M._restore_state["status"] = _saved_status
+
 print(f"\n{'All workspace tests passed.' if not FAILURES else f'{len(FAILURES)} FAILED: ' + ', '.join(FAILURES)}")
 sys.exit(1 if FAILURES else 0)

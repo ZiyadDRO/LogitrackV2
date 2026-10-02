@@ -3961,15 +3961,20 @@ def _data_is_stale() -> bool:
     synced" after every restart — whereas the age of the newest sale is exactly what
     anyone means by "is the tool current", and it fixes itself.
 
-    Empty catalog → not stale. There is nothing to refresh, and syncing on boot into an
-    empty app would surprise someone who just wanted to upload a spreadsheet. Likewise
-    with the store paused (or spreadsheets loaded): there is nothing to sync them from.
+    No store connected, or the store paused (spreadsheets loaded) → not stale: there is
+    nothing to sync from, and syncing on boot would surprise someone who just wanted to
+    upload a spreadsheet.
+
+    A store connected but NOTHING loaded → stale. That is a fresh copy of the project, or
+    one whose saved catalog was lost: the connection is on, and the app sat empty until
+    the nightly slot, or until someone switched the connection off and on to make it load.
+    Not while a saved catalog is still being restored from disk, which fills it shortly.
     """
     if not _CONN.list_active() or _showing_store_id() is None:
         return False
     with _state_lock:
         if not _catalog:
-            return False
+            return _restore_state.get("status") != "restoring"
         newest = None
         for e in _catalog.values():
             df = e.get("df")

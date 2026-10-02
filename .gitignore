@@ -75,3 +75,14 @@ engine_statsforecast/sync_state.json.tmp
 # Which days this install's store is closed. Runtime settings, like the sync ledger.
 engine_statsforecast/closed_days.json
 engine_statsforecast/closed_days.json.tmp
+
+# Saved store logins. Holds the Square / Shopify ACCESS TOKEN in plain text: committing it
+# published a live Square token in a public repo, and made every fresh clone show the
+# store as "connected" with nothing loaded. Each install connects once from the app.
+engine_statsforecast/connections.json
+engine_statsforecast/connections.json.tmp
+# Today's sales and the shelf prices last read from the store. Runtime state.
+engine_statsforecast/today_sales.json
+engine_statsforecast/today_sales.json.tmp
+engine_statsforecast/live_prices.json
+engine_statsforecast/live_prices.json.tmp
