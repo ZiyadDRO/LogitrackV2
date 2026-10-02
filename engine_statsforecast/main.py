@@ -1047,7 +1047,20 @@ def _hs_report(df, future_fc, lv, own, off, to_real, settings, shift=0, peer_inf
                          "ofDays": len(_offs), "missingNoData": int(_nofile),
                          "missingOther": int(len(_offs) - len(common) - _nofile),
                          "weight": yv.get("weight")})
-        xs = [(dd["x"], dd["date"]) for dd in days if not dd["closed"]]
+        # "× a typical day" is read off the units the bars draw, so the tallest bar is the
+        # busiest day and a taller bar never reads as a smaller multiple. It used to come
+        # from the holiday's shape alone, before the weekday pattern, the blend into the
+        # stretch's edges and any promotion, so a Saturday could stand taller than a day
+        # marked 1.58x. Days past the end of the forecast (no units) keep the shape's
+        # figure and are left out of busiest/quietest.
+        _u = [dd["units"] for dd in days if not dd["closed"] and dd["units"] is not None]
+        _med_u = float(np.median(_u)) if _u else 0.0
+        if _med_u > 0:
+            for dd in days:
+                if dd["units"] is not None and not dd["closed"]:
+                    dd["x"] = round(dd["units"] / _med_u, 2)
+        xs = [(dd["x"], dd["date"]) for dd in days
+              if not dd["closed"] and (_med_u <= 0 or dd["units"] is not None)]
         hi = max(xs) if xs else (1.0, None)
         lo = min(xs) if xs else (1.0, None)
         n_own, n_pool = int(L.get("years") or 0), int(L.get("pool") or 0)
