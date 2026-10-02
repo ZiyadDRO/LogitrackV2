@@ -263,21 +263,26 @@ function HolidayWeeksTable({ hc, lm }) {
             <th className={th} title="Typical extra units carried before this holiday at the 95% level.">Avg cover</th>
           </tr></thead>
           <tbody>
-            {rows.map((r) => (
-              <tr key={r.key} className="border-t border-[var(--t-line)]">
-                <td className={`px-3 py-2 text-[15px] font-semibold ${HTEXT}`}>{r.name}</td>
+            {rows.map((r) => {
+              const thin = r.windows < (hc?.minWeeksShown ?? 5);
+              const tn = (v) => (thin ? HMUTED : tone(lm, lvlSvc(v, 95)));
+              return (
+              <tr key={r.key} className="border-t border-[var(--t-line)]"
+                title={thin ? "Too few tested weeks to read: 2 or 3 weeks give 0% or 100% by chance." : undefined}>
+                <td className={`px-3 py-2 text-[15px] font-semibold ${HTEXT}`}>{r.name}{thin && <span className={`ml-1.5 text-[13px] font-normal ${HMUTED}`}>few weeks</span>}</td>
                 <td className={`px-3 py-2 text-[14px] ${r.rateSource === "own" ? HTEXT : HMUTED}`}>{r.rateSource === "own" ? "own" : "shared"}</td>
                 <td className={`px-3 py-2 text-[15px] tabular-nums ${HTEXT}`}>{hrateText(r.rates)}</td>
                 <td className={`px-3 py-2 text-[15px] tabular-nums ${HMUTED}`}>{r.windows}</td>
                 <td className={`px-3 py-2 text-[15px] tabular-nums ${HMUTED}`}>{r.skus}</td>
                 <td className="px-3 py-2 text-[15px] tabular-nums">
-                  <span className={tone(lm, lvlSvc(r.without, 95))}>{hpct(r.without)}</span>
+                  <span className={tn(r.without)}>{hpct(r.without)}</span>
                   <span className={HMUTED}> → </span>
-                  <span className={`font-bold ${tone(lm, lvlSvc(r.with, 95))}`}>{hpct(r.with)}</span>
+                  <span className={`font-bold ${tn(r.with)}`}>{hpct(r.with)}</span>
                 </td>
                 <td className={`px-3 py-2 text-[15px] tabular-nums ${HMUTED}`}>{r.avgCoverUnits == null ? "-" : `+${Math.round(r.avgCoverUnits)} units`}</td>
               </tr>
-            ))}
+              );
+            })}
           </tbody>
         </table>
       </div>
@@ -289,9 +294,14 @@ function HolidayWeeksTable({ hc, lm }) {
 }
 
 function HolidayWeeksCard({ hc, tier, lm, money, holidayCost }) {
-  const rows = hc?.byHoliday || [];
+  const all = hc?.byHoliday || [];
   const t = tierRow(hc, tier);
-  if (!rows.length || !t) return null;
+  if (!all.length || !t) return null;
+  // Every figure at the level in use, so the sentence and the rows agree.
+  const at = (r) => r.byTier?.[String(t.tier)] || { with: r.with, without: r.without };
+  const minWeeks = hc.minWeeksShown ?? 5;
+  const rows = all.filter((r) => r.windows >= minWeeks);
+  const few = all.filter((r) => r.windows < minWeeks);
   const shared = rows.filter((r) => r.rateSource !== "own");
   const own = rows.filter((r) => r.rateSource === "own");
   const th = `text-left text-[14px] uppercase tracking-widest font-bold ${HMUTED} px-3 py-2`;
@@ -306,14 +316,16 @@ function HolidayWeeksCard({ hc, tier, lm, money, holidayCost }) {
           <span className={`font-semibold ${tone(lm, lvlSvc(t.holidayWith, t.ordinary ?? 95))}`}>{hpct(t.holidayWith)}</span>,
           against {hpct(t.ordinary)} of ordinary weeks.
           {holidayCost != null && <> It costs about {money(holidayCost)}/yr to carry, included in the totals below.</>}
+          {" "}Figures are at the {t.tier}% level in use.
         </p>
       </div>
+      <div className="overflow-x-auto">
       <table className="w-full">
         <thead><tr>
           <th className={th}>Holiday</th>
           <th className={th} title="Replayed weeks that carried this holiday.">Weeks tested</th>
-          <th className={th} title="How often those weeks stayed in stock at the 95% level, without the holiday cover and with it.">In stock: without → with</th>
-          <th className={th} title="Typical extra units carried before this holiday, per product, at the 95% level.">Typical cover</th>
+          <th className={th} title="How often those weeks stayed in stock at the level in use, without the holiday cover and with it.">In stock: without → with</th>
+          <th className={th} title="Typical extra units carried before this holiday, per product, at the 95% level.">Typical cover (95%)</th>
         </tr></thead>
         <tbody>
           {[...own, ...shared].map((r) => (
@@ -323,17 +335,24 @@ function HolidayWeeksCard({ hc, tier, lm, money, holidayCost }) {
               </td>
               <td className={`px-3 py-2 text-[15px] tabular-nums ${HMUTED}`}>{r.windows}</td>
               <td className="px-3 py-2 text-[15px] tabular-nums">
-                <span className={HMUTED}>{hpct(r.without)} → </span>
-                <span className={`font-bold ${tone(lm, lvlSvc(r.with, 95))}`}>{hpct(r.with)}</span>
+                <span className={HMUTED}>{hpct(at(r).without)} → </span>
+                <span className={`font-bold ${tone(lm, lvlSvc(at(r).with, t.ordinary ?? 95))}`}>{hpct(at(r).with)}</span>
               </td>
               <td className={`px-3 py-2 text-[15px] tabular-nums ${HMUTED}`}>{r.avgCoverUnits == null ? "-" : `+${Math.round(r.avgCoverUnits)} units`}</td>
             </tr>
           ))}
         </tbody>
       </table>
-      {shared.length > 0 && (
-        <div className={`px-4 py-2 text-[14px] ${HMUTED} border-t border-[var(--t-line)]`}>
-          * Shares one rate measured on every holiday together: not enough of its own weeks yet to measure it alone.
+      </div>
+      {(shared.length > 0 || few.length > 0) && (
+        <div className={`px-4 py-2 text-[14px] ${HMUTED} border-t border-[var(--t-line)] space-y-0.5`}>
+          {shared.length > 0 && <div>* Shares one rate measured on every holiday together: not enough of its own weeks yet to measure it alone.</div>}
+          {few.length > 0 && (
+            <div>
+              Also covered, with too few tested weeks to show a rate of their own ({minWeeks}+ needed):{" "}
+              {few.map((r) => r.name).join(", ")}.
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -882,7 +901,7 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
                           <h3 className={`text-[16.5px] font-bold ${text}`}>What each protection level would have cost you</h3>
                           <p className={`text-[15px] ${muted} mt-1 max-w-[640px] leading-relaxed`}>
                             Replayed against your own sales history. More protection means fewer missed sales but more
-                            cash tied up in buffer stock. The best level is where the two together cost least.
+                            cash tied up in buffer stock. The best level is where they cost least together.
                           </p>
                         </div>
                         <div className={`flex gap-4 text-[14.5px] ${muted}`}>

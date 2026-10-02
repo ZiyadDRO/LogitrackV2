@@ -69,6 +69,9 @@ FIT_MIN_SHARE = 0.25
 # backtest replays far fewer holiday windows than it has holidays, and a handful of them,
 # all covered, would otherwise read as "holidays need no cover".
 PRIOR_WINDOWS = 60
+# A holiday with fewer replayed weeks than this is listed for analysts but not shown to
+# clients on its own: two or three weeks give an in-stock rate of 0% or 100% by chance.
+MIN_WEEKS_SHOWN = 5
 # The protection level the rate is calibrated at.
 FIT_Z = 1.6449
 GRID = np.round(np.arange(0.0, 2.0001, 0.01), 2)
@@ -372,8 +375,10 @@ def summary(frame: pd.DataFrame, z_by_pct: dict, fitted: dict | None) -> dict | 
                      "rates": {b: table.get(b) for b in ("1", "2", "3")},
                      "fitWindows": (meta.get(k) or {}).get("windows", 0),
                      "with": rate("cov_95", m), "without": rate("cov0_95", m),
+                     "byTier": {str(p): {"with": rate(f"cov_{p}", m), "without": rate(f"cov0_{p}", m)}
+                                for p in sorted(z_by_pct) if f"cov_{p}" in frame.columns},
                      "avgCoverUnits": round(float(cover.mean()), 1) if len(cover) else None})
-    return {"tiers": tiers, "byHoliday": rows,
+    return {"tiers": tiers, "byHoliday": rows, "minWeeksShown": MIN_WEEKS_SHOWN,
             "windows": int(is_h.sum()), "ordinaryWindows": int((~is_h).sum()),
             "target": rates.get("target"),
             "rules": {"minOwnWindows": MIN_OWN_WINDOWS, "minOwnSkus": MIN_OWN_SKUS,
