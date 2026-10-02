@@ -45,6 +45,15 @@ STORE_PATH = os.environ.get(
 # means a tick was missed rather than that we are simply between ticks.
 STALE_AFTER_SECONDS = 4500.0
 
+# THE SHAPE OF A DAY. Each hourly reading is also a point on the store's running total for
+# the day, so a finished day says what share of its sales had happened by each hour. Averaged
+# over days, that is how a day that changed price at 2 PM is split: the share of a normal
+# day's sales that comes after 2 PM gets the new price's effect. Only days read into the
+# late evening count (a day whose last reading was at 3 PM would look like it stopped then),
+# and until PROFILE_MIN_DAYS of them exist the day is taken as even across its 24 hours.
+PROFILE_MIN_DAYS = 14
+PROFILE_LAST_READING_HOUR = 21.0
+
 
 def utcnow() -> _dt.datetime:
     return _dt.datetime.now(_dt.timezone.utc)
@@ -59,6 +68,8 @@ class TodaySales:
         self._day: str | None = None          # the local day these counts belong to
         self._units: dict[str, float] = {}
         self._fetched_at: str | None = None
+        self._curve: list = []                # [(local hour, store units so far)] today
+        self._profile = {"days": 0, "cum": [0.0] * 25}
         self.load()
 
     # -- persistence --
@@ -70,6 +81,11 @@ class TodaySales:
                 self._day = raw.get("day")
                 self._units = {str(k): float(v) for k, v in (raw.get("units") or {}).items()}
                 self._fetched_at = raw.get("fetchedAt")
+                self._curve = [(float(h), float(u)) for h, u in (raw.get("curve") or [])]
+                pr = raw.get("profile") or {}
+                if isinstance(pr.get("cum"), list) and len(pr["cum"]) == 25:
+                    self._profile = {"days": int(pr.get("days") or 0),
+                                     "cum": [float(x) for x in pr["cum"]]}
             except (FileNotFoundError, json.JSONDecodeError, AttributeError, TypeError, ValueError):
                 self._day, self._units, self._fetched_at = None, {}, None
         return self
@@ -79,12 +95,53 @@ class TodaySales:
             tmp = self.path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as fh:
                 json.dump({"version": 1, "day": self._day, "units": self._units,
-                           "fetchedAt": self._fetched_at}, fh)
+                           "fetchedAt": self._fetched_at, "curve": self._curve,
+                           "profile": self._profile}, fh)
             os.replace(tmp, self.path)        # atomic: a crash can't truncate it
         return self
 
     # -- writes --
-    def record(self, day: str, units: dict, *, now=None) -> dict:
+    def _fold_day(self):
+        """Add the finished day's running total to the average shape, if it was read late
+        enough to show the whole day."""
+        pts = sorted(self._curve)
+        self._curve = []
+        if not pts or pts[-1][0] < PROFILE_LAST_READING_HOUR:
+            return
+        total = max(u for _, u in pts)
+        if total <= 0:
+            return
+        hs = [0.0] + [h for h, _ in pts]
+        us = [0.0] + [min(u, total) for _, u in pts]
+        cum = []
+        for k in range(25):
+            if k >= hs[-1]:
+                cum.append(1.0)
+                continue
+            j = max(i for i in range(len(hs)) if hs[i] <= k)
+            h0, h1, u0, u1 = hs[j], hs[j + 1], us[j], us[j + 1]
+            frac = 0.0 if h1 <= h0 else (k - h0) / (h1 - h0)
+            cum.append((u0 + frac * (u1 - u0)) / total)
+        self._profile = {"days": self._profile["days"] + 1,
+                         "cum": [a + b for a, b in zip(self._profile["cum"], cum)]}
+
+    def share_after(self, hour: float) -> tuple[float, str]:
+        """(share of a normal day's sales that come after `hour`, "store" or "even")."""
+        h = min(max(float(hour), 0.0), 24.0)
+        with self._lock:
+            n = self._profile["days"]
+            if n < PROFILE_MIN_DAYS:
+                return (24.0 - h) / 24.0, "even"
+            cum = [c / n for c in self._profile["cum"]]
+        k = min(int(h), 23)
+        before = cum[k] + (h - k) * (cum[k + 1] - cum[k])
+        return max(0.0, min(1.0, 1.0 - before)), "store"
+
+    def profile_days(self) -> int:
+        with self._lock:
+            return int(self._profile["days"])
+
+    def record(self, day: str, units: dict, *, now=None, hour=None) -> dict:
         """Replace the whole day's counts. Not additive, on purpose.
 
         Each fetch asks Square for the day's orders from the beginning, so the answer it
@@ -100,9 +157,13 @@ class TodaySales:
             except (TypeError, ValueError):
                 continue
         with self._lock:
+            if self._day is not None and self._day != str(day):
+                self._fold_day()
             self._day = str(day)
             self._units = clean
             self._fetched_at = ts
+            if hour is not None:
+                self._curve.append((round(float(hour), 3), float(sum(clean.values()))))
             self.save()
         return {"day": self._day, "skus": len(clean),
                 "units": float(sum(clean.values())), "at": ts}
@@ -116,6 +177,7 @@ class TodaySales:
         """
         with self._lock:
             if self._day is not None and self._day != str(current_day):
+                self._fold_day()
                 self._day, self._units, self._fetched_at = None, {}, None
                 self.save()
                 return True
@@ -169,5 +231,6 @@ class TodaySales:
     def purge(self):
         with self._lock:
             self._day, self._units, self._fetched_at = None, {}, None
+            self._curve, self._profile = [], {"days": 0, "cum": [0.0] * 25}
             self.save()
         return self

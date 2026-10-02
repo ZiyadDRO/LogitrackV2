@@ -17,13 +17,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 import pandas as pd
 import numpy as np
-import datetime, io, os, json, math, threading, time
+import datetime, io, os, json, math, re, threading, time
 from contextlib import asynccontextmanager
 from zoneinfo import ZoneInfo
 from dateutil.relativedelta import relativedelta
 
 from forecast_engine import (analyse_price, daily_price_rollup, price_evidence, price_bounds, extrapolation_distance, extrapolation_uncertainty, cap_price_ratio, MAX_PRICE_LIFT, PRICE_EXTRAP_FLOOR, PRICE_EXTRAP_CEIL, PRICE_EFFECT_UNC, BORROWED_EFFECT_UNC, STORE_BORROWED_EFFECT_UNC, classify_demand, compute_safe_price_range, fill_daily_gaps,
-                             sparse_subtype, is_dormant as _FE_is_dormant)
+                             sparse_subtype, is_dormant as _FE_is_dormant,
+                             is_off_season as _FE_off_season)
 import router as R
 import datetime as _dt
 import forecast_log as _FL
@@ -57,7 +58,27 @@ _today_sales = _TS.TodaySales()
 import live_prices as _LP
 _live = _LP.LivePrices()
 import holiday_calendar as _HOL
+import rush as _RUSH
+import workspace as _WS
+# One-off rushes (rush.py) are left out of the training data. LOGITRACK_RUSH=0 switches it off.
+RUSH_ON = os.environ.get("LOGITRACK_RUSH", "1").strip() not in ("0", "false", "no")
+# Slow sellers' rates are worked out with the season taken out (see build_entry).
+# LOGITRACK_SLOW_DESEASON=0 switches it off.
+SLOW_DESEASON = os.environ.get("LOGITRACK_SLOW_DESEASON", "1").strip() not in ("0", "false", "no")
 _holidays = _HOL.HolidaySettings()
+import closed_days as _CD
+import holiday_shape as _HS
+import store_clock as _CLOCK
+import bands as _BANDS
+# Holidays are handled by holiday_shape: each holiday's stretch keeps the forecast's own
+# total and only the day-by-day split follows past years. (The earlier layer, a +X% lift
+# per holiday measured against the weeks around it, was measured worse and removed; so was
+# flattening past stretches before training, which lifted the quiet days after a peak and
+# forecast a December gift item +118% for January.) LOGITRACK_HOLIDAY_SHAPES=0 switches the
+# stretches off, for comparison runs.
+HOLIDAY_SHAPES = os.environ.get("LOGITRACK_HOLIDAY_SHAPES", "1").strip() not in ("0", "false", "no")
+_hs_peer_cache: dict = {}
+_closed = _CD.ClosedDays()
 import exports
 from engines import ProphetEngine, GlobalPooledEngine, IntermittentEngine, MovingAverageEngine
 import engines as _ENGINES
@@ -69,6 +90,8 @@ YEARLY_MIN_DAYS = int(getattr(_ENGINES, "YEARLY_MIN_DAYS", 450))
 @asynccontextmanager
 async def _lifespan(app):
     # Replaces the deprecated @app.on_event("startup") hook.
+    _reconcile_workspace()
+    _apply_store_zone()      # before warmup: every fit starts from "today"
     warmup()
     # The nightly sync is what makes the tool current without anyone asking. It is a daemon
     # thread, so it lives and dies with this process — which is the honest limit: keep the
@@ -91,6 +114,18 @@ async def _lifespan(app):
 
 
 app = FastAPI(lifespan=_lifespan)
+
+# A numpy number (np.bool_, np.float64, ...) anywhere in a reply made FastAPI fail the whole
+# request with a 500, which the page can only report as "Failed to fetch". Replies are
+# built from pandas/numpy results in many places, so they're converted here once rather
+# than trusting every one of them to cast.
+try:
+    import fastapi.encoders as _FE
+    for _t in (np.bool_, np.int8, np.int16, np.int32, np.int64, np.uint8, np.uint16, np.uint32,
+               np.uint64, np.float16, np.float32, np.float64):
+        _FE.ENCODERS_BY_TYPE[_t] = lambda v: v.item()
+except (ImportError, AttributeError):       # a test's stand-in for fastapi
+    pass
 
 # All catalog/cache mutation happens under this lock. State is module-level and
 # requests can interleave (or two tabs can race an upload against a re-categorize);
@@ -277,6 +312,46 @@ def _drop_backtest_state(why: str) -> None:
     print(f"Measured protection levels dropped — {why}. Estimates apply until a new test runs.")
 
 
+def _forget_backtest_memory() -> None:
+    """Forget the IN-MEMORY run only, leaving what's on disk alone. Used when the loaded
+    workspace changes: the run in memory described the products that were just set
+    aside, and its tiers must not be read (or re-saved) against another workspace's."""
+    globals()["_last_backtest"] = None
+    globals()["_last_backtest_rows"] = None
+    globals()["_last_backtest_combos"] = []
+    globals()["_backtest_tier_cache"] = {}
+    globals()["_backtest_exclusions"] = {}
+    globals()["_backtest_fingerprint"] = None
+    globals()["_backtest_parts"] = {}
+    _backtest_inputs.clear()
+
+
+# Bumped every time the loaded products are set aside or swapped for another workspace's.
+# A backtest records it when it snapshots the catalog and throws its result away if it
+# moved: a run measured on store A's products must never be saved into store B's.
+_ws_epoch = 0
+
+
+def _bump_ws_epoch() -> None:
+    globals()["_ws_epoch"] = _ws_epoch + 1
+
+
+def _bt_stamp() -> tuple:
+    """What a backtest was measured against: (workspace epoch, per-product fingerprint).
+    Call under _state_lock, at the same moment the catalog is snapshotted."""
+    return (_ws_epoch, _BTSTORE.fingerprint_parts(_catalog))
+
+
+def _bt_stamp_still_valid(stamp: tuple) -> bool:
+    """The run can be kept: same workspace, and its data only grew (a sync that added
+    days) rather than being rewritten or replaced. Call under _state_lock."""
+    ep, parts = stamp
+    if ep != _ws_epoch:
+        return False
+    now = _BTSTORE.fingerprint_parts(_catalog)
+    return parts == now or _BTSTORE.grew_only(parts, now)
+
+
 # Model-switch history, persisted to disk so the overview banner survives restarts.
 # Shape: {"events": [ {skuId, skuName, fromRoute, toRoute, fromLabel, toLabel,
 #                       reason, date} ], "lastRoute": {sku_id: route}}
@@ -305,6 +380,70 @@ def _save_switches(state: dict) -> None:
 _switch_state = _load_switches()
 
 
+def _current_prices() -> dict:
+    """{sku: today's regular shelf price}, the price the protection level is chosen for
+    (the live list price when the store reports one, else the last recorded price, moved
+    by any price change already in force)."""
+    out = {}
+    for sid, e in (_cache() or {}).items():
+        p = e.get("regular_price") or e.get("effective_price") or e.get("last_price")
+        try:
+            if p is not None and float(p) > 0:
+                out[str(sid)] = round(float(p), 2)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+# A shelf price has to move by more than this before the measured tiers are re-priced.
+PRICE_DRIFT_TOLERANCE = 0.01
+
+
+def _reprice_backtest_if_price_moved() -> bool:
+    """Re-price the stored run when a product's shelf price has moved since.
+
+    The backtest's money (lost profit per unit short) is margin, and margin is price
+    minus cost. Cost and fee edits already re-priced the run; a price change never did,
+    so a product whose price went up kept a protection level chosen for the old margin.
+    Re-pricing is arithmetic over the stored windows (backtest.recost), not a refit."""
+    global _last_backtest_rows
+    try:
+        with _state_lock:
+            rows = _last_backtest_rows
+            if rows is None or not len(rows) or not _last_backtest or "price" not in rows.columns:
+                return False
+            now = _current_prices()
+            last = (rows.sort_values("cutoff").groupby(rows["sku"].astype(str))["price"].last()
+                    if "cutoff" in rows.columns else rows.groupby(rows["sku"].astype(str))["price"].last())
+            moved = [sid for sid, p in now.items()
+                     if sid in last.index and float(last[sid] or 0) > 0
+                     and abs(p - float(last[sid])) / float(last[sid]) > PRICE_DRIFT_TOLERANCE]
+            if not moved:
+                return False
+            BT = _bt()
+            inputs = _backtest_inputs or {}
+            econ = {sid: {"price": p} for sid, p in now.items()}
+            for sid, c in (inputs.get("costs") or {}).items():
+                if sid in econ and c:
+                    econ[sid].update({"cost": c, "fees": (inputs.get("fees") or {}).get(sid, 0.0)})
+            holding = inputs.get("holdingPct")
+            holding = int(holding) if holding is not None else int(_session_holding_pct)
+            sink = []
+            res = BT.recost(_last_backtest, rows, econ, holding_pct=holding,
+                            combos=_last_backtest_combos or None, rows_sink=sink)
+            if sink:
+                _last_backtest_rows = sink[0]
+            _cache_backtest_tiers(res)
+            _record_backtest_inputs({**{k: v for k, v in econ.items() if v.get("cost")}}, holding)
+            _store_backtest_result(res, "reprice")
+            _persist_backtest()
+            print(f"Shelf price moved for {len(moved)} product(s); measured protection levels re-priced.")
+            return True
+    except Exception as exc:                                  # noqa: BLE001 — never fail a refit over it
+        print(f"Re-pricing the backtest skipped ({exc}).")
+        return False
+
+
 def _effective_sku_costs(payload_costs: dict | None) -> dict | None:
     """Best-known cost per SKU: the sheet's Cost column as the floor, Scorecard entries
     layered on top (Scorecard wins — the user may have corrected the sheet).
@@ -321,6 +460,10 @@ def _effective_sku_costs(payload_costs: dict | None) -> dict | None:
         # cost used to drop the fee back to zero. Both halves survive now.
         base = merged.get(str(sid), {})
         merged[str(sid)] = {**base, **{k: x for k, x in (v or {}).items() if x is not None}}
+    # Today's shelf price travels with the costs, so every window is valued at the margin
+    # the product earns NOW (see backtest._run_cutoff).
+    for sid, p in _current_prices().items():
+        merged.setdefault(sid, {})["price"] = p
     return merged or None
 
 
@@ -362,19 +505,44 @@ def _recent_switches(days: int = SWITCH_BANNER_DAYS) -> list:
     return sorted(out, key=lambda e: e["date"], reverse=True)
 
 
-# "Today" is evaluated FRESH on every call (never frozen at import) and, when the
-# browser's timezone has been reported, in the USER's timezone — so a server that
-# runs past midnight or sits in another region still shows the right current date.
-_APP_TZ = None   # IANA name (e.g. "America/New_York"); set from the frontend
+# "Today" is evaluated FRESH on every call (never frozen at import), on the STORE's
+# clock: see store_clock.py and _apply_store_zone below. _APP_TZ mirrors that zone for
+# the code that reads it directly.
+_APP_TZ = _CLOCK.DEFAULT_ZONE
+_CLOCK.set_zone(_APP_TZ)
 
 
 def set_timezone(tz):
+    """Kept so older pages that still send their browser's zone don't break. It no longer
+    sets anything: the viewer's zone isn't the store's (someone checking from another
+    city, or two people in different zones on a hosted server, used to move "today" for
+    everyone). The store's zone comes from _apply_store_zone."""
+    return None
+
+
+def _resolve_store_zone() -> tuple:
+    """(zone, source) for what's loaded now. In order: the zone picked on the Closed days
+    panel ("set"), then the one the connected store reports ("square" / "shopify"), then
+    Eastern Time ("default")."""
+    try:
+        z = _closed.get_zone(_current_slot())
+    except Exception:                                   # noqa: BLE001 — never block on this
+        z = {}
+    if _CLOCK.valid(z.get("set")):
+        return z["set"], "set"
+    if _CLOCK.valid(z.get("detected")):
+        return z["detected"], (z.get("detectedFrom") or "store")
+    return _CLOCK.DEFAULT_ZONE, "default"
+
+
+def _apply_store_zone() -> str:
+    """Point the app's clock at the store's zone. Called at startup, when the loaded
+    workspace changes, when a store reports its zone, and when the zone is picked."""
     global _APP_TZ
-    if tz and tz != _APP_TZ:
-        try:
-            ZoneInfo(tz); _APP_TZ = tz   # validate before storing
-        except Exception:
-            pass
+    zone, _src = _resolve_store_zone()
+    _CLOCK.set_zone(zone)
+    _APP_TZ = zone
+    return zone
 
 
 def today():
@@ -620,7 +788,7 @@ def _levels_text(ev) -> str:
 
 
 def _price_response(method, eng, has_price, price_varied, elast, evidence=None, bounds=None,
-                    borrowed=None, borrowed_range=None, borrowed_bounds=None) -> dict:
+                    borrowed=None, borrowed_range=None, borrowed_bounds=None, known_range=None) -> dict:
     """Will a price change move THIS product's forecast — and if not, why not?
 
     There are two unrelated mechanisms behind "price affects the forecast", one per kind
@@ -667,6 +835,46 @@ def _price_response(method, eng, has_price, price_varied, elast, evidence=None, 
                          (f"Borrowed from {borrowed['peers']} {_who}, because this one doesn't have "
                           f"{need_n} prices with {need_d}+ days yet: a 10% price cut lifts units about {lift}%. "
                           f"The band is wider because it's borrowed.{rng}"))}
+    e = elast or {}
+    if e.get("basis") == "measured" and e.get("elasticity"):
+        # The product's own cross-checked reading (uplift.price_reading), on any route.
+        el = float(e["elasticity"])
+        lift = round(((0.9 ** el) - 1) * 100)
+        how = e.get("method")
+        _kr = known_range or ((ev.get("rangeLo"), ev.get("rangeHi")) if ev.get("rangeLo") is not None else None)
+        _n = int(e.get("changes") or 0)
+        _chg = f"{_n} price change{'s' if _n != 1 else ''}"
+        if how == "both":
+            src = (f"Measured two ways from its own sales, the same months across years and the weeks "
+                   f"before vs after its {_chg}, and they agree")
+        elif how == "before-after":
+            src = (f"Measured from its own {_chg}, comparing the weeks before and after each one "
+                   f"against products whose price didn't change then")
+        else:
+            src = (f"Measured from its own sales, comparing the same months across years "
+                   f"({e.get('points')} single-price days with sales)")
+        clamp = ""
+        if _kr and bounds:
+            clamp = (f" Known range: ${_kr[0]:.2f} to ${_kr[1]:.2f}. Outside it the response is extrapolated "
+                     f"in percentages and eases off the further you go, approaching {MAX_PRICE_LIFT:g}× on cuts "
+                     f"and -80% on rises, with more safety stock. Prices below ${bounds[0]:.2f} or above "
+                     f"${bounds[1]:.2f} count as those limits.")
+        return {"applies": True, "reason": "measured", "method": how, "elasticity": el,
+                "sameMonths": e.get("sameMonths"), "beforeAfter": e.get("beforeAfter"),
+                "bounds": list(bounds) if bounds else None,
+                "knownRange": list(_kr) if _kr else None, "levels": ev.get("levels"),
+                "mixedDays": mixed,
+                "text": f"{src}: a 10% price cut lifts units about {lift}%, and a price change shifts the forecast to match.{clamp}"}
+    if e.get("basis") == "readings-disagree":
+        def _pct(x):
+            return f"{round(((0.9 ** float(x)) - 1) * 100)}%"
+        return {"applies": False, "reason": "readings-disagree",
+                "sameMonths": e.get("sameMonths"), "beforeAfter": e.get("beforeAfter"),
+                "levels": ev.get("levels"), "mixedDays": mixed,
+                "text": (f"Price isn't used. Its two readings disagree: the same months across years say a 10% "
+                         f"cut lifts units about {_pct(e['sameMonths'])}, the weeks around its price changes say "
+                         f"about {_pct(e['beforeAfter'])}. Something besides price is moving its sales, so "
+                         f"neither can be trusted yet.")}
     if evidence is not None and not ev.get("usable"):
         need_d = ev.get("minDays", 30); need_n = ev.get("levelsRequired", 2)
         if ev.get("reason") == "levels-too-close":
@@ -677,7 +885,8 @@ def _price_response(method, eng, has_price, price_varied, elast, evidence=None, 
                              f"together to show how demand responds.{mixed_note}")}
         return {"applies": False, "reason": "too-few-price-levels", "levels": ev.get("levels"),
                 "mixedDays": mixed, "need": need_d, "levelsNeeded": need_n,
-                "text": (f"Price isn't used yet. It needs {need_n} prices with {need_d}+ days each. "
+                "text": (f"Price isn't used yet. It needs {need_n} prices with {need_d}+ days each, or a "
+                         f"price change with a week or more of sales on each side. "
                          f"So far: {_levels_text(ev)}.{mixed_note}")}
     clamp_note = ""
     if bounds is not None and ev.get("rangeLo") is not None:
@@ -693,8 +902,8 @@ def _price_response(method, eng, has_price, price_varied, elast, evidence=None, 
         if inv:
             return {"applies": False, "reason": "inverted", "detail": inv,
                     "text": ("Price isn't used. This product sold more at its higher prices, so "
-                             "something other than price drove its sales, and no other product in the "
-                             "store has a price history to borrow from yet.")}
+                             "something other than price drove its sales and its prices can't "
+                             "show how demand responds.")}
         if not price_varied:
             return {"applies": False, "reason": "price-never-varied",
                     "text": ("Price isn't used: it has never changed in this product's sales "
@@ -704,17 +913,7 @@ def _price_response(method, eng, has_price, price_varied, elast, evidence=None, 
                 "text": ("Price is an input to this product's model, so this change shifts the forecast."
                          + clamp_note)}
 
-    e = elast or {}
     basis = e.get("basis") or "none"
-    if basis == "measured" and e.get("elasticity"):
-        el = float(e["elasticity"])
-        lift = round(((0.9 ** el) - 1) * 100)
-        return {"applies": True, "reason": "measured", "elasticity": el,
-                "bounds": list(bounds) if bounds else None, "levels": ev.get("levels"),
-                "mixedDays": mixed,
-                "text": (f"Measured from {e.get('points')} single-price days with sales: a 10% price "
-                         f"cut lifts units about {lift}%, and this change shifts the forecast to match."
-                         + clamp_note)}
     need = getattr(_UP, "MIN_PRICE_POINTS", 30)
     if basis == "too-few-points":
         return {"applies": False, "reason": basis, "points": e.get("points"), "need": need,
@@ -727,90 +926,281 @@ def _price_response(method, eng, has_price, price_varied, elast, evidence=None, 
     if basis == "positive-elasticity-ignored":
         return {"applies": False, "reason": basis,
                 "text": ("Price isn't used. This product sold more at its higher prices, so "
-                         "something other than price drove its sales, and no other product in the "
-                         "store has a price history to borrow from yet.")}
+                         "something other than price drove its sales and its prices can't "
+                         "show how demand responds.")}
     return {"applies": False, "reason": basis,
             "text": "This product's forecast doesn't respond to price changes."}
 
 
-def _holiday_report(effects, assign, df, today, held_days, has_price, settings):
-    """What the product page shows under Holidays: for every period checked, what this
-    product's own sales did in each past year, the lift the forecast uses (with its
-    day-by-day shape), where it came from, and when it next applies. Periods switched off
-    for this product are listed as such."""
-    t = pd.Timestamp(today).date()
-    first = df["ds"].min().date() if len(df) else t
+_closed_memo: dict = {"snap": None, "days": frozenset()}
+
+
+def _store_closed_days() -> frozenset:
+    """Days nothing sold anywhere in the store (every product on file sold 0) while the
+    store normally sells: the store was closed. Worked out once per set of products."""
+    # The raw catalogue, not the published one: this is asked while products are being
+    # (re)built, before anything is published.
+    ents = list(_catalog.values())
+    snap = tuple(sorted(id(e.get("df")) for e in ents))
+    if _closed_memo["snap"] == snap:
+        return _closed_memo["days"]
+    frames = [e["df"][["ds", "y"]] for e in ents
+              if hasattr(e.get("df"), "columns") and len(e["df"])]
+    days = frozenset()
+    if len(frames) >= 3:
+        g = pd.concat(frames).groupby("ds")["y"].agg(["sum", "count"])
+        if float(g["sum"].median()) >= 5.0:
+            days = frozenset(pd.to_datetime(g.index[(g["sum"] <= 0) & (g["count"] >= 3)]).date)
+    _closed_memo.update({"snap": snap, "days": days})
+    return days
+
+
+def _hs_who(n, info):
+    """Who a holiday pattern is steadied by, in words: the category, the store products
+    that move with it, or (when that's unknown, e.g. in a backtest) similar products."""
+    info = info or {}
+    cat = info.get("category")
+    s = "" if n == 1 else "s"
+    eq = ", none counting for more than a typical one" if n > 1 else ""
+    if info.get("scope") == "category" and cat:
+        return f"{n} other {cat} product{s}{eq}"
+    if info.get("scope") == "store":
+        alone = f"it's the only {cat} product" if cat else "it has no category"
+        mv = "moves" if n == 1 else "move"
+        return f"{n} product{s} elsewhere in the store that {mv} with it ({alone}){eq}"
+    return f"{n} similar product{s}"
+
+
+def _hs_report(df, future_fc, lv, own, off, to_real, settings, shift=0, peer_info=None):
+    """What the product page shows under Holidays (holiday_shape): for every holiday, its
+    next stretch day by day (units already sold, then this forecast's units, the same
+    numbers the chart shows), how its busiest and quietest days compare with a typical day
+    of the stretch, and the same stretch in past years for comparison."""
+    fut = {}
+    for x, v in zip(future_fc["ds"], future_fc["yhat"]):
+        fut[to_real(pd.Timestamp(x).date())] = max(float(v), 0.0)
+    hist = {to_real(pd.Timestamp(x).date()): float(v) for x, v in zip(df["ds"], df["y"])}
+    if not fut:
+        return None
+    f0, f1 = min(fut), max(fut)
+    closed = _closed_real()
+    A = _HS.assign(f0 - datetime.timedelta(days=40), f1 + datetime.timedelta(days=40), settings)
     rows = []
-    for k in _HOL.selected_keys(settings) + list((settings or {}).get("exclude") or []):
-        e = effects.get(k) or {}
-        name = e.get("name") or _HOL.name_of(k, settings)
-        nxt = None
-        runs = [r for r in _HOL.occurrences(assign, k) if r[1] >= t]
-        if runs:
-            nxt = {"start": runs[0][0].isoformat(), "end": runs[0][1].isoformat()}
-        elif k not in (settings or {}).get("exclude", []):
-            w = [x for x in _HOL.windows_for(k, t, t + datetime.timedelta(days=400), settings) if x[1] >= t]
-            if w:
-                nxt = {"start": w[0][0].isoformat(), "end": w[0][1].isoformat()}
-        m = float(e.get("multiplier") or 1.0)
-        n, peers, src = e.get("occurrences", 0), e.get("peers", 0), e.get("source")
-        applied = bool(e.get("applied")) and src != "none"
-        _scope = "other products in the store" if e.get("peerScope") == "store" else "similar products"
-        if k in ((settings or {}).get("exclude") or []):
-            status, why = "off", "Switched off for this product. Its dates are treated like any other day."
-        elif not e:
-            status = "unseen"
-            why = ("Not in this product's sales history yet, and similar products don't show it either."
-                   if first > t - datetime.timedelta(days=330) else
-                   "Not enough sales on these dates to tell, and no similar products to compare with.")
-        elif src == "none":
-            status = "discounted"
-            why = (f"Every past {name} was discounted and no price response is known, so the holiday "
-                   f"can't be told apart from the deal. Not applied.")
-        elif applied:
-            status = "applied"
-            why = (f"From {n} past year{'s' if n != 1 else ''} of this product's sales." if src == "own" else
-                   f"Not in this product's own history yet, so this comes from {peers} {_scope}."
-                   if src == "peers" else
-                   f"From {n} past year{'s' if n != 1 else ''} of its own sales, combined with {peers} {_scope}.")
+    for key, name, _rule, before, after, core_label in _HS.EVENTS:
+        occ = sorted((o for o in _HS.occurrences(f0 - datetime.timedelta(days=30), f0 + datetime.timedelta(days=400),
+                                                 settings) if o["key"] == key and o["span"][1] >= f0),
+                     key=lambda o: o["anchor"])
+        if not occ:
+            continue
+        o = occ[0]
+        a_, b_ = o["core"]
+        span = [o["span"][0] + datetime.timedelta(days=i) for i in range((o["span"][1] - o["span"][0]).days + 1)]
+        mine = [d for d in span if (A.get(d) or (None,))[0] == key and A[d][1] == o["anchor"]]
+        L = (lv or {}).get(key) or {}
+        r = L.get("r") or {}
+        levels_ = [r.get((d - o["anchor"]).days, 1.0) for d in mine]
+        med = float(np.median(levels_)) if levels_ else 1.0
+        days, total, core_units, sold, partial = [], 0.0, 0.0, 0.0, False
+        for d, lvl in zip(mine, levels_):
+            is_past = d < f0
+            u = hist.get(d) if is_past else fut.get(d)
+            if d in closed:
+                u = 0.0
+            if u is None and not is_past:
+                partial = True
+            days.append({"date": d.isoformat(), "units": (round(u, 1) if u is not None else None),
+                         "sold": bool(is_past), "closed": d in closed, "core": a_ <= d <= b_,
+                         "x": round(lvl / med, 2) if med > 0 else 1.0})
+            if u is not None:
+                total += u
+                if a_ <= d <= b_:
+                    core_units += u
+                if is_past:
+                    sold += u
+        # The same days in past years, lined up on the holiday: only the days this year's
+        # stretch has, and only years that had nearly all of them (another holiday may have
+        # taken some that year), so a comparison is never 7 days against 4.
+        _offs = {(d - o["anchor"]).days: (a_ <= d <= b_) for d in mine}
+        past = []
+        for yv in ((own or {}).get(key) or {}).get("years") or []:
+            bo = yv.get("byOff") or {}
+            common = [q for q in _offs if q in bo]
+            if not _offs or len(common) < 0.8 * len(_offs):
+                continue
+            # Why a day is missing matters to whoever reads the comparison: the sales
+            # history may simply stop before it (the most recent year, usually), or
+            # another holiday may have claimed it that year.
+            try:
+                _anc = datetime.date.fromisoformat(str(yv["anchor"])[:10])
+                _nofile = sum(1 for q in _offs if q not in bo
+                              and (_anc + datetime.timedelta(days=q)) not in hist)
+            except Exception:                               # noqa: BLE001
+                _nofile = 0
+            past.append({"year": int(yv["anchor"][:4]), "start": yv["start"], "end": yv["end"],
+                         "units": round(sum(bo[q] for q in common), 1),
+                         "coreUnits": round(sum(bo[q] for q in common if _offs[q]), 1),
+                         "days": len(common), "allDays": len(common) == len(_offs),
+                         "ofDays": len(_offs), "missingNoData": int(_nofile),
+                         "missingOther": int(len(_offs) - len(common) - _nofile),
+                         "weight": yv.get("weight")})
+        xs = [(dd["x"], dd["date"]) for dd in days if not dd["closed"]]
+        hi = max(xs) if xs else (1.0, None)
+        lo = min(xs) if xs else (1.0, None)
+        n_own, n_pool = int(L.get("years") or 0), int(L.get("pool") or 0)
+        if key in (off or ()):
+            status = "off"
+        elif not mine:
+            status = "merged"
+        elif not L or (n_own == 0 and n_pool < 2):
+            status = "new"
+        elif _HS.significant(L):
+            status = "moves"
         else:
-            status = "none"
-            _yrs = e.get("years") or []
-            if _yrs and max(abs(y["pct"]) for y in _yrs) >= 10:
-                why = ("Past years moved, but not clearly enough on this many sales to rule out chance. "
-                       "Forecast as ordinary days, with the possibility covered by safety stock.")
-            elif n:
-                why = "Past years don't show a change on these dates, so they're forecast as ordinary days."
-            else:
-                why = f"{'Other products in the store' if e.get('peerScope') == 'store' else 'Similar products'} don't show a clear change on these dates."
-        days = []
-        sh = e.get("shape") if applied else None
-        if sh and nxt:
-            d0 = datetime.date.fromisoformat(nxt["start"])
-            off0 = assign.offsets.get(d0, (0, len(sh)))[0] if hasattr(assign, "offsets") else 0
-            for i, f in enumerate(sh[off0:]):
-                d = d0 + datetime.timedelta(days=i)
-                days.append({"date": d.isoformat(), "pct": round((m * f - 1) * 100)})
-        rows.append({"key": k, "name": name, "status": status, "active": status == "applied",
-                     "multiplier": round(m, 3), "pct": round((m - 1) * 100) if status == "applied" else 0,
-                     "source": src, "occurrences": n, "peers": peers, "skipped": e.get("skipped", 0),
-                     "measuredPct": (round((e["rawOwn"] - 1) * 100) if e.get("rawOwn") else None),
-                     "years": e.get("years") or [], "days": days, "custom": _HOL.is_custom(k),
-                     "next": nxt, "text": why})
-    order = {"applied": 0, "discounted": 1, "none": 2, "unseen": 3, "off": 4}
-    rows.sort(key=lambda r: (order[r["status"]], (r["next"] or {}).get("start") or "9999"))
-    notes = []
-    if held_days:
-        notes.append(f"On {held_days} past days, the holiday's lift is taken back out before the everyday level "
-                     f"and season are learned, so a spike never inflates ordinary weeks. It is added back on its own dates.")
-    if not has_price:
-        notes.append("No prices are on file, so a holiday's lift includes any deals you ran then. "
-                     "Don't also enter those same deals as events.")
-    return {"effects": rows, "heldDays": int(held_days), "notes": notes, "applied": False,
-            "checked": len(rows),
-            "windows": [{"key": r["key"], "name": r["name"], "start": r["next"]["start"],
-                         "end": r["next"]["end"], "pct": r["pct"]}
-                        for r in rows if r["active"] and r["next"]]}
+            status = "flat"
+        last = past[-1] if past else None
+        # No percentage when the history was moved to end yesterday: this year's total
+        # comes from the moved seasons and the past years from the real dates, so the two
+        # sit on different parts of the calendar and the gap between them is the move,
+        # not the product. (A +127% on a flat product is what it produced.)
+        vs = (round((total - last["units"]) / last["units"] * 100)
+              if (last and last["units"] > 0 and last["allDays"] and not partial and not sold
+                  and not shift) else None)
+        merged_into = merged_key = None
+        if not mine:
+            _o = next((A.get(o["core"][0]) for _ in (0,) if A.get(o["core"][0])), None)
+            merged_into = _HS.name_of(_o[0]) if _o else None
+            merged_key = _o[0] if _o else None
+        _none = (peer_info or {}).get("scope") == "none"
+        # Where the day-by-day pattern comes from, in parts the page can lay out: this
+        # product's own past years and how much they weigh on the holiday's own days, and
+        # which similar products steady it and how much of their evidence each one is.
+        own_pct = float(L.get("ownShare") or 0.0) if L else 0.0
+        shares = list(L.get("peerShares") or []) if L else []
+        basis = {"ownYears": n_own, "ownPct": round(own_pct) if (n_own or n_pool) else None,
+                 "peerPct": (round(100 - own_pct) if n_pool else 0),
+                 "peers": shares[:12], "peerCount": n_pool,
+                 "scope": (peer_info or {}).get("scope"), "category": (peer_info or {}).get("category"),
+                 "alone": _none}
+        if n_own and n_pool:
+            text = (f"From {n_own} past year{'s' if n_own != 1 else ''} of this product's sales "
+                    f"({basis['ownPct']}% of the pattern on the holiday's days), steadied by "
+                    f"{_hs_who(n_pool, peer_info)} ({basis['peerPct']}%)")
+        elif n_own:
+            text = (f"From {n_own} past year{'s' if n_own != 1 else ''} of this product's sales only"
+                    + ("; no similar product has this holiday in its history" if not _none else
+                       "; no other product in the store moves with it closely enough"))
+        elif n_pool:
+            text = f"None of this product's own yet: from {_hs_who(n_pool, peer_info)}"
+        else:
+            text = ""
+
+        # Every past year of this holiday on file, newest first: its own stretch as it sold,
+        # its busiest day, and the change from the year before (only between two complete
+        # years, so a year the history starts or stops partway through isn't a "drop").
+        all_years = []
+        for yv in ((own or {}).get(key) or {}).get("years") or []:
+            try:
+                anc = datetime.date.fromisoformat(str(yv["anchor"])[:10])
+            except Exception:                               # noqa: BLE001
+                continue
+            bo = {int(k): float(v) for k, v in (yv.get("byOff") or {}).items()}
+            if not bo:
+                continue
+            _core = next((oc["core"] for oc in _HS.occurrences(anc, anc, settings)
+                          if oc["key"] == key and oc["anchor"] == anc), (anc, anc))
+            ydays = [{"date": (anc + datetime.timedelta(days=q)).isoformat(), "units": round(u, 1),
+                      "sold": True, "closed": False,
+                      "core": _core[0] <= anc + datetime.timedelta(days=q) <= _core[1]}
+                     for q, u in sorted(bo.items())]
+            mean_u = float(np.mean(list(bo.values()))) if bo else 0.0
+            for dd in ydays:
+                dd["x"] = round(dd["units"] / mean_u, 2) if mean_u > 0 else 1.0
+            pk = max(ydays, key=lambda dd: dd["units"])
+            all_years.append({"year": anc.year, "anchor": anc.isoformat(), "start": yv["start"], "end": yv["end"],
+                              "coreStart": _core[0].isoformat(), "coreEnd": _core[1].isoformat(),
+                              "units": round(float(yv.get("units") or 0), 1),
+                              "coreUnits": round(float(yv.get("coreUnits") or 0), 1),
+                              "complete": bool(yv.get("full")), "days": ydays,
+                              "peak": ({"date": pk["date"], "x": pk["x"]} if pk["units"] > 0 else None)})
+        all_years.sort(key=lambda y: y["anchor"])
+        for i, y in enumerate(all_years):
+            prev = all_years[i - 1] if i else None
+            y["pctVsPrior"] = (round((y["units"] - prev["units"]) / prev["units"] * 100)
+                               if prev and prev["units"] > 0 and y["complete"] and prev["complete"]
+                               and len(y["days"]) == len(prev["days"]) else None)
+        all_years.reverse()
+        # The most recent one that has ENDED: shown when the next one is outside the
+        # forecast the page asked for (see _holidays_view).
+        last_done = next((y for y in all_years if y["end"] < f0.isoformat()), None)
+        rows.append({
+            "key": key, "name": name, "status": status, "active": status == "moves", "coreLabel": core_label,
+            "next": {"start": mine[0].isoformat() if mine else o["span"][0].isoformat(),
+                     "end": mine[-1].isoformat() if mine else o["span"][1].isoformat(),
+                     "coreStart": a_.isoformat(), "coreEnd": b_.isoformat()},
+            "days": days,
+            "peak": {"x": hi[0], "date": hi[1]}, "quiet": {"x": lo[0], "date": lo[1]},
+            "forecast": {"units": round(total, 1), "coreUnits": round(core_units, 1), "sold": round(sold, 1),
+                         "underway": sold > 0, "partial": partial},
+            "lastYear": ({**last, "pct": vs} if last else None),
+            "last": last_done, "allYears": all_years,
+            "years": past, "yearsUsed": n_own, "peers": n_pool, "text": text, "basis": basis,
+            "mergedInto": merged_into, "mergedKey": merged_key,
+            "peerNames": list((peer_info or {}).get("names") or [])[:25],
+        })
+    # A holiday falling inside another's stretch this time is named with it ("Valentine's
+    # Day & Super Bowl") instead of getting a line of its own.
+    by_key = {r["key"]: r for r in rows}
+    for r in rows:
+        if r["status"] == "merged" and r.get("mergedKey") in by_key:
+            host = by_key[r["mergedKey"]]
+            host.setdefault("alsoIncludes", []).append(r["name"])
+    for r in rows:
+        if r.get("alsoIncludes"):
+            r["name"] = " & ".join([r["name"]] + r["alsoIncludes"])
+    rows = [r for r in rows if not (r["status"] == "merged" and r.get("mergedKey") in by_key)]
+    order = {"moves": 0, "flat": 1, "new": 2, "merged": 3, "off": 4}
+    rows.sort(key=lambda r: (order[r["status"]], r["next"]["start"]))
+    return {"checked": len(_HS.EVENTS), "method": "shape", "effects": rows,
+            "forecastStart": f0.isoformat(),
+            "moves": sum(1 for r in rows if r["status"] == "moves"), "shiftDays": int(shift or 0),
+            # Shaded on the chart, named once under it.
+            "windows": [{"key": r["key"], "name": r["name"], "start": r["next"]["start"], "end": r["next"]["end"],
+                         "peakDate": r["peak"]["date"] if r["peak"]["x"] >= 1.1 else None}
+                        for r in rows if r["status"] == "moves"]}
+
+
+def _holidays_view(rep, horizon_days):
+    """Which occurrence of each holiday the page shows, for the forecast it asked for.
+
+    The next one when it starts inside the forecast (its units are this forecast's, and
+    they feed the stockout date and the order); otherwise the most recent one that has
+    ended, as it actually sold. A long-range forecast of a holiday months out is today's
+    pace stretched forward, not something to plan with. Worked out per request from the
+    horizon in days, so 1, 2, 3 months, or any other horizon, all follow the same rule."""
+    if not rep or rep.get("method") != "shape":
+        return rep
+    try:
+        f0 = datetime.date.fromisoformat(rep.get("forecastStart"))
+    except Exception:                                       # noqa: BLE001
+        return rep
+    cut = f0 + datetime.timedelta(days=max(int(horizon_days or 0), 1) - 1)
+    out = []
+    for r in rep.get("effects") or []:
+        r = dict(r)
+        try:
+            nxt = datetime.date.fromisoformat(r["next"]["start"])
+        except Exception:                                   # noqa: BLE001
+            nxt = None
+        if nxt is not None and nxt <= cut:
+            r["view"] = "next"
+        elif r.get("last"):
+            r["view"] = "last"
+        else:
+            r["view"] = "none"          # not in this forecast, and never on file yet
+        out.append(r)
+    return {**rep, "effects": out, "horizonDays": int(horizon_days or 0), "horizonEnd": cut.isoformat(),
+            "windows": [w for w in rep.get("windows") or []
+                        if w.get("start") and datetime.date.fromisoformat(w["start"]) <= cut]}
 
 
 def _with_future(forecast, future_fc, last_actual):
@@ -849,12 +1239,87 @@ def _widen_for_extrapolation(fc, last_actual):
     return fc
 
 
+# Borrowing a price response from similar products is OFF: a product's price changes move
+# its forecast only through its own price history. The code is kept; set
+# LOGITRACK_PRICE_BORROWING=1 to switch it back on.
+PRICE_BORROWING = os.environ.get("LOGITRACK_PRICE_BORROWING", "0").strip() in ("1", "true", "yes")
+
+
+# ── Closed days ───────────────────────────────────────────────────────────────────────
+# See closed_days.py. A closed day is left out of every history the forecast learns from
+# and forecast at zero. Dates are real calendar dates: an uploaded sheet whose history was
+# moved (date_shift_days) has its closed days looked up where they really happened.
+_closed_memo_real = {"key": None, "real": frozenset()}
+
+
+def _closed_settings() -> dict:
+    try:
+        return _closed.get(_current_slot())
+    except Exception:                                   # noqa: BLE001
+        return {"dates": [], "yearly": []}
+
+
+def _closed_real() -> frozenset:
+    st = _closed_settings()
+    key = json.dumps(st, sort_keys=True)
+    if _closed_memo_real["key"] != key:
+        t = today().date()
+        real = _CD.expand(st, datetime.date(t.year - 15, 1, 1), datetime.date(t.year + 3, 12, 31))
+        _closed_memo_real.update({"key": key, "real": frozenset(real)})
+    return _closed_memo_real["real"]
+
+
+def _drop_closed(df, shift=0):
+    """`df` without its closed days (history is on dates moved by `shift`)."""
+    real = _closed_real()
+    if not real or df is None or not len(df) or "ds" not in df.columns:
+        return df
+    sd = datetime.timedelta(days=int(shift or 0))
+    on = {d + sd for d in real}
+    m = pd.to_datetime(df["ds"]).dt.date.isin(on).to_numpy()
+    return df[~m] if m.any() else df
+
+
+def _closed_chart_days(df_train, sku_id, horizon_days) -> list:
+    """Closed days from the first day of history to the end of the forecast, as chart x
+    values (ms). Dates inside the history are the chart's (moved) dates, like the line."""
+    try:
+        if not _closed_real() or df_train is None or not len(df_train):
+            return []
+        d0 = pd.to_datetime(df_train["ds"]).min().normalize()
+        d1 = pd.to_datetime(df_train["ds"]).max().normalize() + pd.Timedelta(days=int(horizon_days or 0) + 1)
+        days = pd.date_range(d0, d1, freq="D")
+        m = _closed_mask(days, sku_id)
+        return [int(t.timestamp() * 1000) for t, c in zip(days, m) if c]
+    except Exception:                                        # noqa: BLE001
+        return []
+
+
+def _closed_mask(ds, sku_id) -> np.ndarray:
+    """Which of these forecast dates the store is closed on. Dates inside the product's
+    history (a backtest or calibration cutoff) are on its moved dates; dates after it are
+    real ones."""
+    real = _closed_real()
+    d = pd.to_datetime(pd.Series(ds)).dt.date
+    if not real or not len(d):
+        return np.zeros(len(d), bool)
+    ent = _catalog.get(sku_id) or {}
+    sd = datetime.timedelta(days=int(ent.get("date_shift_days") or 0))
+    hdf = ent.get("df")
+    h_end = pd.to_datetime(hdf["ds"]).max().date() if hasattr(hdf, "columns") and len(hdf) else None
+    return np.array([((x - sd) in real) if (h_end is not None and x <= h_end) else (x in real)
+                     for x in d], bool)
+
+
 def build_entry(sku_id, sku_name, df_clean, mode, filename, today, events, related, n_relatives,
                 pool_cohesion=None,
                 calibrate=True, calib_windows=None, force_route=None, availability=None,
-                live_price=None, holidays=None, peers=None, store_peers=None, peer_scope="category"):
+                live_price=None, holidays=None, peers=None, store_peers=None, peer_scope="category",
+                py_weight=None, pool_baseline=None, peer_info=None):
     events = events or []
     df = df_clean[df_clean["ds"] <= today].copy()
+    # Closed days never happened: out of the history before anything is learned from it.
+    df = _drop_closed(df, (_catalog.get(sku_id) or {}).get("date_shift_days"))
     # Sales are not demand on a day you ran out. Dropping those days outright — the old
     # behaviour — is biased, because the days you sell out are the busy ones, so it
     # deleted the top of the distribution and every forecast drifted low. Instead: uplift
@@ -882,16 +1347,10 @@ def build_entry(sku_id, sku_name, df_clean, mode, filename, today, events, relat
     # Every calendar period plus the store's own is checked for every product, minus any
     # switched off for this one. Peers are always measured against the full calendar.
     _hglobal = _holidays.get() if holidays is None else (holidays or {})
-    _hset = _HOL.for_sku(_hglobal, sku_id)
-    _hpeer = _HOL.for_sku(_hglobal, None)
     # An uploaded sheet may have been moved so its last row lands on yesterday; holidays
     # are looked up on the dates its sales really happened (one shift for the whole
     # catalogue, 0 for a live store).
     _hshift = int((_catalog.get(sku_id) or {}).get("date_shift_days") or 0)
-    _hver = json.dumps(_hpeer, sort_keys=True) + f"|{_hshift}"
-    h_assign = (_HOL.history_assign(df, _hset, horizon_end=df["ds"].max() + pd.Timedelta(days=800),
-                                    shift=_hshift)
-                if len(df) else {})
     # Who a holiday lift or a price response is borrowed from: the category (see
     # R.category_peers), falling back to the behavioural relatives.
     # Only what was known on `today`: a calibration or backtest cutoff must not learn a
@@ -900,75 +1359,63 @@ def build_entry(sku_id, sku_name, df_clean, mode, filename, today, events, relat
                    if hasattr(r, "columns") and len(r)]
     _store_full = [r for r in (store_peers or []) if hasattr(r, "columns") and len(r)]
 
-    def _borrow(cat_frames, moving_keys):
+    def _borrow(cat_frames):
         """The price response similar products show; when too few in the category have a
         price history, the whole store's (the same fallback holidays use), with more
-        safety stock because a store-wide typical response is a looser match."""
+        safety stock because a store-wide typical response is a looser match.
+        Switched off (PRICE_BORROWING): a product's price response comes from its own
+        prices or not at all."""
+        if not PRICE_BORROWING:
+            return None
         b = _UP.pooled_elasticity(cat_frames)
         if b is not None:
             b = {**b, "scope": peer_scope or "category"}
         if b is None and _store_full:
-            _sc = [(_HOL.strip(r[r["ds"] <= today], _HOL.applied_assign(_HOL.history_assign(r, _hpeer, shift=_hshift),
-                                                                       moving_keys))
-                    if moving_keys else r[r["ds"] <= today]) for r in _store_full]
-            b = _UP.pooled_elasticity(_sc)
+            b = _UP.pooled_elasticity([r[r["ds"] <= today] for r in _store_full])
             if b is not None:
                 b = {**b, "scope": "store"}
         return b
 
-    def _price_side(moving):
-        """Own and borrowed price response, measured with the days of the holidays that
-        move this product taken out (a Black Friday spike at a discount would otherwise
-        pass for a price response). Only those: stripping every checked period would
-        throw away a third of the history for nothing."""
-        _k = {k: {"applied": True} for k in (moving or ())}
-        _own = _HOL.strip(df, _HOL.applied_assign(h_assign, _k)) if moving else df
-        _pc = [(_HOL.strip(r[r["ds"] <= today], _HOL.applied_assign(_HOL.history_assign(r, _hpeer, shift=_hshift), _k))
-                if moving else r[r["ds"] <= today]) for r in _peers_full]
-        _b = (_borrow(_pc, _k)
-              if (has_price and last_price and not _own_price_ok(_own)) else None)
-        return _own, _pc, _b
+    def _price_side():
+        """Own history, similar products' histories as of `today`, and the borrowed price
+        response (None unless PRICE_BORROWING is on)."""
+        _pc = [r[r["ds"] <= today] for r in _peers_full]
+        _b = _borrow(_pc) if (has_price and last_price and not _own_price_ok(df)) else None
+        return df, _pc, _b
+
+    # THE PRICE READING. One response per product, from its own sales only, used the same
+    # way by every engine (uplift.price_reading): measured across the same months of
+    # different years and before vs after each price change, cross-checked when both can
+    # read. Other products whose price held steady over the same weeks are the yardstick
+    # for season and traffic in the before/after reading; same category first.
+    _ba_others = [r[r["ds"] <= today] for r in _store_full]
+    _ba_prefer = ([r[r["ds"] <= today] for r in _peers_full] if peer_scope == "category" else None)
+    _readings = {}
+
+    def _reading(own_frame):
+        k = _UP.frame_key(own_frame)
+        got = _readings.get(k) if k is not None else None
+        if got is None:
+            got = _UP.price_reading(own_frame, gate_ok=price_usable, others=_ba_others, prefer=_ba_prefer)
+            if k is not None:
+                _readings[k] = got
+        return got
 
     def _own_price_ok(own_frame):
-        """Whether this product's OWN prices give a response the forecast can use: enough
-        days at two prices (the gate) AND a measurement that points the normal way. A
-        product that clears the gate but reads backwards (its dearer days sold more, from
-        a season or a launch, not the price) has no usable response of its own, exactly
-        like one that hasn't cleared the gate, so both borrow from similar products."""
-        if not price_usable:
+        """Whether this product's OWN prices give a response the forecast can use: one of
+        the two readings points the normal way and, when both can read, they agree. A
+        product whose dearer days sold more (from a season or a launch, not the price), or
+        whose two readings disagree, has no usable response of its own."""
+        if not (has_price and last_price):
             return False
-        _eh = _UP.price_elasticity(own_frame)
-        return _eh.get("basis") == "measured" and float(_eh.get("elasticity") or 0.0) < 0
+        return _reading(own_frame).get("elasticity") is not None
 
     def _el(own_frame, borrowed_):
         if _own_price_ok(own_frame):
-            return float(_UP.price_elasticity(own_frame)["elasticity"])
+            return float(_reading(own_frame)["elasticity"])
         return float(borrowed_["elasticity"]) if borrowed_ else 0.0
 
-    def _learn(el):
-        def _peer_price(f):
-            r = _UP.peer_price_response(f)
-            return (r["elasticity"], r["current"]) if r else (0.0, None)
-
-        eff = _HOL.learn(df, _peers_full, _hset, assign=h_assign, elasticity=el,
-                         ref_price=last_price, price_fn=_peer_price, version=_hver, as_of=today,
-                         store=[r for r in (store_peers or []) if hasattr(r, "columns") and len(r)],
-                         shift=_hshift)
-        return eff
-
-    # First with every day in, then again with the days of the holidays found to move this
-    # product left out, when that changes the price response the lifts were measured with.
-    df_nohol, peers_clean, borrowed = _price_side(())
-    h_effects = {}
-    if h_assign:
-        _el0 = _el(df_nohol, borrowed)
-        h_effects = _learn(_el0)
-        _moving0 = sorted(k for k, e in h_effects.items() if e.get("applied"))
-        if _moving0:
-            df_nohol, peers_clean, borrowed = _price_side(_moving0)
-            _el1 = _el(df_nohol, borrowed)
-            if abs(_el1 - _el0) > 0.05:
-                h_effects = _learn(_el1)
+    df_nohol, peers_clean, borrowed = _price_side()
 
     # BORROWED PRICE RESPONSE. A product that hasn't sold at two prices for 30+ days can't
     # show how its demand responds, but similar products that have can. Their typical
@@ -976,11 +1423,19 @@ def build_entry(sku_id, sku_name, df_clean, mode, filename, today, events, relat
     # forecast, with a wider band because it's borrowed. The same goes for a product whose
     # own prices read backwards (see _own_price_ok).
     own_price_ok = _own_price_ok(df_nohol)
+    reading = _reading(df_nohol) if (has_price and last_price) else None
     # Only the RESPONSE is borrowed. A product that has sold at enough prices (whose own
     # reading just couldn't be used) keeps its own known range and limits: those are
     # prices it has really sold at.
-    if own_price_ok or (price_usable and borrowed):
+    if price_usable and (own_price_ok or borrowed):
         eff_range, eff_bounds = p_range, p_bounds
+    elif own_price_ok:
+        # Read from its price changes alone (short promotions, say): the known range is
+        # the prices on either side of those changes.
+        _ba = reading.get("beforeAfterDetail") or {}
+        _lp = float(last_price)
+        eff_range = (round(min(_ba.get("lo", _lp), _lp), 2), round(max(_ba.get("hi", _lp), _lp), 2))
+        eff_bounds = (round(eff_range[0] * PRICE_EXTRAP_FLOOR, 2), round(eff_range[1] * PRICE_EXTRAP_CEIL, 2))
     elif borrowed:
         _lp = float(last_price)
         eff_range = (round(_lp * borrowed["relLo"], 2), round(_lp * borrowed["relHi"], 2))
@@ -989,19 +1444,73 @@ def build_entry(sku_id, sku_name, df_clean, mode, filename, today, events, relat
     else:
         eff_range = eff_bounds = None
 
-    if h_assign:
-        # What the models train on: each applied lift divided back out of its own days
-        # (holiday_calendar.deflate). Periods with no clear effect stay as recorded.
-        df_imp = _HOL.deflate(df, h_assign, h_effects)
-    else:
-        df_imp = df
-    # Similar products' histories feed the pooled season. The periods that move this
-    # product are taken out of theirs, so a peer's Black Friday can't pass for November.
-    _moving = {k for k, e in h_effects.items() if e.get("applied")}
-    related_clean = [(_HOL.strip(r, _HOL.applied_assign(_HOL.history_assign(r, _hpeer, shift=_hshift),
-                                                         {k: {"applied": True} for k in _moving}))
-                      if hasattr(r, "columns") and _moving else r)
-                     for r in (related or [])]
+    df_imp = df
+
+    # HOLIDAY STRETCHES (holiday_shape.py). Each holiday's stretch keeps the forecast's own
+    # total; only where in the stretch the units land follows past years, lined up on the
+    # holiday itself. Learned from this product's own past years (promotion days left out,
+    # Events carry those), pulled toward similar products' shape by how little it sold.
+    # The models train on history as it happened; nothing is flattened first.
+    hs_levels, hs_own, hs_A = {}, {}, {}
+    _hs_off = set(((_hglobal or {}).get("ignored") or {}).get(str(sku_id)) or [])
+    _hs_sd = datetime.timedelta(days=_hshift)
+    _hs_full = (_catalog.get(sku_id) or {}).get("df")
+    _hs_end = (pd.to_datetime(_hs_full["ds"]).max().date() if hasattr(_hs_full, "columns") and len(_hs_full)
+               else (df["ds"].max().date() if len(df) else None))
+
+    def _to_real(x):
+        return (x - _hs_sd) if (_hs_end is not None and x <= _hs_end) else x
+
+    if HOLIDAY_SHAPES and len(df) >= 28:
+        try:
+            hs_own = _HS.measure(df, _hshift, _hglobal, off=_hs_off)
+            _pm = []
+            # Names of the similar products, in the same order as their frames, so the page
+            # can say which ones steady the pattern and by how much.
+            _src_peers = peers if peers is not None else []
+            _all_names = list((peer_info or {}).get("names") or [])
+            _pm_names = ([n for r, n in zip(_src_peers, _all_names) if hasattr(r, "columns") and len(r)]
+                         if peers is not None and len(_all_names) == len(_src_peers) else None)
+            for r in _peers_full:
+                rr = r[r["ds"] <= today]
+                ck = (_HOL._frame_key(rr), _hshift, json.dumps((_hglobal or {}).get("dates") or {}, sort_keys=True))
+                m = _hs_peer_cache.get(ck) if ck[0] is not None else None
+                if m is None:
+                    m = _HS.measure(rr, _hshift, _hglobal)
+                    if ck[0] is not None:
+                        if len(_hs_peer_cache) > 5000:
+                            _hs_peer_cache.clear()
+                        _hs_peer_cache[ck] = m
+                _pm.append({k: v for k, v in m.items() if k not in _hs_off})
+            hs_levels = {k: v for k, v in _HS.levels(hs_own, _HS.pool(_pm, _pm_names)).items() if k not in _hs_off}
+            _r0 = _to_real(df["ds"].min().date())
+            hs_A = _HS.assign(_r0, _r0 + datetime.timedelta(days=(df["ds"].max() - df["ds"].min()).days + 800),
+                              _hglobal, off=_hs_off)
+        except Exception:                                   # noqa: BLE001 — never fail a build over it
+            import traceback; traceback.print_exc()
+            hs_levels, hs_A = {}, {}
+    # ONE-OFF RUSHES (rush.py): weeks well above normal that have ended and weren't there
+    # the year before. Divided back out like a holiday, so a World Cup or a viral month
+    # can't leave the everyday level stuck above where sales are now. Looked for after the
+    # holidays are out, so a Black Friday is never mistaken for one.
+    rushes = []
+    if RUSH_ON and len(df_imp):
+        try:
+            rushes = _RUSH.find(df_imp, today, peers=[r[r["ds"] <= today] for r in _peers_full])
+        except Exception:                                   # noqa: BLE001 — never fail a build over it
+            rushes = []
+        if rushes:
+            df_imp = _RUSH.deflate(df_imp, rushes)
+    _rush_days = set()
+    for _r in rushes:
+        _rush_days.update(_r["factors"].keys())
+    # Similar products' histories feed the pooled season, as they happened, and only up
+    # to `today`: a calibration window re-fits at an earlier cutoff with the same
+    # relatives, and they used to arrive whole, so the pooled season of a holdout window
+    # had already seen the days it was being graded on.
+    related_clean = [(r[pd.to_datetime(r["ds"]) <= pd.Timestamp(today)] if hasattr(r, "columns") and "ds" in r.columns
+                      else r) for r in (related or [])]
+    related_clean = [r for r in related_clean if not hasattr(r, "columns") or len(r)]
 
     days = (df["ds"].max() - df["ds"].min()).days if len(df) > 1 else 0
     sales = int(df["y"].sum())
@@ -1044,43 +1553,67 @@ def build_entry(sku_id, sku_name, df_clean, mode, filename, today, events, relat
     # with a usable price). Otherwise they're held out so the baseline is the regular-price
     # rate, and any scheduled discount is applied as a price change on top.
     fit_df, promo_report = _PROMO.hold_out(
-        df, method if (method != "prophet" or own_price_ok) else "prophet-without-price")
-    # Picked-holiday days leave the training data too (see HOLIDAYS above). Kept when
-    # removing them would leave too little to fit.
-    # Picked-holiday days train as ordinary days (their units replaced by the ordinary
-    # level around them, see HOLIDAYS above), on every route.
-    holiday_days_held = 0
-    if h_assign and df_imp is not df and len(fit_df):
+        df, method if method != "prophet" else "prophet-without-price")
+    # One-off rush days train at the level around them (rush.py), on every route.
+    if df_imp is not df and len(fit_df) and _rush_days:
         _imp = df_imp.set_index("ds")
-        _hm = _HOL.holiday_mask(fit_df, _HOL.applied_assign(h_assign, h_effects))
-        if _hm.any():
+        _rm = pd.to_datetime(fit_df["ds"]).dt.normalize().isin(_rush_days).to_numpy()
+        if _rm.any():
             fit_df = fit_df.copy()
             _vals = _imp["y"].reindex(fit_df["ds"]).to_numpy(float)
-            fit_df["y"] = np.where(_hm & np.isfinite(_vals), _vals, fit_df["y"].to_numpy(float))
-            holiday_days_held = int(_hm.sum())
+            fit_df["y"] = np.where(_rm & np.isfinite(_vals), _vals, fit_df["y"].to_numpy(float))
 
     # Routes without a price input learn a level from history. When part of that history
     # sold at a different price, the level is off: a stretch at a lower price makes today's
     # rate look higher than it is. With a measured response, restate each past day at
     # today's price before fitting, so the baseline is "demand at the current price" and
-    # price events move it from there. (Prophet takes price as an input and needs none.)
-    _elast_pre = None
-    if method != "prophet" and price_usable and last_price:
-        _elast_pre = _UP.price_elasticity(df_nohol)
-        _e = float(_elast_pre.get("elasticity") or 0.0) if _elast_pre.get("basis") == "measured" else 0.0
+    # price events move it from there. Prophet included: it no longer fits a price number
+    # of its own, it uses this same reading.
+    if own_price_ok and last_price:
+        _e = float(reading["elasticity"])
         if _e and "price" in fit_df.columns:
             _p = pd.to_numeric(fit_df["price"], errors="coerce").fillna(float(last_price)).clip(lower=0.01)
             _adj = (float(last_price) / _p) ** _e
             fit_df = fit_df.copy()
             fit_df["y"] = fit_df["y"] * _adj.clip(0.5, 2.0)
 
+    # SLOW SELLERS' SEASONS. Croston and the moving average work out one rate from recent
+    # sales and hold it flat. When recent months were the quiet season that rate starts too
+    # low for the busy one ahead (and too high coming out of it), and scaling it by the
+    # coming months can't make up for it. So the season is taken out FIRST: each past day
+    # is divided by its season's level (a smooth daily curve from the monthly index, own
+    # history if it has a year of it, otherwise similar products), the rate is worked out
+    # from that, and the coming days' season is put back on after.
+    _slow_sea = None
+    # What the models learn from, before the season is taken out: holidays and one-off rushes
+    # divided out, past discount days held out or restated at today's price (see the same
+    # weeks in past years, below).
+    _fit_plain = fit_df
+    if method in ("croston", "abstain") and SLOW_DESEASON and len(fit_df):
+        _sp = [r for r in related_clean if hasattr(r, "columns")]
+        _s0 = _SEAS.resolve(df_imp, _sp)
+        if _s0.get("source") != "none" and _s0.get("strength", 0) >= _SEAS.MIN_STRENGTH:
+            _di = np.asarray(_SEAS.daily_index(fit_df["ds"].dt.strftime("%Y-%m-%d").tolist(), _s0["index"]), float)
+            if np.all(np.isfinite(_di)) and np.all(_di > 0):
+                fit_df = fit_df.copy()
+                fit_df["y"] = fit_df["y"].astype(float).to_numpy() / _di
+                _slow_sea = _s0
+
     if method == "prophet":
         # `related` lets an established-but-under-a-year SKU (yearly seasonality off)
         # blend in a pooled annual shape from its cohesive peers; a no-op otherwise.
         # has_promo=False: a promotion is a price cut, carried by the price input. Learning a
         # separate "promotion boost" from the same discounted days counted one effect twice.
-        eng = ProphetEngine().fit(fit_df, today, own_price_ok, False, last_price, fc_events,
-                                  related=related_clean, price_bounds=p_bounds, price_range=p_range)
+        # has_price=False: Prophet's own price fit had no check on it (a price change landing
+        # on a season turn read as a price effect). The product's cross-checked reading is
+        # applied on top instead, as on every other route.
+        # The store's average yearly shape (months of R.catalog_baseline), so the pooled
+        # blend judges agreement on the same specific scale grouping and routing use.
+        _bmo = (np.asarray(pool_baseline, float)[7:19] if pool_baseline is not None
+                and len(pool_baseline) >= 19 else None)
+        eng = ProphetEngine().fit(fit_df, today, False, False, last_price, fc_events, past_years_weight=py_weight,
+                                  related=related_clean, price_bounds=p_bounds, price_range=p_range,
+                                  baseline_mo=_bmo)
     elif method == "global":
         eng = GlobalPooledEngine().fit(fit_df, today, related=related_clean)
     elif method == "croston":
@@ -1107,7 +1640,10 @@ def build_entry(sku_id, sku_name, df_clean, mode, filename, today, events, relat
     # baseline and scale it month by month, from the product's own history if it has a
     # year of it, otherwise from its peers.
     season_report = None
-    if method in ("croston", "abstain"):
+    if _slow_sea is not None:
+        season_report = {**_slow_sea, "coverage": 1.0, "smooth": True, "deseasonalized": True,
+                         "text": _SEAS.explain(_slow_sea)}
+    elif method in ("croston", "abstain"):
         _peers = [r for r in related_clean if hasattr(r, "columns")]
         _sea = _SEAS.resolve(df_imp, _peers)
         if _sea.get("source") != "none":
@@ -1126,7 +1662,7 @@ def build_entry(sku_id, sku_name, df_clean, mode, filename, today, events, relat
     if prophet_refused and not borrowed and has_price and last_price:
         # Prophet's own fit read price backwards, so it switched price off. Similar
         # products stand in, as they do for any product with no usable response of its own.
-        borrowed = _borrow(peers_clean, {k: {"applied": True} for k, e in h_effects.items() if e.get("applied")})
+        borrowed = _borrow(peers_clean)
         if borrowed:
             eff_range, eff_bounds = p_range, p_bounds      # Prophet only gets price when usable
     if not prophet_prices and (not prophet_refused or borrowed):
@@ -1134,12 +1670,15 @@ def build_entry(sku_id, sku_name, df_clean, mode, filename, today, events, relat
         # borrow from similar products. A promotion's discount moves the forecast through the
         # price response below, and a promotion with no discount doesn't move it at all.
         _lift = {"multiplier": 1.0, "basis": "promotions-are-price-changes", "promoDays": 0}
-        _elast = _elast_pre if _elast_pre is not None else _UP.price_elasticity(df_nohol)
-        if not price_usable and _elast.get("elasticity"):
-            # Measurable in principle, but the price levels behind it don't clear the
-            # gate. Keep the diagnostic, apply nothing.
-            _elast = {**_elast, "elasticity": 0.0, "basis": "too-few-price-levels",
-                      "measuredButGated": _elast.get("elasticity")}
+        _r = reading or {}
+        _elast = dict(_r.get("sameMonthsDetail") or {"elasticity": 0.0, "basis": "no-price-data", "points": 0})
+        _rd = {k: _r.get(k) for k in ("sameMonths", "beforeAfter", "changes")}
+        if own_price_ok:
+            _elast = {**_elast, "elasticity": float(_r["elasticity"]), "basis": "measured",
+                      "method": _r.get("basis"), **_rd}
+        else:
+            _elast = {**_elast, "elasticity": 0.0, "basis": _r.get("basis") or _elast.get("basis") or "none",
+                      **_rd}
         if borrowed and (not own_price_ok or prophet_refused):
             _elast = {**_elast, "elasticity": borrowed["elasticity"], "basis": "borrowed",
                       "peers": borrowed["peers"],
@@ -1149,7 +1688,8 @@ def build_entry(sku_id, sku_name, df_clean, mode, filename, today, events, relat
 
     price_response = _price_response(method, eng, has_price, price_varied,
                                      (uplift_report or {}).get("price"),
-                                     evidence=p_evidence, bounds=p_bounds,
+                                     evidence=p_evidence, bounds=eff_bounds if own_price_ok else p_bounds,
+                                     known_range=eff_range if own_price_ok else None,
                                      borrowed=borrowed if (uplift_report or {}).get("price", {}).get("basis") == "borrowed" else None,
                                      borrowed_range=eff_range, borrowed_bounds=eff_bounds)
     # Whether a price event moves this forecast, whichever engine is behind it. This used
@@ -1165,16 +1705,96 @@ def build_entry(sku_id, sku_name, df_clean, mode, filename, today, events, relat
     last_actual = df["ds"].max()
     future_fc = forecast[forecast["ds"] > last_actual].copy().reset_index(drop=True)
 
-    if season_report and len(future_fc):
-        _sm = _SEAS.future_multipliers(
-            future_fc["ds"].dt.strftime("%Y-%m-%d").tolist(),
-            season_report["index"], coverage=season_report.get("coverage", 1.0))
+    # Slow sellers with a year of their own history: the same weeks last year, scaled by
+    # this year's pace (seasonality.same_weeks_last_year).
+    _yoy = None
+    if SLOW_DESEASON and method in ("croston", "abstain") and len(future_fc):
+        try:
+            _fd = future_fc["ds"].tolist()
+            _yoy = _SEAS.same_weeks_last_year(df_imp, _fd)
+            # Past sales include past sales events. A store sale that comes round every
+            # year (Black Friday, the March clearance) is then forecast even if nobody enters
+            # it again, which is right. But on days where you HAVE scheduled a price change
+            # or a sale, its effect is added separately, so those days are read from the
+            # history with past sale days held out, or last year's sale is counted twice.
+            if _yoy and fc_events and last_price:
+                _path = _UP.future_price_path([str(d)[:10] for d in _fd], fc_events, last_price)
+                _ev_days = [i for i, d in enumerate(_fd)
+                            if _path.get(str(d)[:10]) is not None
+                            and abs(float(_path[str(d)[:10]]) - float(last_price)) > 1e-9]
+                if _ev_days:
+                    _clean = _SEAS.same_weeks_last_year(_fit_plain, _fd)
+                    if _clean:
+                        _dl = list(_yoy["daily"])
+                        for i in _ev_days:
+                            if i < len(_dl) and i < len(_clean["daily"]):
+                                _dl[i] = _clean["daily"][i]
+                        _yoy = {**_yoy, "daily": _dl}
+        except Exception:                                   # noqa: BLE001
+            _yoy = None
+    if (season_report or _yoy) and len(future_fc):
+        _dates = future_fc["ds"].dt.strftime("%Y-%m-%d").tolist()
+        if season_report:
+            _sm = (_SEAS.daily_index(_dates, season_report["index"])
+                   if season_report.get("smooth") else
+                   _SEAS.future_multipliers(_dates, season_report["index"],
+                                            coverage=season_report.get("coverage", 1.0)))
+        else:
+            _sm = [1.0] * len(_dates)
+        if _yoy:
+            _base = future_fc["yhat"].clip(lower=0).to_numpy(float)
+            _b = _base * np.asarray(_sm, float)
+            _y = np.asarray(_yoy["daily"], float)[:len(_b)]
+            _strong = float((season_report or {}).get("strength") or 0.0) >= _SEAS.YOY_STRONG
+            _fin = _y if _strong else 0.5 * _b + 0.5 * _y
+            if np.all(_base > 1e-9):
+                _sm = (_fin / _base).tolist()
+                season_report = {**(season_report or {"index": _SEAS._flat(), "source": "own"}),
+                                 "sameWeeksLastYear": {k: _yoy[k] for k in ("growth", "lastYear", "recent")},
+                                 "yoyWeight": 1.0 if _strong else 0.5}
+                _g = _yoy["growth"]
+                _ny = int(_yoy.get("years") or 1)
+                season_report["text"] = (
+                    f"Forecast from the same weeks in past years ({round(_yoy['lastYear'])} units in the next "
+                    f"{_yoy.get('days', 30)} days a year ago"
+                    + (f"; {_ny} years averaged" if _ny > 1 else "") + "), "
+                    + (f"{'up' if _g >= 1 else 'down'} {abs(round((_g - 1) * 100))}% for how its last 6 months "
+                       f"compare with a year before" if abs(_g - 1) >= 0.005 else "at the same pace as a year ago")
+                    + ("." if _strong else
+                       ", averaged half and half with its recent selling rate (its season is mild)."))
         if any(abs(m - 1.0) > 1e-9 for m in _sm):
             future_fc = _UP.apply(future_fc, _sm)
             forecast = _with_future(forecast, future_fc, last_actual)
             season_report["applied"] = True
             season_report["peakMultiplier"] = round(max(_sm), 3)
             season_report["troughMultiplier"] = round(min(_sm), 3)
+
+    # HOLIDAY STRETCHES AHEAD: each stretch's total split across its days by its shape
+    # (see HOLIDAY STRETCHES above). Before any promotion or closed-day multiplier, so a
+    # scheduled sale lifts the reshaped day and a closed day takes no share. A stretch
+    # already under way is split as a whole, the units already sold counting toward its
+    # total, so the days left never take the whole stretch.
+    hs_info = {}
+    if hs_levels and hs_A and len(future_fc):
+        try:
+            _wdi = _HS._wdi_of(df_imp)
+            _past = {pd.Timestamp(x).date(): float(v) for x, v in zip(df_imp["ds"], df_imp["y"])
+                     if (last_actual - pd.Timestamp(x)).days < 60}
+            _old = future_fc["yhat"].clip(lower=0).to_numpy(float)
+            _apply = {k: v for k, v in hs_levels.items() if _HS.significant(v)}
+            _new, hs_info = _HS.redistribute(future_fc["ds"].tolist(), _old, _to_real, hs_A, _apply, _wdi,
+                                             past=_past, closed=_closed_mask(future_fc["ds"], sku_id))
+            if hs_info:
+                _ratio = np.where(_old > 1e-9, _new / np.maximum(_old, 1e-9), 1.0)
+                future_fc = future_fc.copy()
+                future_fc["yhat"] = np.where(_old > 1e-9, future_fc["yhat"].to_numpy(float) * _ratio, _new)
+                for _c in ("yhat_lower", "yhat_upper"):
+                    if _c in future_fc.columns:
+                        future_fc[_c] = pd.to_numeric(future_fc[_c], errors="coerce").to_numpy(float) * _ratio
+                forecast = _with_future(forecast, future_fc, last_actual)
+        except Exception:                                   # noqa: BLE001
+            import traceback; traceback.print_exc()
+            hs_info = {}
 
     if uplift_report and len(future_fc):
         _mults = _UP.future_multipliers(
@@ -1209,24 +1829,31 @@ def build_entry(sku_id, sku_name, df_clean, mode, filename, today, events, relat
         # price change or promotion moved the scorecard's order but not the product page.
         forecast = _with_future(forecast, future_fc, last_actual)
 
-    # Holiday lifts on the upcoming windows. Applied last among the multipliers (they all
-    # multiply, so order doesn't change the result), and the price uncertainty on those
-    # days scales with them. h_sd is how unsure the lift itself is, in units.
     holiday_report = None
-    if h_assign:
-        holiday_report = _holiday_report(h_effects, h_assign, df, today, holiday_days_held, has_price, _hset)
-    if h_effects and len(future_fc):
-        _hm_f, _hse_f, _hk_f = _HOL.future_multipliers(future_fc["ds"].dt.date.tolist(), h_effects, h_assign)
-        if any(abs(m - 1.0) > 1e-9 for m in _hm_f) or any(x > 0 for x in _hse_f):
-            _marr = np.asarray(_hm_f, dtype=float)
-            future_fc = _UP.apply(future_fc, _hm_f)
-            if "x_sd" in future_fc.columns:
-                future_fc["x_sd"] = pd.to_numeric(future_fc["x_sd"], errors="coerce").fillna(0.0) * _marr
-            future_fc["h_sd"] = future_fc["yhat"].clip(lower=0).to_numpy(float) * np.asarray(_hse_f, dtype=float)
-            future_fc["holiday"] = _hk_f
-            future_fc["h_mult"] = _marr
+
+    # CLOSED DAYS AHEAD sell nothing. Applied after every other multiplier, so nothing
+    # can lift a day the store isn't open.
+    closed_ahead = 0
+    if len(future_fc):
+        _cz = _closed_mask(future_fc["ds"], sku_id)
+        if _cz.any():
+            _cm = np.where(_cz, 0.0, 1.0)
+            future_fc = _UP.apply(future_fc, _cm.tolist())
+            for _c in ("x_sd", "h_sd"):
+                if _c in future_fc.columns:
+                    future_fc[_c] = pd.to_numeric(future_fc[_c], errors="coerce").fillna(0.0).to_numpy(float) * _cm
             forecast = _with_future(forecast, future_fc, last_actual)
-            holiday_report["applied"] = True
+            closed_ahead = int(_cz.sum())
+
+    # What the Holidays tab shows, read off the final forecast (promotions and closed days
+    # included), so it always says what the chart says and moves whenever it does.
+    if HOLIDAY_SHAPES and len(future_fc):
+        try:
+            holiday_report = _hs_report(df, future_fc, hs_levels, hs_own, _hs_off, _to_real, _hglobal, _hshift,
+                                        peer_info=peer_info)
+        except Exception:                                   # noqa: BLE001
+            import traceback; traceback.print_exc()
+            holiday_report = None
 
     # Price range + safe extrapolation (model-agnostic; carries over).
     p_min = p_max = p_safe_min = p_safe_max = None; gap_warn = None
@@ -1276,10 +1903,16 @@ def build_entry(sku_id, sku_name, df_clean, mode, filename, today, events, relat
                 cutoff_cal = today - pd.Timedelta(days=WIN * (k + 1))
                 if (cutoff_cal - first_day).days < 60:      # need ≥60 days to train before a window
                     break
+                # Same model and pool as the fit being calibrated: the route it was forced
+                # to (a backtest's single-engine pass) and the pool's cohesion, or the
+                # holdout measured a different forecast from the one it sizes the buffer for.
                 cal = build_entry(sku_id, sku_name, df_clean, mode, filename, cutoff_cal,
                                   events, related, n_relatives, calibrate=False,
+                                  pool_cohesion=pool_cohesion, force_route=force_route,
                                   availability=availability, holidays=_hglobal, peers=peers,
-                                  store_peers=store_peers)
+                                  store_peers=store_peers, pool_baseline=pool_baseline,
+                                  py_weight=(float(getattr(eng, "_py_w", 0.0) or 0.0)
+                                             if method == "prophet" else None))
                 tend = cutoff_cal + pd.Timedelta(days=WIN)
                 hold = (df[(df["ds"] > cutoff_cal) & (df["ds"] <= tend)][["ds", "y"]]
                         .merge(cal["forecast"][["ds", "yhat"]], on="ds", how="inner"))
@@ -1355,6 +1988,14 @@ def build_entry(sku_id, sku_name, df_clean, mode, filename, today, events, relat
                             eng._q_lo, eng._q_hi, eng.explain_bits(), len(df),
                             dispersion=eng.residual_dispersion, ref_mean=ref_mean)
     details["relatives"] = int(n_relatives)
+    if season_report and season_report.get("applied") and method in ("croston", "abstain") \
+            and season_report.get("text"):
+        details["seasonality"] = {**(details.get("seasonality") or {}), "yearly": True,
+                                  "text": season_report["text"]}
+    if rushes:
+        details["oneOff"] = {"count": len(rushes), "text": _RUSH.explain(rushes),
+                             "periods": [{k: r[k] for k in ("start", "end", "weeks", "ratio", "lastYear", "source")}
+                                         for r in rushes]}
     # The engine describes its own inputs; a price response applied on top of it (measured
     # or borrowed) is not the engine's, so say what actually happens.
     # One verdict on price, said the same way everywhere: whenever Prophet isn't carrying
@@ -1363,7 +2004,17 @@ def build_entry(sku_id, sku_name, df_clean, mode, filename, today, events, relat
     if not prophet_prices and price_response.get("text"):
         details["price"] = {**(details.get("price") or {}), "used": bool(price_response.get("applies")),
                             "text": price_response.get("text")}
-    if holiday_report:
+    if holiday_report and holiday_report.get("method") == "shape":
+        _act = [r for r in holiday_report["effects"] if r["status"] == "moves"]
+        details["holidays"] = {
+            "count": len(_act),
+            "text": ((f"Around {', '.join(r['name'] for r in _act[:5])}"
+                      + (f" and {len(_act) - 5} more" if len(_act) > 5 else "")
+                      + ", each holiday's forecast units are spread over its days the way past years sold, "
+                        "lined up on the holiday itself. The total for those weeks is this forecast's own.")
+                     if _act else
+                     "No holiday changes how this product's sales fall across the days around it.")}
+    elif holiday_report:
         _act = [r for r in holiday_report["effects"] if r["active"]]
         details["holidays"] = {
             "count": len(_act),
@@ -1374,6 +2025,11 @@ def build_entry(sku_id, sku_name, df_clean, mode, filename, today, events, relat
                      f"{holiday_report['checked']} holidays and sales periods checked automatically. None shows a "
                      f"clear effect on this product yet.")}
 
+    try:
+        _off = bool(len(df)) and bool(_FE_off_season(df["ds"], df["y"].to_numpy(dtype=float),
+                                                    pd.Timestamp(today) + pd.Timedelta(days=1)))
+    except Exception:                                       # noqa: BLE001
+        _off = False
     return {
         "engine": eng, "df_train": df, "forecast": forecast, "future_fc": future_fc,
         "mode": mode, "filename": filename, "sku_name": sku_name,
@@ -1400,7 +2056,10 @@ def build_entry(sku_id, sku_name, df_clean, mode, filename, today, events, relat
         # fitted to, so the badge, the routing and the forecast can never disagree about
         # it. Only meaningful now that zero-fill runs to the window end — before that a
         # live-sourced series could not end in a zero and this was always False.
-        "dormant": bool(_FE_is_dormant(df["y"].to_numpy(dtype=float))) if len(df) else False,
+        # Quiet the way it was quiet this time last year (a Christmas line in September)
+        # is out of season, not dormant: it keeps its normal status and its family.
+        "off_season": _off,
+        "dormant": bool(_FE_is_dormant(df["y"].to_numpy(dtype=float))) and not _off if len(df) else False,
         "route": method, "route_reason": reason, "explain": details,
         "price_modeled": price_modeled, "effective_price": effective_price,
     }
@@ -1420,6 +2079,10 @@ def _exclude_from_pooling(c: dict, as_of=None) -> bool:
     if df is None or len(df) == 0 or "y" not in df.columns:
         return False
     as_of = as_of or today()
+    # Out of season is not dormant: a Christmas line in September still defines what a
+    # Christmas product does, and a new one needs it as family.
+    if _FE_off_season(df["ds"], df["y"].to_numpy(dtype=float), as_of):
+        return False
     sold = df[df["y"] > 0]
     if sold.empty:
         return True
@@ -1440,14 +2103,20 @@ def _rebuild(today, only: str | None = None, record_switches: bool = False):
     global _last_rebuild_errors
     if only is None:
         _last_rebuild_errors = {}
-    pool_catalog = {sid: c for sid, c in _catalog.items() if not _exclude_from_pooling(c, today)}
+    # Closed days are out of every history used below, the product's own and the similar
+    # products it borrows from (holiday lifts, seasons, relatives).
+    _open = ({sid: {**c, "df": _drop_closed(c.get("df"), c.get("date_shift_days"))}
+              for sid, c in _catalog.items()} if _closed_real() else _catalog)
+    pool_catalog = {sid: c for sid, c in _open.items() if not _exclude_from_pooling(c, today)}
     base_cols = R.detect_group_columns(pool_catalog)
     groups, group_meta = R.adaptive_group_catalog(pool_catalog, base_cols)
     # The catalog-wide average fingerprint, computed once. Everything below measures
     # similarity with this subtracted, so "alike" means alike beyond the rhythm the whole
     # business shares rather than because of it.
     _baseline = R.catalog_baseline(pool_catalog)
-    clusters = R.cluster_catalog(groups, pool_catalog, baseline=_baseline)   # behavioural sub-clusters per category
+    _family = R.family_map(groups, group_meta)
+    clusters = R.cluster_catalog(groups, pool_catalog, baseline=_baseline,   # behavioural sub-clusters per category
+                                 family=_family)
     targets = [only] if only else list(_catalog.keys())
     # Build into a copy, publish at the end. A refit of an already-populated catalogue
     # publishes exactly once: any intermediate publish would recreate the old/new mixture
@@ -1457,13 +2126,29 @@ def _rebuild(today, only: str | None = None, record_switches: bool = False):
     incremental = not staged
     built = 0
     for sku_id in targets:
-        c = _catalog[sku_id]
+        c = _open[sku_id]
         try:
             # Pool only from the behavioural cluster this SKU best fits (not every
             # category-mate). n_rel is the chosen cluster's size, so routing to the
             # global model still requires ≥ MIN_RELATIVES genuinely-similar peers.
             rels, n_rel, cluster_info = R.behavioral_relatives(sku_id, groups, pool_catalog, clusters,
                                                                baseline=_baseline)
+            # A product left out of pooling (no sales for a while: a Christmas item in
+            # September) still has a category: it borrows holiday patterns from it, and is
+            # judged against the store on its own history when it has none.
+            if sku_id in pool_catalog:
+                _peer_cat, _peer_fam = pool_catalog, _family
+            else:
+                _peer_cat = {**pool_catalog, sku_id: c}
+                _peer_fam = {**_family, sku_id: R.group_catalog({sku_id: c}, base_cols).get(sku_id)}
+            _peer_frames, _peer_ids = R.category_peers(sku_id, groups, _peer_cat, family=_peer_fam,
+                                                       baseline=_baseline, with_ids=True)
+            # Who its holiday pattern is steadied by, in words the Holidays panel can use.
+            _pcat = _peer_fam.get(sku_id)
+            _in_cat = _pcat is not None and any(m != sku_id and f == _pcat for m, f in _peer_fam.items())
+            _peer_info = {"scope": "category" if _in_cat else ("store" if _peer_ids else "none"),
+                          "category": _pcat,
+                          "names": [(_peer_cat.get(m) or {}).get("sku_name") or m for m in _peer_ids]}
             # How much the chosen pool actually agrees on a shape. This used to be
             # computed only for the Grouping tab's display while routing ignored it,
             # so a pool the UI drew in red still supplied a newcomer's whole forecast.
@@ -1472,8 +2157,9 @@ def _rebuild(today, only: str | None = None, record_switches: bool = False):
             # Hours-in-stock, where we have it. Absent → every day counts as fully
             # available, so an untracked catalogue behaves exactly as before.
             _avail = None
+            _live_ok = _live_readings_apply(sku_id)
             try:
-                _cov = _slog.coverage(sku_id)
+                _cov = _slog.coverage(sku_id) if _live_ok else {}
                 if _cov.get("samples"):
                     _avail = {r["date"]: r["hoursInStock"] for r in _slog.availability_series(
                         sku_id, _cov["firstSeen"], _FL.today().isoformat())
@@ -1482,15 +2168,15 @@ def _rebuild(today, only: str | None = None, record_switches: bool = False):
                 _avail = None
             entry = build_entry(sku_id, c["sku_name"], c["df"], c["mode"], c["filename"],
                                 today, c.get("events", []), rels, n_rel,
-                                pool_cohesion=pool_coh, availability=_avail,
-                                live_price=_live.get(sku_id),
-                                peers=R.category_peers(sku_id, groups, pool_catalog),
+                                pool_cohesion=pool_coh, availability=_avail, pool_baseline=_baseline,
+                                live_price=_live.get(sku_id) if _live_ok else None,
+                                peers=_peer_frames, peer_info=_peer_info,
                                 store_peers=R.category_peers(sku_id, {}, pool_catalog, limit=40),
                                 # With no category, or no other product in it, "similar
                                 # products" is already the whole store: say so.
-                                peer_scope=("category" if groups.get(sku_id) is not None and any(
-                                    m != sku_id and gg == groups.get(sku_id) and m in pool_catalog
-                                    for m, gg in groups.items()) else "store"))
+                                peer_scope=("category" if _peer_fam.get(sku_id) is not None and any(
+                                    m != sku_id and ff == _peer_fam.get(sku_id) and m in pool_catalog
+                                    for m, ff in _peer_fam.items()) else "store"))
             entry["cluster_info"] = cluster_info
             entry["group_info"] = group_meta.get(sku_id)
             staged[sku_id] = entry
@@ -1510,6 +2196,8 @@ def _rebuild(today, only: str | None = None, record_switches: bool = False):
             if sku_id not in staged:
                 pass  # nothing to preserve; the upload response reports the error
     _publish_cache(staged)
+    # A shelf price that moved re-prices the measured protection levels (no refit).
+    _reprice_backtest_if_price_moved()
 
 
 def warmup():
@@ -1592,8 +2280,13 @@ def list_skus():
         df = e["df_train"]
         # Latest non-null units_in_stock on or before today, mirroring _ingest's own rule.
         last_stock, stock_src = None, None
+        _cat = _catalog.get(sku_id) or {}
         try:
-            if df is not None and "units_in_stock" in df.columns:
+            if "last_known_stock" in _cat:
+                # What the file actually said (see _ingest); None when it gave no figure.
+                if _cat["last_known_stock"] is not None:
+                    last_stock, stock_src = int(_cat["last_known_stock"]), "sheet"
+            elif df is not None and "units_in_stock" in df.columns:
                 ss = pd.to_numeric(df["units_in_stock"], errors="coerce").dropna()
                 if len(ss):
                     last_stock, stock_src = int(ss.iloc[-1]), "sheet"
@@ -1606,7 +2299,7 @@ def list_skus():
             # That is the exact regression handleUploadSuccess already documents having
             # fixed once for costs. StockLog is the timestamped record of on-hand and it
             # survives a restart, so it is the right thing to read back.
-            logged = _slog.latest(sku_id)
+            logged = _slog.latest(sku_id) if _live_readings_apply(sku_id) else None
             if logged is not None:
                 last_stock, stock_src = int(round(logged)), "live"
         out.append({"id": sku_id, "name": e["sku_name"] or sku_id, "mode": e["mode"], "filename": e["filename"],
@@ -1772,6 +2465,10 @@ def save_events(sku_id: str, events: list = Body(...)):
         # Only reached when the events applied cleanly — the rollback path raises above,
         # and what it rolls back to is already what's on disk.
         _persist_catalog()
+    try:
+        _livelog_reconcile([sku_id], trigger="planned")
+    except Exception as exc:                                # noqa: BLE001 — never fail a save over it
+        print(f"[livelog] could not revise for new events: {exc}")
     return {"success": True, "eventsApplied": len(events)}
 
 
@@ -1822,13 +2519,92 @@ async def upload_file(file: UploadFile = File(...), mode: str = Query(default="r
         raise HTTPException(413, f"File is too large ({len(contents) / 1e6:.0f} MB; limit "
                                  f"{MAX_UPLOAD_BYTES // (1024 * 1024)} MB). Export a smaller date range.")
     try:
-        df_raw = pd.read_csv(io.BytesIO(contents)) if file.filename.endswith(".csv") else pd.read_excel(io.BytesIO(contents))
+        df_raw = _read_sheet(contents, file.filename)
     except Exception as e:
         raise HTTPException(400, f"Could not read the file: {e}")
     if len(df_raw) > MAX_UPLOAD_ROWS:
         raise HTTPException(413, f"File has {len(df_raw):,} rows (limit {MAX_UPLOAD_ROWS:,}).")
-    with _state_lock:
-        return _ingest(df_raw, file.filename, append=(str(mode).lower() == "append"))
+    # A store in use is paused and set aside first (login and products kept), so the file
+    # goes into your spreadsheets' workspace instead of merging into the store's products.
+    paused = _set_aside_store_for_upload()
+    try:
+        with _state_lock:
+            res = _ingest(df_raw, file.filename, append=(str(mode).lower() == "append"))
+    except Exception:
+        if paused:
+            warmup()        # the spreadsheets were loaded unfitted for this upload
+        raise
+    if paused:
+        res["storePaused"] = paused
+    return res
+
+
+def _read_sheet(contents: bytes, filename: str) -> pd.DataFrame:
+    """Read an uploaded CSV / Excel file with the SKU column as TEXT.
+
+    Read as numbers, a code like 00123 became 123 (and 123.0 once any cell was blank),
+    so a later upload of the same product (from Excel, where it was text) arrived as a
+    different product and split its history. The header is read first to find whichever
+    column is the SKU, in any capitalisation."""
+    is_csv = filename.lower().endswith(".csv")
+    reader = (lambda **kw: pd.read_csv(io.BytesIO(contents), **kw)) if is_csv else \
+             (lambda **kw: pd.read_excel(io.BytesIO(contents), **kw))
+    head = reader(nrows=0)
+    sku_cols = [c for c in head.columns if str(c).strip().lower().replace(" ", "_") == "sku"]
+    return reader(dtype={c: str for c in sku_cols}) if sku_cols else reader()
+
+
+_ISO_DATE = re.compile(r"^\s*\d{4}-\d{1,2}-\d{1,2}")
+_SLASH_DATE = re.compile(r"^\s*(\d{1,2})[/.\-](\d{1,2})[/.\-](\d{2,4})")
+
+
+def _parse_dates(col: pd.Series) -> tuple[pd.Series, str | None]:
+    """Parse a Date column without guessing its format from the first row.
+
+    pd.to_datetime on "01/02/2024, 05/02/2024, 13/02/2024" (day first: February) read the
+    first two as Jan 2 and May 2 and dropped the 13th as unreadable, with no warning about
+    the swap. Numbers-with-slashes are now checked across the whole column: any first
+    number over 12 means day-first; any second number over 12 means month-first (US);
+    if nothing tells them apart, US order is assumed and said so. Returns (dates, note)."""
+    if pd.api.types.is_datetime64_any_dtype(col):
+        return col, None
+    s = col.astype("string").str.strip()
+    nonblank = s.dropna()
+    nonblank = nonblank[nonblank != ""]
+    if not len(nonblank):
+        return pd.to_datetime(s, errors="coerce"), None
+    if nonblank.str.match(_ISO_DATE).mean() >= 0.8:
+        return pd.to_datetime(s, errors="coerce", format="ISO8601"), None
+    parts = nonblank.str.extract(_SLASH_DATE)
+    if parts.notna().all(axis=1).mean() >= 0.8:
+        a = pd.to_numeric(parts[0], errors="coerce")
+        b = pd.to_numeric(parts[1], errors="coerce")
+        day_first = bool((a > 12).any()) and not bool((b > 12).any())
+        note = None
+        if day_first:
+            note = "Dates read as day/month/year (a first number above 12 was found)."
+        elif not (b > 12).any():
+            note = ("Dates could be day/month or month/day; read as month/day/year (US). "
+                    "If that's wrong, write them as YYYY-MM-DD.")
+        return pd.to_datetime(s, errors="coerce", dayfirst=day_first, format="mixed"), note
+    return pd.to_datetime(s, errors="coerce", format="mixed"), None
+
+
+def _repeated_block(df: pd.DataFrame) -> int:
+    """How many times the whole file repeats as one block (1 = it doesn't): rows
+    0..n-1 again as n..2n-1, and so on. A pasted-twice sheet repeats that way; a file
+    with one row per sale repeats rows next to each other, which is real demand."""
+    n = len(df)
+    if n < 2:
+        return 1
+    rows = df.astype(str).agg("\u241f".join, axis=1).tolist()
+    for k in (2, 3, 4):
+        if n % k:
+            continue
+        m = n // k
+        if all(rows[i * m:(i + 1) * m] == rows[:m] for i in range(1, k)):
+            return k
+    return 1
 
 
 def _true_dates(entry) -> pd.DataFrame:
@@ -1919,15 +2695,35 @@ def _ingest(df_raw, filename: str, stock_override: dict | None = None,
     the short version is that a spreadsheet has an unknown vintage and a live feed does
     not, so shifting the one is a fix and shifting the other is corruption."""
     df_raw.columns = [c.strip().lower().replace(" ", "_") for c in df_raw.columns]
+    # Identical rows are NOT dropped one by one any more. A file with one row per sale
+    # has identical rows whenever the same item sells twice on a day at the same price:
+    # 3 mugs became 1 while the message said "no double-counting". What IS collapsed is a
+    # sheet pasted into itself: the whole block of rows repeated, in order, 2-4 times.
+    # Checked here, on the rows as they came, before anything re-sorts them.
+    copies_collapsed = _repeated_block(df_raw)
+    if copies_collapsed > 1:
+        df_raw = df_raw.iloc[: len(df_raw) // copies_collapsed].reset_index(drop=True)
     if not {"date", "units_sold"}.issubset(df_raw.columns):
         raise HTTPException(400, "Missing required columns 'Date' and 'Units_Sold'. "
                                  "Optional: SKU, SKU_Name, Category (or other attributes), Price, On_Promotion, Units_In_Stock.")
     has_sku = "sku" in df_raw.columns
+    if has_sku:
+        # Codes are text (see _read_sheet); trim stray spaces so "A1 " and "A1" are one product.
+        _s = df_raw["sku"]
+        df_raw["sku"] = _s.where(_s.isna(), _s.astype(str).str.strip())
+    date_note = None
     try:
-        df_raw["date"] = pd.to_datetime(df_raw["date"], errors="coerce")
+        df_raw["date"], date_note = _parse_dates(df_raw["date"])
         df_raw["units_sold"] = pd.to_numeric(df_raw["units_sold"], errors="coerce")
     except Exception as e:
         raise HTTPException(400, f"Could not parse data: {e}")
+    # Most dates unreadable means the format was misread, not that the data is bad.
+    # Better to stop and say so than to load a fraction of the history silently.
+    _n = len(df_raw)
+    _bad = int(df_raw["date"].isna().sum())
+    if _n >= 10 and _bad / _n > 0.2:
+        raise HTTPException(400, f"{_bad:,} of {_n:,} dates couldn't be read. "
+                                 "Write dates as YYYY-MM-DD (for example 2024-02-13) and upload again.")
     # ── Data-quality accounting (reported back to the user) ──
     rows_in        = len(df_raw)
     bad_dates      = int(df_raw["date"].isna().sum())
@@ -1944,6 +2740,12 @@ def _ingest(df_raw, filename: str, stock_override: dict | None = None,
     if "on_promotion" in df_raw.columns:
         df_raw["on_promotion"] = df_raw["on_promotion"].fillna(0).clip(0, 1)
     if "units_in_stock" in df_raw.columns:
+        # The stock figures AS GIVEN, before blanks are filled. Blanks become 1 below so
+        # the stockout handling reads an unknown day as "in stock" rather than sold out,
+        # but the last known count must come from real figures: taken after the fill, a
+        # blank latest cell became "1 unit in stock, from your file" and triggered urgent
+        # reorders.
+        df_raw["_stock_raw"] = df_raw["units_in_stock"].clip(lower=0)
         df_raw["units_in_stock"] = df_raw["units_in_stock"].fillna(1).clip(lower=0)
     df_raw = df_raw.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
 
@@ -1968,7 +2770,6 @@ def _ingest(df_raw, filename: str, stock_override: dict | None = None,
     #    transactions) is summed into one daily total; stock/price take the last
     #    value of the day, on-promotion the max. Guarantees exactly one row/day/SKU.
     key = ["sku", "date"] if has_sku else ["date"]
-    df_raw = df_raw.drop_duplicates()
     dups_remaining = int(df_raw.duplicated(subset=key).sum())
     if dups_remaining:
         agg = {}
@@ -1976,6 +2777,7 @@ def _ingest(df_raw, filename: str, stock_override: dict | None = None,
             if c in key:
                 continue
             agg[c] = "sum" if c == "units_sold" else ("max" if c in ("on_promotion", "price_mixed") else "last")
+        # (pandas "last" skips blanks, so _stock_raw keeps the day's last REAL figure.)
         _pr = None
         if "price" in df_raw.columns:
             # Same-day transactions at different prices: a units-weighted day price and a
@@ -1999,6 +2801,10 @@ def _ingest(df_raw, filename: str, stock_override: dict | None = None,
         "badDatesDropped": bad_dates, "missingSalesFilledZero": missing_sales,
         "duplicateRowsMerged": int(max(duplicate_rows_merged, 0)),
     }
+    if copies_collapsed > 1:
+        data_quality["fileRepeatedTimes"] = copies_collapsed
+    if date_note:
+        data_quality["dateFormat"] = date_note
 
     # ── Re-anchor the sheet's timeline to "yesterday" — UPLOADS ONLY ─────────
     # Treat the most recent row in the upload as if it were yesterday, regardless
@@ -2026,7 +2832,7 @@ def _ingest(df_raw, filename: str, stock_override: dict | None = None,
             df_raw["date"] = df_raw["date"] + offset
 
     # Attribute columns = anything not reserved (Category, Brand, Size, …) → relatedness signal.
-    attr_cols = [c for c in df_raw.columns if c not in R.RESERVED_COLS]
+    attr_cols = [c for c in df_raw.columns if c not in R.RESERVED_COLS and c != "_stock_raw"]
 
     if not has_sku:
         sid = filename.replace(".xlsx", "").replace(".xls", "").replace(".csv", "").upper().replace(" ", "-")
@@ -2048,7 +2854,8 @@ def _ingest(df_raw, filename: str, stock_override: dict | None = None,
     carried: dict = {}
     if not append and not reanchor:
         carried = {sid: {"events": list(c.get("events") or []), "attrs": dict(c.get("attrs") or {}),
-                         "attrs_set": list(c.get("attrs_set") or [])}
+                         "attrs_set": list(c.get("attrs_set") or []),
+                         "attrs_ai": list(c.get("attrs_ai") or [])}
                    for sid, c in _catalog.items() if c.get("live_source")}
     if not append:
         _catalog.clear()
@@ -2072,6 +2879,11 @@ def _ingest(df_raw, filename: str, stock_override: dict | None = None,
         _data_end = None
     for sid, (grp, sname) in groups_iter.items():
         keep = ["date", "units_sold"] + [c for c in ("price", "price_mixed", "on_promotion", "units_in_stock") if c in grp.columns]
+        # A product with no stock figure anywhere in the file has no stock data, even if
+        # other products in the file do. Kept as a column of filled-in 1s, it read as
+        # "counted, from your file".
+        if "units_in_stock" in keep and "_stock_raw" in grp.columns and grp["_stock_raw"].isna().all():
+            keep.remove("units_in_stock")
         dfc = grp[keep].rename(columns={"date": "ds", "units_sold": "y"}).copy()
         dfc["ds"] = pd.to_datetime(dfc["ds"])
         # Sheets that only carry a row per SALE day would otherwise hide every
@@ -2087,9 +2899,10 @@ def _ingest(df_raw, filename: str, stock_override: dict | None = None,
             errors.append(f"{sid}: fewer than 2 rows (has {len(dfc)}), skipped."); continue
         # Carry the latest known on-hand stock forward so the UI can pre-fill it.
         # grp is already sorted by date; take the most recent row at or before today.
-        if "units_in_stock" in grp.columns:
+        _stk_col = "_stock_raw" if "_stock_raw" in grp.columns else "units_in_stock"
+        if _stk_col in grp.columns:
             past = grp[grp["date"] <= today()]
-            ss = pd.to_numeric((past if not past.empty else grp)["units_in_stock"], errors="coerce").dropna()
+            ss = pd.to_numeric((past if not past.empty else grp)[_stk_col], errors="coerce").dropna()
             if len(ss) > 0:
                 last_stock[sid] = int(ss.iloc[-1])
         # Latest known per-unit cost (same pattern as stock) → prefills the
@@ -2111,8 +2924,10 @@ def _ingest(df_raw, filename: str, stock_override: dict | None = None,
             if added or overlap:
                 extended.append(sid)
             _hand = set(prev.get("attrs_set") or [])
-            prev["attrs"] = {**(prev.get("attrs") or {}),
-                             **{k: v for k, v in attrs.items() if v is not None and k not in _hand}}
+            _from_file = {k: v for k, v in attrs.items() if v is not None and k not in _hand}
+            prev["attrs"] = {**(prev.get("attrs") or {}), **_from_file}
+            # What the file says replaces an AI guess, and is the file's from now on.
+            prev["attrs_ai"] = sorted(set(prev.get("attrs_ai") or []) - set(_from_file))
             prev["sku_name"] = sname or prev.get("sku_name")
             prev["mode"] = "uploaded"
             prev["filename"] = filename
@@ -2126,6 +2941,7 @@ def _ingest(df_raw, filename: str, stock_override: dict | None = None,
             if append:
                 added_skus.append(sid)
             _kept = carried.get(sid) or {}
+            _file_keys = {k for k, v in attrs.items() if v is not None}   # what this file/store says
             if _kept:
                 # The store's values fill in and update; what a person set by hand wins,
                 # including a category they cleared on purpose.
@@ -2140,6 +2956,8 @@ def _ingest(df_raw, filename: str, stock_override: dict | None = None,
                              "mode": "uploaded", "filename": filename,
                              "events": list(_kept.get("events") or []),
                              "attrs_set": list(_kept.get("attrs_set") or []),
+                             # An AI guess the store's own data now covers is the store's.
+                             "attrs_ai": sorted(set(_kept.get("attrs_ai") or []) - _file_keys),
                              "sources": [filename], "date_shift_days": date_shift_days,
                              # Kept separate from `mode`, which the dashboard reads to decide
                              # whether "Clear all data" is offered. This flag is only about
@@ -2150,6 +2968,11 @@ def _ingest(df_raw, filename: str, stock_override: dict | None = None,
     # "unknown" is a real, distinct answer: a product the store does not inventory-track
     # returns no count, and showing that as a number — any number — is the failure mode.
     stock_src: dict[str, str] = {sid: "sheet" for sid, v in last_stock.items() if v is not None}
+    # The last REAL stock figure a file gave, kept on the product (and saved with it), so
+    # /api/skus reads that rather than the history column, whose blanks are filled with 1.
+    for sid in groups_iter:
+        if sid in _catalog and (last_stock.get(sid) is not None or not append):
+            _catalog[sid]["last_known_stock"] = last_stock.get(sid)
     if stock_override:                       # live inventory → prefill current stock
         for sid in groups_iter:
             if last_stock.get(sid) is None and stock_override.get(sid) is not None:
@@ -2373,9 +3196,234 @@ def save_connection(payload: dict = Body(default={})):
 
 @app.delete("/api/connections/{connection_id}")
 def delete_connection(connection_id: str):
+    slot = _WS.store_slot(connection_id)
+    # Read BEFORE deleting: with nothing recorded, whose products are loaded is worked
+    # out from the saved stores, and this one is about to stop being one.
+    was = _current_slot() if _CONN.get(connection_id) else None
     if not _CONN.delete(connection_id):
         raise HTTPException(404, "No such connection.")
+    # Its set-aside products go with it. If ITS products are the ones loaded, what shows
+    # next is recorded as the spreadsheets: your set-aside sheets come back if there are
+    # any, otherwise its products stay loaded and are yours as a spreadsheet would be.
+    # Leaving "showing" unrecorded let a restart guess another store's workspace, and the
+    # next switch then wrote these products over that store's set-aside copy.
+    if was == slot and _STORE.enabled():
+        if _WS.has(_WS.SHEETS):
+            _swap_workspace(_WS.SHEETS)
+        else:
+            _WS.set_showing(_WS.SHEETS)
+    elif _WS.showing() == slot:
+        _WS.set_showing(_WS.SHEETS)
+    _WS.drop(slot)
+    _closed.drop(slot)
+    _apply_store_zone()
     return {"success": True, "deleted": connection_id}
+
+
+# ── Workspaces: a store's products, or your spreadsheets ─────────────────────────
+# See workspace.py. Pausing a store sets its products aside (with their events, categories
+# and measured protection levels) and brings back whatever spreadsheets were loaded before;
+# putting it back in use does the reverse and catches up with a sync. The saved login is
+# never touched either way.
+def _ws_dirs() -> list:
+    return [("catalog", _STORE.path()), ("backtest", _BTSTORE._DIR)]
+
+
+def _infer_slot(live: bool) -> str:
+    """Whose products these are, when nothing was recorded (an install from before
+    workspaces existed). Store products belong to the store in use or, with none in use,
+    the store used most recently. Paused or not doesn't decide whose they ARE: working it
+    out from "in use" alone called a paused store's products spreadsheets and never set
+    them aside."""
+    if not live:
+        return _WS.SHEETS
+    conns = _CONN.list_active() or _CONN.list_all()
+    return _WS.store_slot(conns[0]["id"]) if conns else _WS.SHEETS
+
+
+def _current_slot() -> str:
+    """The workspace loaded now. Worked out once when there's no record, then recorded, so
+    pausing or resuming a store can't change the answer halfway through a switch."""
+    s = _WS.showing()
+    if s:
+        return s
+    with _state_lock:
+        live = any(e.get("live_source") for e in _catalog.values())
+        empty = not _catalog
+    s = _infer_slot(live)
+    if not empty and _STORE.enabled():
+        _WS.set_showing(s)
+    return s
+
+
+def _reconcile_workspace() -> None:
+    """At startup: a paused store's products must not be what's showing. (They could be,
+    from before workspaces existed, or from the switch that got this wrong.) Set them
+    aside and bring back the spreadsheets, before anything is fitted."""
+    if not _STORE.enabled():
+        return
+    try:
+        s = _WS.showing()
+        if not s:
+            saved, _ = _STORE.load()
+            if not saved:
+                return
+            s = _infer_slot(any(e.get("live_source") for e in saved.values()))
+            _WS.set_showing(s)
+        cid = _WS.connection_of(s)
+        conn = _CONN.get(cid) if cid else None
+        if conn and not _CONN.is_active(conn):
+            _WS.park(s, _ws_dirs())
+            _WS.unpark(_WS.SHEETS, _ws_dirs())
+            _WS.set_showing(_WS.SHEETS)
+            print(f"Store '{conn.get('label')}' is paused: its products were set aside.")
+    except Exception as exc:          # never block startup over this
+        print(f"Workspace check skipped: {exc}")
+
+
+def _showing_store_id() -> str | None:
+    return _WS.connection_of(_current_slot())
+
+
+def _live_readings_apply(sku_id) -> bool:
+    """Whether the store's live readings (shelf price, hourly stock) apply to the loaded
+    products. They are filed by product code only, and the sampler keeps reading a paused
+    store, so a spreadsheet product with the same code as one of its products picked up
+    that store's prices and stock. They apply only while a store's products are the ones
+    loaded. (With saving switched off there are no workspaces to tell them apart, and
+    the readings apply as they always did.)"""
+    try:
+        if not _STORE.enabled():
+            return True
+        return _WS.is_store(_current_slot())
+    except Exception:                                       # noqa: BLE001
+        return False
+
+
+def _swap_workspace(target: str, refit: bool = True):
+    """Set the loaded products aside under their workspace and load `target`'s. Returns
+    None when `target` is already loaded, else whether it had anything to bring back.
+    With refit=False the products are loaded into memory without fitting (the caller is
+    about to re-ingest them)."""
+    with _state_lock:
+        cur = _current_slot()
+        if cur == target:
+            return None
+        if _catalog:
+            _persist_catalog()
+            _WS.park(cur, _ws_dirs())
+        else:
+            _WS.drop(cur)
+        had = _WS.unpark(target, _ws_dirs())
+        _WS.set_showing(target)
+        _bump_ws_epoch()           # any backtest still running measured the other products
+        _apply_store_zone()        # the workspace now loaded may keep a different clock
+        if not refit:
+            saved, extras = _STORE.load()
+            _catalog.clear(); _publish_cache({})
+            _catalog.update(saved)
+            _sheet_costs.clear(); _cost_sources.clear()
+            _sheet_costs.update({k: float(v) for k, v in (extras.get("sheet_costs") or {}).items()})
+            _cost_sources.update({k: str(v) for k, v in (extras.get("cost_sources") or {}).items()})
+            # The measured protection levels in memory belong to the workspace just set
+            # aside. Left in place, the re-import that follows compared them with these
+            # products, found the history "rewritten" and wiped the tiers this workspace
+            # had saved on disk. Forget them and read this workspace's own back.
+            _forget_backtest_memory()
+            _restore_backtest()
+    if refit:
+        warmup()
+    return had
+
+
+def _undo_import_swap(prev_slot: str | None) -> None:
+    """An import that switched workspaces and then failed: go back to what was showing.
+    The failed ingest may have half-replaced the products in memory, but nothing reached
+    disk (the catalog is saved at the end of a successful ingest), so the disk copy is
+    what gets set aside again."""
+    if not prev_slot:
+        return
+    try:
+        with _state_lock:
+            saved, _ = _STORE.load()
+            _catalog.clear(); _publish_cache({})
+            _catalog.update(saved)
+        _swap_workspace(prev_slot)
+    except Exception as exc:                                 # noqa: BLE001
+        print(f"Could not switch back after a failed import ({exc}).")
+
+
+def _set_aside_store_for_upload() -> str | None:
+    """A spreadsheet upload while a store is in use: pause the store and switch to the
+    spreadsheets' workspace first, so the file never merges into (or replaces) the
+    store's products. Returns the paused store's name, or None when nothing changed."""
+    if not _STORE.enabled():
+        return None
+    slot = _current_slot()
+    if not _WS.is_store(slot):
+        return None
+    conn = _CONN.get(_WS.connection_of(slot)) or {}
+    if conn:
+        _CONN.set_active(conn["id"], False)
+    # refit=False: the upload that follows fits everything anyway.
+    _swap_workspace(_WS.SHEETS, refit=False)
+    _apply_store_zone()
+    return conn.get("label") or "The store"
+
+
+@app.get("/api/workspace")
+def workspace_status():
+    slot = _current_slot()
+    cid = _WS.connection_of(slot)
+    conn = _CONN.get(cid) if cid else None
+    return {"showing": "store" if cid else "sheets", "connectionId": cid,
+            "label": (conn or {}).get("label"), "parked": _WS.parked(),
+            "restoring": _restore_state.get("status") == "restoring"}
+
+
+@app.post("/api/connections/{connection_id}/use")
+def use_connection(connection_id: str, payload: dict = Body(default={})):
+    """Body: { active: true | false }.
+
+    true  → this store is in use: synced nightly and its products shown. Whatever is
+            loaded now (spreadsheets, or another store) is set aside first. If the store's
+            products were set aside earlier they come straight back as they were (and the
+            nightly sync catches them up if they've fallen behind); if not, `needsImport`
+            tells the page to import them.
+    false → paused: its products are set aside (not deleted), your spreadsheets come
+            back, and nothing syncs from it until it's back in use. The login stays saved,
+            and stock is still read hourly (those hours can't be recovered later).
+    """
+    if not _CONN.get(connection_id):
+        raise HTTPException(404, "No such connection.")
+    if not _STORE.enabled():
+        raise HTTPException(400, "Switching needs saved data, and saving is switched off "
+                                 "(LOGITRACK_PERSIST=0).")
+    active = bool(payload.get("active", True))
+    slot = _WS.store_slot(connection_id)
+    needs_import = False
+    had = None
+    if active:
+        _CONN.set_active(connection_id, True)
+        had = _swap_workspace(slot)
+        with _state_lock:
+            empty = not _catalog
+        # Set-aside products come back exactly as they were. If they've fallen more than a
+        # sync behind, the nightly sync's own staleness check (it asks the data, see
+        # _data_is_stale) catches them up on its next look; with nothing set aside, the
+        # page is told to import.
+        if not had and (had is False or empty):
+            needs_import = True
+    else:
+        # Whose products are loaded is read BEFORE pausing: with nothing recorded it's
+        # worked out from which store is in use, and after pausing there isn't one.
+        was = _current_slot()
+        _CONN.set_active(connection_id, False)
+        if was == slot:
+            had = _swap_workspace(_WS.SHEETS)
+    return {"connections": _CONN.list_all(), "showing": "store" if active else "sheets",
+            "restored": bool(had), "needsImport": needs_import,
+            "restoring": _restore_state.get("status") == "restoring"}
 
 
 @app.post("/api/connections/test")
@@ -2431,6 +3479,13 @@ def upload_from_source(payload: dict = Body(default={})):
         raise
     except Exception as e:                               # noqa: BLE001
         raise HTTPException(400, f"{source.title()} fetch failed: {e}")
+    # The store's own time zone (Square location, Shopify shop), filed for its workspace
+    # below and used for the app's clock unless one was picked on the Closed days panel.
+    _store_tz = None
+    try:
+        _store_tz = ((raw.attrs.get(source) or {}).get("timezone")) if hasattr(raw, "attrs") else None
+    except Exception:                                    # noqa: BLE001
+        _store_tz = None
 
     # Category + current inventory + unit cost — best-effort by design: if the token lacks
     # the product scope, or the platform simply doesn't expose costs (Square gates them
@@ -2492,10 +3547,59 @@ def upload_from_source(payload: dict = Body(default={})):
         except Exception as exc:                         # noqa: BLE001 — never fail an import over it
             print(f"Could not log inventory reading ({exc}).")
 
-    with _state_lock:
-        res = _ingest(raw, label, stock_override=stock_map, cost_override=cost_map,
-                      reanchor=False,   # live dates are the real dates
-                      cost_source=source)
+    # A saved store imports into ITS workspace: whatever else is loaded (your spreadsheets,
+    # another store) is set aside first, and the store's own set-aside products come back
+    # so the planned events and categories on them carry over into the fresh import.
+    #
+    # A NEW store being saved is filed first, so it gets a workspace of its own and goes
+    # through the same path. It used to set aside only spreadsheets: connecting a second
+    # store while one was in use imported straight over the first store's products, and
+    # nothing kept a copy. A one-off import (not saved) while a store is in use pauses
+    # that store and loads into your spreadsheets' workspace, for the same reason.
+    prev_slot = _current_slot() if _STORE.enabled() else None
+    prev_active = next((c["id"] for c in _CONN.list_all() if c.get("active")), None)
+    created_cid = None
+    store_paused = None
+    swapped = False
+    if _STORE.enabled() and not cid and payload.get("save"):
+        created_cid = cid = _CONN.upsert(source, label, creds)["id"]
+    if cid and _STORE.enabled():
+        _CONN.set_active(cid, True)           # pauses whichever store was in use
+        swapped = _swap_workspace(_WS.store_slot(cid), refit=False) is not None
+    elif _STORE.enabled() and _WS.is_store(prev_slot):
+        was = _CONN.get(_WS.connection_of(prev_slot)) or {}
+        if was:
+            _CONN.set_active(was["id"], False)
+            store_paused = was.get("label") or "The store"
+        swapped = _swap_workspace(_WS.SHEETS, refit=False) is not None
+
+    if _CLOCK.valid(_store_tz):
+        try:
+            _closed.set_detected(_current_slot(), _store_tz, source)
+        except Exception as exc:                         # noqa: BLE001 — never fail an import over it
+            print(f"Could not file the store's time zone ({exc}).")
+    _apply_store_zone()         # before ingesting: the fit starts from the store's "today"
+
+    try:
+        with _state_lock:
+            res = _ingest(raw, label, stock_override=stock_map, cost_override=cost_map,
+                          reanchor=False,   # live dates are the real dates
+                          cost_source=source)
+    except Exception:
+        # Put back what was showing before this import started, as it was.
+        if swapped:
+            _undo_import_swap(prev_slot)
+        if created_cid:
+            _CONN.delete(created_cid)
+            _WS.drop(_WS.store_slot(created_cid)); _closed.drop(_WS.store_slot(created_cid))
+        if prev_active:
+            _CONN.set_active(prev_active, True)
+        elif cid:
+            _CONN.set_active(cid, False)
+        _apply_store_zone()
+        raise
+    if store_paused:
+        res["storePaused"] = store_paused
 
     res["source"] = source
     if source_stats:
@@ -2509,7 +3613,16 @@ def upload_from_source(payload: dict = Body(default={})):
     if payload.get("save") or cid:
         saved = _CONN.upsert(source, label, creds, connection_id=cid)
         _CONN.touch(saved["id"])
-        res["connection"] = saved
+        if _STORE.enabled():
+            _CONN.set_active(saved["id"], True)
+            _WS.set_showing(_WS.store_slot(saved["id"]))
+            if _CLOCK.valid(_store_tz):
+                try:
+                    _closed.set_detected(_WS.store_slot(saved["id"]), _store_tz, source)
+                except Exception:                        # noqa: BLE001
+                    pass
+            _apply_store_zone()
+        res["connection"] = _CONN.public(_CONN.get(saved["id"]) or {}) or saved
     return res
 
 
@@ -2560,11 +3673,16 @@ def _backtest_needed() -> list:
     with _state_lock:
         catalog = dict(_catalog)
         measured = {k.split("|")[0] for k in _backtest_tier_cache}
+        # Tested last time and explained (no cost, sells below cost, too few windows that
+        # could judge the buffer): re-running tonight can't change that answer, so it
+        # isn't a reason to. Only a product that was too SHORT can have grown into one.
+        explained = {sid for sid, why in (_backtest_exclusions or {}).items()
+                     if not str(why).startswith("it only has")}
 
     # 1. Products that have crossed the testable threshold since the last run.
     newly = []
     for sid, e in catalog.items():
-        if sid in measured:
+        if sid in measured or sid in explained:
             continue
         df = e.get("df")
         if df is None or len(df) < 2:
@@ -2703,8 +3821,13 @@ def _run_daily_sync(ledger=None, day=None) -> dict:
     if not saved:
         return {**out, "ok": False, "reason": "no-saved-connection",
                 "detail": "Nothing to sync from. Connect a store and tick Remember this account."}
-    cid = saved[0]["id"]
-    out["label"] = saved[0].get("label")
+    active = [c for c in saved if c.get("active")]
+    if not active:
+        # Paused on purpose: a skip, not a failure (and nothing to retry).
+        return {**out, "ok": True, "skip": True, "reason": "store-paused",
+                "detail": "The store is paused, so nothing syncs until it's back in use."}
+    cid = active[0]["id"]
+    out["label"] = active[0].get("label")
 
     # ── 1. fetch + ingest ────────────────────────────────────────────────────
     if done("fetch"):
@@ -2811,8 +3934,11 @@ def _data_is_stale() -> bool:
     anyone means by "is the tool current", and it fixes itself.
 
     Empty catalog → not stale. There is nothing to refresh, and syncing on boot into an
-    empty app would surprise someone who just wanted to upload a spreadsheet.
+    empty app would surprise someone who just wanted to upload a spreadsheet. Likewise
+    with the store paused (or spreadsheets loaded): there is nothing to sync them from.
     """
+    if not _CONN.list_active() or _showing_store_id() is None:
+        return False
     with _state_lock:
         if not _catalog:
             return False
@@ -2848,8 +3974,16 @@ def data_is_stale_by(newest, now) -> bool:
     return (pd.Timestamp(now).normalize() - pd.Timestamp(newest).normalize()).days > 2
 
 
+def _store_wall_clock():
+    """The store's local time, naive, for the nightly sync: "00:15" means 00:15 where the
+    store is, not wherever the server happens to run (a UTC server fired it at 8:15pm
+    Eastern, before the day being synced was over)."""
+    return _CLOCK.now().replace(tzinfo=None)
+
+
 _sync = _SCHED.DailySync(_run_daily_sync, is_stale=_data_is_stale,
-                         stages=("fetch", "refit", "backtest"))
+                         stages=("fetch", "refit", "backtest"), clock=_store_wall_clock)
+_sync.zone_name = lambda: _CLOCK.zone() or "UTC"   # shown as the sync's time zone
 
 
 # A price change seen by the hourly reading refits that product straight away, up to this
@@ -2904,7 +4038,8 @@ def _sample_stock_now() -> dict:
         t = _SRC.fetch_today(source, creds) or {}
         if t.get("day") and not t.get("unsupported"):
             _today_sales.clear_if_closed(t["day"])
-            rec = _today_sales.record(t["day"], t.get("units") or {})
+            _ln = _local_now()
+            rec = _today_sales.record(t["day"], t.get("units") or {}, hour=_ln.hour + _ln.minute / 60.0)
             res["todaySales"] = {"day": rec["day"], "units": rec["units"], "skus": rec["skus"]}
         elif t.get("unsupported"):
             res["todaySales"] = {"unsupported": True}
@@ -2918,7 +4053,12 @@ def _sample_stock_now() -> dict:
         changed = _live.record(res.pop("prices", None), source)
         if changed:
             res["pricesChanged"] = len(changed)
-            todo = [sid for sid in changed if sid in _catalog][:LIVE_PRICE_REFITS_PER_TICK]
+            # Only while this store's products are the ones loaded: with it paused the
+            # catalog is your spreadsheets, and a matching product code there is not this
+            # store's product.
+            showing_this = _showing_store_id() == full.get("id")
+            todo = ([sid for sid in changed if sid in _catalog][:LIVE_PRICE_REFITS_PER_TICK]
+                    if showing_this else [])
             for sid in todo:
                 with _state_lock:
                     _rebuild(today(), only=sid)
@@ -2926,6 +4066,12 @@ def _sample_stock_now() -> dict:
                 with _state_lock:
                     _persist_catalog()
             res["pricesRefitted"] = len(todo)
+            if showing_this:
+                try:
+                    res["weeksRevised"] = _livelog_reconcile(
+                        [sid for sid in changed if sid in _catalog], trigger="shelf")["revised"]
+                except Exception as exc:                  # noqa: BLE001
+                    res["weeksReviseError"] = str(exc)
     except Exception as exc:                              # noqa: BLE001
         res["livePriceError"] = f"{type(exc).__name__}: {exc}"
     # sample_from_shopify swallows store errors into its return value rather than raising,
@@ -2961,7 +4107,11 @@ def sync_status():
     """When the nightly sync last ran, when it runs next, and what it would sync from."""
     st = _sync.status()
     saved = _CONN.list_all()
-    st["connection"] = saved[0] if saved else None
+    active = [c for c in saved if c.get("active")]
+    st["connection"] = active[0] if active else None
+    # Saved but paused: the page says so instead of "nothing to sync from".
+    st["paused"] = bool(saved) and not active
+    st["showing"] = "store" if _showing_store_id() else "sheets"
     st["catalogSkus"] = len(_catalog)
     st["syncStatePath"] = _sync.state_path
     # The hourly reading is a separate clock with separate rules — it captures a moment,
@@ -2994,7 +4144,7 @@ def sync_now():
 
 @app.post("/api/sync/settings")
 def sync_settings(payload: dict = Body(default={})):
-    """Body: { enabled?, at? } — `at` is 'HH:MM' in the SERVER's local timezone."""
+    """Body: { enabled?, at? } — `at` is 'HH:MM' in the STORE's time zone (store_clock)."""
     return _sync.configure(at=payload.get("at"), enabled=payload.get("enabled"))
 
 
@@ -3171,14 +4321,18 @@ def _compute_groups():
     # clustering itself is measured on it — it used to be computed afterwards, purely to
     # decorate the display.
     _baseline = R.catalog_baseline(pool_catalog)
-    clusters = R.cluster_catalog(groups, pool_catalog, baseline=_baseline)
+    clusters = R.cluster_catalog(groups, pool_catalog, baseline=_baseline,
+                                 family=R.family_map(groups, group_meta))
     member_key = {}; cohesion_by_key = {}
     for g, cls in clusters.items():
         for cl in cls:
             key = tuple(sorted(cl))
             cohesion_by_key[key] = R.cluster_cohesion(cl, pool_catalog, _baseline)
             for m in cl:
-                member_key[m] = key
+                # A category's clusters now include its subgrouped products as donors;
+                # each product is still shown in the cluster of its OWN group.
+                if groups.get(m) == g:
+                    member_key[m] = key
 
     def _nearest_pool_link(sid, group_key, own_cluster_key=None):
         """Best raw seasonal link from `sid` to any eligible multi-SKU pool in
@@ -3288,8 +4442,50 @@ def _compute_groups():
             "yearlyPoolWeight": seas.get("blendWeight"),
             "yearlyPoolSize": seas.get("poolSize"),
             "similar": similar,
+            # What it actually borrows, when that isn't visible from where it's shown:
+            # a product alone on the card that still takes a season or a pooled forecast
+            # from a family it was matched to (see below).
+            "borrowsFrom": _borrows_from(sid, entry, info, ckey, seas),
+            "familyNote": ((info or {}).get("basis") if not (info or {}).get("chosen") else None),
         })
+    # A product at category level (no subgroup of its own) is compared across its whole
+    # category, so its cluster can be made of another subgroup's products: Crew Socks
+    # moving with the two tees. Shown on that subgroup's card, marked as category level,
+    # rather than alone under "different behaviour" as if it matched nothing.
+    own_key = {r["skuId"]: tuple(sorted(r["cluster"])) if r.get("cluster") else None for r in rows}
+    for r in rows:
+        ck = own_key.get(r["skuId"])
+        meta = r.get("groupInfo") or {}
+        if not ck or len(ck) < 2 or meta.get("level") != "base" or r.get("clusterBasis"):
+            continue
+        mates = [m for m in ck if m != r["skuId"]]
+        if not mates or any(groups.get(m) == groups.get(r["skuId"]) for m in mates):
+            continue
+        keys = {own_key.get(m) for m in mates}
+        if len(keys) == 1 and None not in keys:
+            r["cluster"] = list(next(iter(keys)))
+            r["categoryLevel"] = True
+            r["categoryLevelWith"] = [pool_catalog[m].get("sku_name") or m for m in mates if m in pool_catalog]
     return _to_jsonable({"groupColumns": cols, "skus": rows})
+
+
+def _borrows_from(sid, entry, info, ckey, seas):
+    """[{skuId, skuName}] + what, when this product takes something from a family it
+    isn't shown with: a pooled forecast (global route), a yearly shape blended into its
+    forecast, or the season a slow seller is scaled by. None otherwise."""
+    chosen = list((info or {}).get("chosen") or [])
+    if not chosen or (ckey and set(chosen) <= set(ckey)):
+        return None
+    route = entry.get("route")
+    sea = entry.get("seasonality_applied") or {}
+    what = ("its forecast" if route == "global"
+            else "its yearly shape" if (seas or {}).get("blended")
+            else "its season" if route in ("croston", "abstain") and sea.get("source") == "cohort"
+            else None)
+    if not what:
+        return None
+    return {"what": what, "skus": [{"skuId": m, "skuName": (_catalog.get(m) or {}).get("sku_name") or m}
+                                   for m in chosen]}
 
 
 @app.get("/api/groups")
@@ -3307,23 +4503,47 @@ def get_groups():
 def set_attributes(payload: dict = Body(...)):
     """Merge in attributes (e.g. Groq-extracted {category, brand, size, …}) for one
     or more SKUs, re-group + re-route the whole catalog, and return the new groups.
-    Body: { "skus": { "<sku_id>": {"category": "...", "brand": "...", ...}, ... } }"""
+    Body: { "skus": { "<sku_id>": {"category": "...", "brand": "...", ...}, ... },
+            "source": "user" | "ai" }
+
+    `source: "ai"` (the Grouping tab's classifier) only FILLS IN: it sets attributes that
+    are empty or that the AI set before, never one the file, the store or a person gave,
+    and what it sets is not recorded as set by hand. It used to save AI guesses exactly
+    like a person's edits, so opening the Grouping tab replaced the file's own Category
+    and every later import then kept the guess over the file."""
     skus = payload.get("skus", {}) or {}
+    source = "ai" if str(payload.get("source") or "").lower() == "ai" else "user"
     updated = 0
     with _state_lock:
-        return _set_attributes_locked(skus, updated)
+        return _set_attributes_locked(skus, updated, source=source)
 
 
-def _set_attributes_locked(skus, updated):
+def _set_attributes_locked(skus, updated, source: str = "user"):
     for sid, attrs in skus.items():
         if sid in _catalog:
             merged = dict(_catalog[sid].get("attrs") or {})
+            hand = set(_catalog[sid].get("attrs_set") or [])
+            ai = set(_catalog[sid].get("attrs_ai") or [])
             sku_label = f"{sid} {_catalog[sid].get('sku_name') or ''}".lower()
             force_no_category = any(marker in sku_label for marker in NO_CATEGORY_MARKERS)
             changed = False
             for k, v in (attrs or {}).items():
-                if force_no_category and str(k).lower() == "category":
+                k = str(k)
+                if force_no_category and k.lower() == "category":
                     v = None
+                if source == "ai":
+                    # Fill in only: an empty attribute, or one the AI itself set earlier.
+                    owned_by_ai = k in ai or merged.get(k) in (None, "")
+                    if k in hand or not owned_by_ai:
+                        continue
+                    if v in (None, ""):
+                        if k in merged and k in ai:
+                            merged.pop(k, None); ai.discard(k); changed = True
+                        continue
+                    if merged.get(k) != v:
+                        merged[k] = v; changed = True
+                    ai.add(k)
+                    continue
                 if v in (None, ""):
                     if k in merged:
                         merged.pop(k, None)
@@ -3331,9 +4551,10 @@ def _set_attributes_locked(skus, updated):
                 elif merged.get(k) != v:
                     merged[k] = v
                     changed = True
+                hand.add(k); ai.discard(k)
             _catalog[sid]["attrs"] = merged
-            _catalog[sid]["attrs_set"] = sorted(set(_catalog[sid].get("attrs_set") or [])
-                                                | {str(k) for k in (attrs or {})})
+            _catalog[sid]["attrs_set"] = sorted(hand)
+            _catalog[sid]["attrs_ai"] = sorted(ai)
             if changed:
                 updated += 1
     regroup_error = None
@@ -3745,6 +4966,8 @@ def _grade_message(status, reason, days, selling_days, sales, horizon, ready_day
                 "per-period figure stays uncertain however long the history. Good for deciding "
                 f"cover over {horizon} days, not for a precise weekly number.")
     if reason == "dormant":
+        if not sales:
+            return "Hasn't sold yet. Its forecast starts from its own sales once it does."
         return "No recent sales. Nothing to plan from until it starts selling again."
     if reason == "partial_history":
         return (f"Enough to plan the next {horizon} days, but treat it as directional: "
@@ -3849,7 +5072,7 @@ def get_forecast(sku_id: str = Query(...), stock: int = Query(default=ASSUMED_ST
     if _src in (None, "unknown", "none", "null"):
         if "units_in_stock" in df_train.columns:
             _src = "sheet"
-        elif _slog.latest(str(sku_id)) is not None:
+        elif _live_readings_apply(sku_id) and _slog.latest(str(sku_id)) is not None:
             _src = "live"
         else:
             _src = "unknown"
@@ -4207,6 +5430,13 @@ def get_forecast(sku_id: str = Query(...), stock: int = Query(default=ASSUMED_ST
     usf = int(df_train[df_train["ds"].dt.to_period("M") == cmp]["y"].sum())
     fcr = float(fc_fwd[fc_fwd["ds"].dt.to_period("M") == cmp]["yhat"].clip(lower=0).sum())
     lmt = int(df_train[df_train["ds"].dt.to_period("M") == (cmp - 1)]["y"].sum())
+    # The same month a year ago. Against last month, a seasonal product's change is mostly
+    # its season (a sun hat is always up in May); against the same month last year the
+    # season cancels out and what's left is whether the product is actually growing.
+    # Only when the whole of that month is inside the history.
+    _ly = cmp - 12
+    lyt = (int(df_train[df_train["ds"].dt.to_period("M") == _ly]["y"].sum())
+           if len(df_train) and df_train["ds"].min() <= _ly.to_timestamp() else None)
 
     cards = []; cms = pd.Timestamp(today().to_period("M").to_timestamp())
     for i in range(forecast_months):
@@ -4214,7 +5444,10 @@ def get_forecast(sku_id: str = Query(...), stock: int = Query(default=ASSUMED_ST
         fm = forecast[(forecast["ds"] >= ms) & (forecast["ds"] <= me)]; fut = fm[fm["ds"] > last_actual]
         past = df_train[(df_train["ds"] >= ms) & (df_train["ds"] <= last_actual)]
         asum = int(past["y"].sum()); fsum = float(fut["yhat"].clip(lower=0).sum())
-        flo = float(fut["yhat_lower"].clip(lower=0).sum()); fhi = float(fut["yhat_upper"].clip(lower=0).sum())
+        # The range for the month's TOTAL, by the one rule every multi-day range uses
+        # (bands.py). It used to add up the days' lows and highs, which assumes every day
+        # misses fully in the same direction: 14 to 490 around a 215 forecast.
+        flo, fhi = _month_band(fut, fsum, e)
         mflag, mmsg = get_reliability_flag(max((me - today()).days, 1), days_hist)
         cards.append({"monthLabel": ms.strftime("%B %Y"), "isCurrent": i == 0, "actualsSoFar": asum,
                       "forecastRemaining": round(fsum), "projectedTotal": round(asum + fsum),
@@ -4337,7 +5570,7 @@ def get_forecast(sku_id: str = Query(...), stock: int = Query(default=ASSUMED_ST
         # discount goes past known prices and how few years a holiday was learned from.
         "effectBuffer": {"price": round(_sx, 1), "holiday": round(float(np.sqrt(_sh2)), 1),
                          "total": round(_x_extra, 1)},
-        "holidays": e.get("holidays"),
+        "holidays": _holidays_view(e.get("holidays"), tot_fc_days),
         "priceTiers": e.get("price_tiers", []), "priceTrainedMin": e.get("price_trained_min"),
         "priceTrainedMax": e.get("price_trained_max"), "priceSafeMin": e.get("price_safe_min"),
         "priceSafeMax": e.get("price_safe_max"), "priceGapWarning": e.get("price_gap_warning"),
@@ -4385,11 +5618,20 @@ def get_forecast(sku_id: str = Query(...), stock: int = Query(default=ASSUMED_ST
         # assumed level was read as a real position and the countdown ran from it. A
         # missing countdown is honest; a confident wrong one costs someone an order.
         "daysUntilStockout": (max(int(d_so), 0) if (stock_counted and so_ts is not None) else None),
-        "alreadyOut": bool(stock_counted and so_ts is not None and int(d_so) < 0),
+        # A counted zero is out now too. The stockout search starts today, so with nothing
+        # on the shelf it lands on day 0, never below it, and this used to stay False:
+        # screens and exports said "0 days" instead of "Out of stock".
+        "alreadyOut": bool(stock_counted and (float(stock) <= 0
+                                              or (so_ts is not None and int(d_so) < 0))),
         "daysUntilReorder": (d_ro if (stock_counted and ro_ts is not None) else None),
-        "currentMonth": {"unitsSoFar": usf, "forecastRemaining": round(fcr), "lastMonthTotal": lmt},
+        "currentMonth": {"unitsSoFar": usf, "forecastRemaining": round(fcr), "lastMonthTotal": lmt,
+                         "lastYearTotal": lyt},
         "monthCards": cards, "monthlySummary": monthly,
         "chartDataHistory": hist, "chartDataFuture": fut_line, "chartDataRange": fut_rng, "upcomingPromos": promos,
+        # Days the store is closed (Closed days on the Fleet overview) across the chart,
+        # past and future, as chart x values. They're left out of training and forecast
+        # at 0; the chart marks each with a dot on the axis.
+        "closedDays": _closed_chart_days(df_train, sku_id, tot_fc_days),
         "slowSeller": slow_seller, "rateCheck": rate_check,
         "sparseSubtype": _sparse_sub,
         "demandStory": _demand_story,
@@ -4609,7 +5851,15 @@ def units_sold_since(sku_id: str, counted_at, df_train=None) -> dict:
     if counted_at is None:
         return out
     try:
-        cd = pd.to_datetime(counted_at).normalize()
+        cd = pd.to_datetime(counted_at)
+        # The browser saves the moment of a count as UTC ("2026-09-29T14:03:00.000Z").
+        # Compared as-is with the plain dates of the sales history, that raised a
+        # TypeError and every later forecast for the product failed with a 500. The day
+        # that matters is the store's day, so convert to its time zone, then drop the zone.
+        if cd.tzinfo is not None:
+            cd = cd.tz_convert(_APP_TZ) if _APP_TZ else cd.tz_convert(None)
+            cd = cd.tz_localize(None)
+        cd = cd.normalize()
     except (ValueError, TypeError):
         return out
     out["since"] = cd.strftime("%Y-%m-%d")
@@ -4626,8 +5876,25 @@ def units_sold_since(sku_id: str, counted_at, df_train=None) -> dict:
     return out
 
 
+def _sells_in_a_year(df, stock) -> bool:
+    """Would the past year's sales clear this stock, on a line that isn't fading (the past
+    year sold at least half what the year before did)?"""
+    try:
+        if df is None or not len(df) or stock is None:
+            return False
+        t = pd.Timestamp(df["ds"].max())
+        yr = float(df.loc[df["ds"] > t - pd.Timedelta(days=365), "y"].sum())
+        prev_m = (df["ds"] > t - pd.Timedelta(days=730)) & (df["ds"] <= t - pd.Timedelta(days=365))
+        prev = float(df.loc[prev_m, "y"].sum()) if int(prev_m.sum()) >= 300 else None
+        if prev is not None and yr < 0.5 * prev:
+            return False
+        return yr > 0 and yr >= float(stock)
+    except Exception:                                       # noqa: BLE001
+        return False
+
+
 def sc_status(c, dur, st, lt, cov, po, is_new=False, dormant=False, stock_counted=True,
-              ever_sold=True):
+              ever_sold=True, off_season=False, sells_in_a_year=False):
     """The ONE status definition. The fleet card renders these verbatim rather than
     classifying again, so the two tabs cannot disagree about a product.
 
@@ -4677,20 +5944,38 @@ def sc_status(c, dur, st, lt, cov, po, is_new=False, dormant=False, stock_counte
     if not po and dur is not None and dur < risk: return "Stockout risk"
     # A new product is never "Dead stock" — it hasn't had a chance to prove out.
     # It can still read as "Overstocked" (that's an accurate, recoverable signal).
+    # Dead stock is stock that won't sell. Out of season (quiet now as it was this time
+    # last year) has sold nothing lately by definition, and a line whose past year's sales
+    # would clear this stock, and isn't fading, is carrying stock into its next season
+    # (a pool float in late September). Both are over target cover, not dead.
     if (st is not None and st < 0.05) and (c is None or c > (lt + cov) * 3):
-        return "Overstocked" if is_new else "Dead stock"
+        return "Overstocked" if (is_new or off_season or sells_in_a_year) else "Dead stock"
     if c is None or c > (lt + cov): return "Overstocked"
     if not po and dur is not None and risk <= dur <= due: return "Reorder due"
     return "Healthy"
 
 
 def sc_recommendation(direction, tier, st, c, lt, on_promo, po, cost_known, dur,
-                      is_new=False, rising=False, days_hist=None, cov=30):
+                      is_new=False, rising=False, days_hist=None, cov=30, po_sized=False, dur_bare=None):
     # "soon" has to mean the same thing the status does, or the recommendation and the
     # badge above it describe different products. Both come from sc_bands now.
+    #
+    # With a sized PO, `dur` already counts it from the day it lands and `dur_bare` is the
+    # shelf alone. "Covered" is said only when the PO actually covers the gap; a PO too
+    # small or too late gets said as such instead of "No action needed".
     _risk, _due = sc_bands(lt)
     prof = tier in ("A", "B"); soon = dur is not None and dur <= _due
-    if po and soon: return ("Covered: reorder in transit", "A purchase order is already on its way. No action needed.")
+    if po and not po_sized and soon:
+        return ("Covered: reorder in transit", "A purchase order is already on its way. No action needed.")
+    if po_sized:
+        bare_soon = dur_bare is not None and dur_bare <= _due
+        if not soon and bare_soon:
+            return ("Covered: reorder in transit", "The purchase order on its way covers this. No action needed.")
+        if soon:
+            return ("Order in transit won't cover it",
+                    "Even counting the order on its way (from the day it lands), stock runs short"
+                    + (f" and the reorder point passed {abs(dur)} day{'s' if abs(dur) != 1 else ''} ago" if dur < 0 else "")
+                    + ". Order more now, or bring the delivery forward.")
     if soon:
         if dur < 0:
             n = abs(dur); t = (" Profitable line, prioritize it." if prof else " Margins are slim, keep it disciplined.")
@@ -4748,8 +6033,21 @@ def sc_recommendation(direction, tier, st, c, lt, on_promo, po, cost_known, dur,
     return base
 
 
+def _from_today(fc):
+    """The forecast from today on. A product's forecast starts the day after its last sale
+    on file, so with sales data 10 days old the first 10 rows are days that have already
+    passed. Counting their demand against today's stock made the scorecard call a product
+    "Stockout risk" while its own page said "reorder in 7 days". Same rule as fc_fwd in
+    get_forecast, including its fallback for data older than the whole horizon."""
+    if fc is None or fc.empty:
+        return fc
+    fwd = fc[fc["ds"] >= today()]
+    return fwd.reset_index(drop=True) if len(fwd) else fc
+
+
 def sc_score_one(entry, fc, stock, unit_cost, fees, reg_price, td, lt, cov, po, on_promo,
                  on_order=0, on_order_eta=None, stock_source=None, sku_id=None):
+    fc = _from_today(fc)
     df = entry["df_train"]; cutoff = today() - pd.Timedelta(days=td)
     tr = df[df["ds"] > cutoff]; tu = int(tr["y"].sum()) if len(tr) else 0; ta = tu / max(td, 1)
     n30 = fc.head(30) if fc is not None else None
@@ -4763,6 +6061,13 @@ def sc_score_one(entry, fc, stock, unit_cost, fees, reg_price, td, lt, cov, po, 
     inbound = int(on_order or 0)
     cover_pos = (sc_days_of_cover(fc, stock, inbound, on_order_eta) if inbound > 0 else cover)
     dur = None if cover is None else (cover - lt)
+    # The reorder countdown with the open PO counted from the day it lands, which is what
+    # the product page's reorder date already does. The status used to look only at
+    # whether a PO existed: 10 units arriving in 40 days turned a product that runs out
+    # in a week "Healthy". When the browser sends no quantity (older clients), the bare
+    # flag is still trusted, as before.
+    po_sized = bool(po) and inbound > 0
+    dur_eff = (None if cover_pos is None else cover_pos - lt) if po_sized else dur
     denom = tu + max(stock, 0); st = (tu / denom) if denom > 0 else None
     svol = sc_volatility_score(entry.get("residual_dispersion"))
     days_hist = int((df["ds"].max() - df["ds"].min()).days) if len(df) > 1 else 0
@@ -4782,13 +6087,19 @@ def sc_score_one(entry, fc, stock, unit_cost, fees, reg_price, td, lt, cov, po, 
     # outrank evidence the server holds.
     _ssrc = str(stock_source or "").strip().lower()
     if _ssrc in ("", "unknown", "none", "null") and sku_id is not None:
-        _ssrc = "live" if _slog.latest(str(sku_id)) is not None else "unknown"
+        _ssrc = ("live" if _live_readings_apply(sku_id) and _slog.latest(str(sku_id)) is not None
+                 else "unknown")
     if not _ssrc:
         _ssrc = "unknown"
     _counted = _ssrc in ("manual", "live", "sheet")
-    status = sc_status(cover, dur, st, lt, cov, po, is_new,
+    # Cover itself stays on-hand only: a big PO shouldn't flip a product to "Overstocked"
+    # before it has even landed. Only the reorder countdown counts it.
+    status = sc_status(cover, dur_eff, st, lt, cov,
+                       bool(po) and not po_sized, is_new,
                        dormant=bool(entry.get("dormant")), stock_counted=_counted,
-                       ever_sold=bool(len(df) and float(df["y"].sum()) > 0))
+                       ever_sold=bool(len(df) and float(df["y"].sum()) > 0),
+                       off_season=bool(entry.get("off_season")),
+                       sells_in_a_year=_sells_in_a_year(df, stock))
     _disp = entry.get("residual_dispersion")
     # ONE signal. Each of the other three was a restatement of something already on
     # screen, and each was deleted once that was demonstrated.
@@ -4849,8 +6160,9 @@ def sc_score_one(entry, fc, stock, unit_cost, fees, reg_price, td, lt, cov, po, 
     if is_new:
         flags.append({"type": "new", "text": f"New product ({days_hist} days of history), so the health read is provisional."})
     tier = sc_return_tier(margin)
-    action, reason = sc_recommendation(direction, tier, st, cover, lt, on_promo, po, ck, dur,
-                                       is_new=is_new, rising=rising, days_hist=days_hist, cov=cov)
+    action, reason = sc_recommendation(direction, tier, st, cover, lt, on_promo, po, ck, dur_eff,
+                                       is_new=is_new, rising=rising, days_hist=days_hist, cov=cov,
+                                       po_sized=po_sized, dur_bare=dur)
     # Cover and the reorder countdown are both stock ÷ demand. With an assumed stock they
     # are arithmetic on an invented number, and the fleet reads daysUntilReorder straight
     # into an "Overdue Nd" badge — which is how an uncounted, unsold product came to be
@@ -4860,12 +6172,14 @@ def sc_score_one(entry, fc, stock, unit_cost, fees, reg_price, td, lt, cov, po, 
             "daysOfCoverWithInbound": (cover_pos if _counted else None),
             "unitsOnOrder": inbound,
             "coverDirection": (direction if _counted else None),
-            "daysUntilReorder": (dur if _counted else None),
+            # Counting an open PO from its arrival, like the product page's reorder date.
+            "daysUntilReorder": (dur_eff if _counted else None),
             "sellThrough": round(st, 3) if st is not None else None, "trailingUnits": tu,
             "status": status, "statusRank": STATUS_RANK.get(status, 9), "signals": breakdown,
             # The two facts the status now turns on, published so the UI can explain a
             # badge rather than re-derive it and risk disagreeing.
-            "dormant": bool(entry.get("dormant")), "stockCounted": _counted, "stockSource": _ssrc,
+            "dormant": bool(entry.get("dormant")), "offSeason": bool(entry.get("off_season")),
+            "stockCounted": _counted, "stockSource": _ssrc,
             "flags": flags, "marginPct": margin, "returnTier": tier,
             "recommendation": {"action": action, "reason": reason}}
 
@@ -4979,7 +6293,7 @@ def get_history(sku_id: str | None = Query(default=None), recent_days: int = Que
 # ─────────────────────────────────────────────
 def _stream(wb, basename):
     """basename without extension; the download date is appended to the filename."""
-    filename = f"{basename}_{datetime.date.today().isoformat()}.xlsx"
+    filename = f"{basename}_{_CLOCK.today().isoformat()}.xlsx"
     buf = io.BytesIO(); wb.save(buf); buf.seek(0)
     return StreamingResponse(
         buf, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -5009,6 +6323,7 @@ def _export_view(sid, p):
         # Provenance travels into the export too, or the sheet re-derives it and gets it
         # wrong — which is precisely how live Square counts came to be labelled "assumed".
         stock_source=(p.get("stockSource") or None),
+        stock_counted_at=(p.get("stockCountedAt") or None),
     )
     view["__stock"] = int(_num(p.get("stock"), ASSUMED_STOCK))
     return view
@@ -5064,6 +6379,11 @@ def export_all(payload: dict = Body(default={})):
                               "fees": (skus.get(sid) or {}).get("fees"),
                               "leadTime": _num((skus.get(sid) or {}).get("leadTime"), 14),
                               "coverage": _num((skus.get(sid) or {}).get("coverage"), 30),
+                              # The same provenance and PO facts the screen's scorecard
+                              # gets, or the report's statuses differ from the screen's.
+                              "stockSource": (skus.get(sid) or {}).get("stockSource") or "unknown",
+                              "unitsOnOrder": _num((skus.get(sid) or {}).get("unitsOnOrder"), 0),
+                              "onOrderEtaDays": (skus.get(sid) or {}).get("onOrderEtaDays"),
                               "hasOpenPo": (skus.get(sid) or {}).get("hasOpenPo", False)}
                         for sid in _cache()}}
     try:
@@ -5072,7 +6392,9 @@ def export_all(payload: dict = Body(default={})):
         print(f"[export] scorecard: {ex}"); sc_rows = []
     # The backtest lives server-side, so "everything" can include it without the browser
     # having to send it back. Previously it was simply absent from the full report.
-    return _stream(exports.build_all_workbook(items, suppliers, sc_rows, backtest=_last_backtest), "logitrack_full_report")
+    open_pos = payload.get("openPOs") if isinstance(payload.get("openPOs"), dict) else {}
+    return _stream(exports.build_all_workbook(items, suppliers, sc_rows, backtest=_last_backtest,
+                                              open_pos=open_pos), "logitrack_full_report")
 
 
 # ─────────────────────────────────────────────
@@ -5139,7 +6461,7 @@ def catalog_to_frame() -> pd.DataFrame:
     the catalog frame, so per-SKU costs still come from the Scorecard (`sku_costs`)."""
     frames = []
     for sid, entry in _catalog.items():
-        d = entry.get("df")
+        d = _drop_closed(entry.get("df"), entry.get("date_shift_days"))
         if d is None or len(d) < 2:
             continue
         g = d.copy()
@@ -5177,6 +6499,10 @@ _bt_job_lock = threading.Lock()
 _bt_pending: dict | None = None      # newest request that arrived mid-run, if any
 
 
+class _StaleBacktest(Exception):
+    """A run whose products were set aside or replaced before it finished."""
+
+
 def _bt_job_snapshot() -> dict:
     with _bt_job_lock:
         snap = dict(_bt_job)
@@ -5210,10 +6536,10 @@ def _run_backtest_job(params: dict, sku_costs: dict, trigger: str) -> bool:
             df = None
             with _state_lock:            # snapshot the catalog under the lock…
                 df = catalog_to_frame()
+                srcs = catalog_sources()
+                stamp = _bt_stamp()
             # …then compute OUTSIDE it. The fit is the slow part and touches only the
             # snapshot, so holding the lock for minutes would freeze every other request.
-            with _state_lock:
-                srcs = catalog_sources()
             # Merge at RUN time, not just at request time: a queued request replays the
             # costs it captured when it was queued, which can be stale or empty. The
             # sheet costs are the floor no matter when — or from where — the job starts.
@@ -5222,6 +6548,10 @@ def _run_backtest_job(params: dict, sku_costs: dict, trigger: str) -> bool:
             res = BT.run_for_api(df, **params, sku_costs=_eff, sku_sources=srcs, rows_sink=_sink)
             with _state_lock:
                 global _last_backtest_rows, _last_backtest_combos
+                if not _bt_stamp_still_valid(stamp):
+                    # The products it measured were set aside or replaced while it ran.
+                    # Saving it now would file store A's tiers under store B.
+                    raise _StaleBacktest()
                 _last_backtest_rows = _sink[0] if _sink else None
                 _last_backtest_combos = [(c["lead"], c["coverage"]) for c in (res.get("combos") or [])]
                 _cache_backtest_tiers(res)
@@ -5232,6 +6562,10 @@ def _run_backtest_job(params: dict, sku_costs: dict, trigger: str) -> bool:
                 _bt_job.update({"status": "done", "finishedAt": time.time(), "error": None,
                                 "summary": {"tested": res.get("tested"), "forecasts": res.get("forecasts"),
                                             "failedCutoffs": res.get("failedCutoffs")}})
+        except _StaleBacktest:
+            with _bt_job_lock:
+                _bt_job.update({"status": "done", "finishedAt": time.time(), "error": None,
+                                "summary": {"discarded": "the loaded products changed while it ran"}})
         except Exception as ex:
             with _bt_job_lock:
                 _bt_job.update({"status": "error", "finishedAt": time.time(),
@@ -5325,6 +6659,116 @@ def set_holidays(payload: dict = Body(default={})):
     return {"success": True, "settings": clean, "refitting": started, "refit": dict(_holiday_refit)}
 
 
+# ─── Closed days ─────────────────────────────────────────────────────────────────────
+def _catalog_shift() -> int:
+    """How far the loaded history was moved (one shift for a whole sheet; 0 for a store)."""
+    shifts = [int(e.get("date_shift_days") or 0) for e in list(_catalog.values())]
+    return max(set(shifts), key=shifts.count) if shifts else 0
+
+
+def _closed_view() -> dict:
+    st = _closed_settings()
+    t = today().date()
+    sh = datetime.timedelta(days=_catalog_shift())
+    # Days nothing sold anywhere in the store while it normally sells, on real dates. Only
+    # ever offered: a quiet day is not assumed to be a closed one.
+    try:
+        seen = _store_closed_days()
+    except Exception:                                   # noqa: BLE001
+        seen = frozenset()
+    marked = _CD.expand(st, datetime.date(1990, 1, 1), datetime.date(t.year + 3, 12, 31))
+    sugg = sorted(d - sh for d in seen if (d - sh) < t and (d - sh) not in marked)
+    first = last = None
+    for e in list(_catalog.values()):
+        f = e.get("df")
+        if hasattr(f, "columns") and len(f):
+            a_ = pd.to_datetime(f["ds"]).min().date() - datetime.timedelta(days=int(e.get("date_shift_days") or 0))
+            b_ = pd.to_datetime(f["ds"]).max().date() - datetime.timedelta(days=int(e.get("date_shift_days") or 0))
+            first = a_ if first is None or a_ < first else first
+            last = b_ if last is None or b_ > last else last
+    # A holiday the store was shut on in every year of its history is offered as "every year".
+    hints = []
+    if first and last:
+        for k, name in _CD.YEARLY:
+            if k in st["yearly"]:
+                continue
+            days = [_CD._day_of(k, y) for y in range(first.year, last.year + 1)]
+            days = [d for d in days if d and first <= d <= last]
+            if len(days) >= 2 and all((d in set(sugg)) or (d in marked) for d in days):
+                hints.append(k)
+    return {"settings": st,
+            "yearlyOptions": [{"key": k, "name": n, "next": next((d.isoformat() for d in (
+                _CD._day_of(k, y) for y in (t.year, t.year + 1)) if d and d >= t), None)}
+                for k, n in _CD.YEARLY],
+            # Each yearly closure's date in every year the calendar can show, so the page
+            # can draw a switched-on closure without asking again.
+            "yearlyDates": {k: [d.isoformat() for d in (
+                _CD._day_of(k, y) for y in range(min(first.year if first else t.year, t.year - 5), t.year + 4))
+                if d] for k, _ in _CD.YEARLY},
+            "suggestions": [d.isoformat() for d in sugg], "yearlyHints": hints,
+            "history": {"first": first.isoformat() if first else None,
+                        "last": last.isoformat() if last else None},
+            "timezone": _zone_view(),
+            "refit": dict(_holiday_refit)}
+
+
+def _zone_view() -> dict:
+    """The store's clock, for the Closed days panel and the page's own "today"."""
+    zone, source = _resolve_store_zone()
+    z = {}
+    try:
+        z = _closed.get_zone(_current_slot())
+    except Exception:                                   # noqa: BLE001
+        pass
+    return {"zone": zone, "source": source, "detected": z.get("detected"),
+            "detectedFrom": z.get("detectedFrom"), "default": _CLOCK.DEFAULT_ZONE,
+            "today": _CLOCK.today().isoformat()}
+
+
+@app.get("/api/store-clock")
+def store_clock_view():
+    """The store's time zone and today's date on its clock. The page reads its dates from
+    this rather than from the browser's own clock, so the two can't be a day apart."""
+    return _zone_view()
+
+
+@app.get("/api/closed-days")
+def get_closed_days():
+    """The days the store is closed (single dates and yearly holidays), the days that look
+    closed in the sales history but aren't marked, and whether a refit is running."""
+    return _closed_view()
+
+
+@app.post("/api/closed-days")
+def set_closed_days(payload: dict = Body(default={})):
+    """Body: { dates: [YYYY-MM-DD], yearly: [holiday keys] }. Replaces the calendar for
+    what's loaded now, then refits every product in the background: past closed days
+    leave every history the forecast learns from, and closed days ahead are forecast at 0."""
+    slot = _current_slot()
+    payload = dict(payload or {})
+    # The store's time zone rides along: { timezone: "America/Chicago" } picks one, null
+    # goes back to what the store reports (or Eastern). Absent leaves it alone.
+    zone_changed = False
+    if "timezone" in payload:
+        tz_new = payload.pop("timezone")
+        if tz_new not in (None, "") and not _CLOCK.valid(tz_new):
+            raise HTTPException(400, f"'{tz_new}' isn't a time zone.")
+        was = _APP_TZ
+        _closed.set_zone(slot, tz_new or None)
+        zone_changed = _apply_store_zone() != was
+        if not any(k in payload for k in ("dates", "yearly")):
+            payload = dict(_closed.get(slot))
+    before = _closed.get(slot)
+    try:
+        clean = _closed.save(slot, payload or {})
+    except _CD.SettingsError as ex:
+        raise HTTPException(400, str(ex))
+    changed = json.dumps(before, sort_keys=True) != json.dumps(clean, sort_keys=True)
+    # A new zone can move "today" by a day, which every forecast starts from: refit too.
+    started = _start_holiday_refit() if ((changed or zone_changed) and _catalog) else False
+    return {**_closed_view(), "refitting": started}
+
+
 @app.post("/api/skus/{sku_id}/holidays")
 def set_sku_holidays(sku_id: str, payload: dict = Body(default={})):
     """Switch periods off (or back on) for one product, e.g. a spike you know was a
@@ -5348,46 +6792,37 @@ def set_sku_holidays(sku_id: str, payload: dict = Body(default={})):
 
 @app.get("/api/holidays/report")
 def holiday_report_xlsx():
-    """Every product against every period: what each past year showed, what the forecast
-    uses, and when it next applies. One workbook, two sheets."""
+    """Every product against every holiday: this year's stretch and its forecast units, the
+    busiest and quietest days, and the same days in past years. One workbook."""
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment
     wb = Workbook()
     ws = wb.active; ws.title = "By product"
-    head = ["SKU", "Product", "Holiday or period", "Status", "Forecast uses", "Past years (own sales)",
-            "Based on", "Next dates", "Day by day (next time)", "Why"]
+    head = ["SKU", "Product", "Holiday", "Shapes the forecast", "Stretch", "Forecast units", "On the holiday itself",
+            "Busiest day", "Quietest day", "Last year (same days)", "Vs last year", "Past years", "Based on"]
     ws.append(head)
-    label = {"applied": "Applied", "none": "No clear effect", "unseen": "Not in history yet",
-             "discounted": "Can't separate from discounts", "off": "Switched off"}
-    summary = {}
+    label = {"moves": "Yes", "flat": "No real change", "new": "Not in history yet", "off": "Switched off",
+             "merged": "Part of another holiday this time"}
     for sid, e in sorted(_cache().items()):
         rep = e.get("holidays") or {}
+        if rep.get("method") != "shape":
+            continue
         for r in rep.get("effects") or []:
-            yrs = "; ".join(f"{y['start'][:4]}: {'+' if y['pct'] > 0 else ''}{y['pct']}% "
-                            f"({y['units']} sold vs {y['ordinary']} ordinary)" for y in r.get("years") or [])
-            basis = ("own sales" if r["source"] == "own" else f"{r['peers']} similar products" if r["source"] == "peers"
-                     else f"own sales + {r['peers']} similar products" if r["source"] == "own+peers" else "")
-            nxt = r.get("next") or {}
-            days = ", ".join(f"{d['date'][5:]} {'+' if d['pct'] > 0 else ''}{d['pct']}%" for d in r.get("days") or [])
+            f, ly, nx = r.get("forecast") or {}, r.get("lastYear") or {}, r.get("next") or {}
+            pk, qt = r.get("peak") or {}, r.get("quiet") or {}
             ws.append([sid, e.get("sku_name") or sid, r["name"], label.get(r["status"], r["status"]),
-                       (f"{'+' if r['pct'] > 0 else ''}{r['pct']}%" if r["status"] == "applied" else ""),
-                       yrs, basis, (f"{nxt.get('start')} to {nxt.get('end')}" if nxt else ""), days, r["text"]])
-            a = summary.setdefault(r["name"], {"applied": 0, "pcts": [], "checked": 0})
-            a["checked"] += 1
-            if r["status"] == "applied":
-                a["applied"] += 1; a["pcts"].append(r["pct"])
-    ws2 = wb.create_sheet("By holiday")
-    ws2.append(["Holiday or period", "Products it moves", "Products checked", "Smallest lift", "Largest lift"])
-    for name, a in sorted(summary.items(), key=lambda kv: -kv[1]["applied"]):
-        p = sorted(a["pcts"])
-        ws2.append([name, a["applied"], a["checked"], (f"{p[0]:+d}%" if p else ""), (f"{p[-1]:+d}%" if p else "")])
-    for sh, widths in ((ws, [12, 26, 26, 26, 14, 60, 30, 26, 44, 70]), (ws2, [28, 18, 18, 14, 14])):
-        for c in sh[1]:
-            c.font = Font(bold=True, color="FFFFFF"); c.fill = PatternFill("solid", fgColor="1F2328")
-            c.alignment = Alignment(vertical="center")
-        for i, w in enumerate(widths):
-            sh.column_dimensions[chr(65 + i)].width = w
-        sh.freeze_panes = "A2"
+                       f"{nx.get('start')} to {nx.get('end')}", f.get("units"), f.get("coreUnits"),
+                       (f"{pk['date']} ({pk['x']}x)" if pk.get("date") else ""),
+                       (f"{qt['date']} ({qt['x']}x)" if qt.get("date") else ""),
+                       ly.get("units"), (f"{ly['pct']:+d}%" if ly.get("pct") is not None else ""),
+                       "; ".join(f"{y['year']}: {y['units']}" for y in r.get("years") or []), r.get("text") or ""])
+    widths = [12, 26, 28, 22, 26, 14, 18, 20, 20, 18, 12, 40, 60]
+    for c in ws[1]:
+        c.font = Font(bold=True, color="FFFFFF"); c.fill = PatternFill("solid", fgColor="1F2328")
+        c.alignment = Alignment(vertical="center")
+    for i, w in enumerate(widths):
+        ws.column_dimensions[chr(65 + i)].width = w
+    ws.freeze_panes = "A2"
     buf = io.BytesIO(); wb.save(buf); buf.seek(0)
     fn = f"logitrack_holidays_{today().strftime('%Y-%m-%d')}.xlsx"
     return StreamingResponse(buf, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -5477,6 +6912,7 @@ def _run_partial_job(skus: list, params: dict, combos: list, sku_costs: dict, ho
                 df = catalog_to_frame()
                 prev_rows, prev_res = _last_backtest_rows, _last_backtest
                 prev_combos = list(_last_backtest_combos or [])
+                stamp = _bt_stamp()
             # Relatedness still reads the whole catalog; only these products are refitted.
             fresh = BT.run_backtest(df, params["horizon"], params["n_cutoffs"], params["step"],
                                     params["lead"], params["coverage"], params["service_pct"],
@@ -5486,6 +6922,8 @@ def _run_partial_job(skus: list, params: dict, combos: list, sku_costs: dict, ho
             all_combos = sorted({(int(a), int(b)) for a, b in
                                  zip(merged["leadDays"], merged["coverageDays"])})
             with _state_lock:
+                if not _bt_stamp_still_valid(stamp):
+                    raise _StaleBacktest()
                 spans = {s: int((g["ds"].max() - g["ds"].min()).days) for s, g in df.groupby("sku")}
                 res = BT.rebuild_from_rows(prev_res, merged, combos=all_combos,
                                            holding_pct=holding_pct, sku_costs=sku_costs,
@@ -5498,6 +6936,10 @@ def _run_partial_job(skus: list, params: dict, combos: list, sku_costs: dict, ho
             with _bt_job_lock:
                 _bt_job.update({"status": "done", "finishedAt": time.time(), "error": None,
                                 "summary": {"refitted": len(skus), "tested": res.get("tested")}})
+        except _StaleBacktest:
+            with _bt_job_lock:
+                _bt_job.update({"status": "done", "finishedAt": time.time(), "error": None,
+                                "summary": {"discarded": "the loaded products changed while it ran"}})
         except Exception as ex:
             with _bt_job_lock:
                 _bt_job.update({"status": "error", "finishedAt": time.time(),
@@ -5541,18 +6983,29 @@ def backtest_catalog(payload: dict = Body(default={})):
         except Exception: return d
     with _state_lock:
         df = catalog_to_frame()
+        srcs = catalog_sources()
+        stamp = _bt_stamp()
     _sink = []
-    res = BT.run_for_api(df, g("horizon", 44), p.get("cutoffs") or "auto", g("step", 28), g("lead", 14),
-                         g("coverage", 30), _svc(p.get("service", 95)), g("minTrain", 120), g("holding", 25),
+    # A request that names no pairs or holding rate gets the ones in use, not 14/30 at
+    # 25%: the result replaces every product's measured tier, so testing the wrong
+    # settings threw away the right measurements.
+    _combos = _parse_combos(p.get("combos")) or [tuple(c) for c in _combos_in_use()]
+    _lead, _cov = (_combos[0] if _combos else (g("lead", 14), g("coverage", 30)))
+    _hold = g("holding", _session_holding_pct)
+    res = BT.run_for_api(df, g("horizon", 44), p.get("cutoffs") or "auto", g("step", 28), g("lead", _lead),
+                         g("coverage", _cov), _svc(p.get("service", 95)), g("minTrain", 120), _hold,
                          _eff_costs := _effective_sku_costs(_parse_sku_costs(p.get("costs"))),
-                         combos=_parse_combos(p.get("combos")),
-                         sku_sources=catalog_sources(), rows_sink=_sink)
+                         combos=_combos,
+                         sku_sources=srcs, rows_sink=_sink)
     with _state_lock:
         global _last_backtest_rows, _last_backtest_combos
+        if not _bt_stamp_still_valid(stamp):
+            raise HTTPException(409, "The loaded products changed while the test ran, so its "
+                                     "result was not kept. Run it again.")
         _last_backtest_rows = _sink[0] if _sink else None
         _last_backtest_combos = [(c["lead"], c["coverage"]) for c in (res.get("combos") or [])]
         _cache_backtest_tiers(res)
-        _record_backtest_inputs(_eff_costs, g("holding", 25))
+        _record_backtest_inputs(_eff_costs, _hold)
         _store_backtest_result(res, "fleet-tab")
     return res
 
@@ -5573,9 +7026,12 @@ def backtest_recost(payload: dict = Body(default={})):
         holding = int(p.get("holding", _session_holding_pct))
         _session_holding_pct = holding
         eff = _effective_sku_costs(_parse_sku_costs(p.get("costs"))) or {}
+        _sink = []
         res = BT.recost(_last_backtest, _last_backtest_rows, eff,
                         holding_pct=holding,
-                        combos=_last_backtest_combos or None)
+                        combos=_last_backtest_combos or None, rows_sink=_sink)
+        if _sink:       # the windows now carry the prices and costs they were valued at
+            globals()["_last_backtest_rows"] = _sink[0]
         _cache_backtest_tiers(res)
         _record_backtest_inputs(eff, holding)
         _store_backtest_result(res, "recost")
@@ -5587,15 +7043,17 @@ def backtest_recost(payload: dict = Body(default={})):
 def backtest_refresh(payload: dict = Body(default={})):
     """Kick off a background backtest over the LOADED FLEET. Used both by the Backtest
     tab and by the dashboard when lead time or coverage changes."""
+    global _session_holding_pct
     p = payload or {}
     def g(k, d):
         try: return int(p.get(k, d))
         except Exception: return d
+    _combos = _parse_combos(p.get("combos")) or [tuple(c) for c in _combos_in_use()]
+    _lead, _cov = (_combos[0] if _combos else (14, 30))
     params = {"horizon": g("horizon", 44), "n_cutoffs": p.get("cutoffs") or "auto", "step": g("step", 28),
-              "lead": g("lead", 14), "coverage": g("coverage", 30),
+              "lead": g("lead", _lead), "coverage": g("coverage", _cov),
               "service_pct": _svc(p.get("service", 95)), "min_train": g("minTrain", 120),
-              "holding_pct": g("holding", 25), "combos": _parse_combos(p.get("combos"))}
-    global _session_holding_pct
+              "holding_pct": g("holding", _session_holding_pct), "combos": _combos}
     _session_holding_pct = int(params["holding_pct"])
     started = _run_backtest_job(params, _effective_sku_costs(_parse_sku_costs(p.get("costs"))) or {},
                                 p.get("trigger") or "manual")
@@ -5779,10 +7237,13 @@ def _record_backtest_inputs(sku_costs: dict | None, holding_pct) -> None:
     coverage were already part of the cache key; cost and holding were not, so a cost
     edit left a stale figure sitting there labelled 'measured'."""
     global _backtest_inputs
+    with_cost = {str(k): v for k, v in (sku_costs or {}).items() if (v or {}).get("cost") not in (None, "")}
     _backtest_inputs = {
         "holdingPct": (int(holding_pct) if holding_pct is not None else None),
-        "costs": {str(k): float((v or {}).get("cost") or 0.0) for k, v in (sku_costs or {}).items()},
-        "fees": {str(k): float((v or {}).get("fees") or 0.0) for k, v in (sku_costs or {}).items()},
+        "costs": {k: float(v.get("cost") or 0.0) for k, v in with_cost.items()},
+        "fees": {k: float(v.get("fees") or 0.0) for k, v in with_cost.items()},
+        "prices": {str(k): float(v["price"]) for k, v in (sku_costs or {}).items()
+                   if (v or {}).get("price") not in (None, "")},
     }
 
 
@@ -5913,33 +7374,330 @@ import live_actuals as _LA          # noqa: E402
 DEFAULT_LOG_HORIZONS = [7]
 
 
-def _horizon_prediction(future_fc, horizon_days: int):
+def _month_band(fut, point, entry):
+    """(low, high) for the forecast part of a month card: bands.total_band over the month's
+    days still to come. `fut` holds those days' yhat / yhat_lower / yhat_upper."""
+    if fut is None or len(fut) == 0 or point <= 0:
+        return 0.0, 0.0
+    if not {"yhat_lower", "yhat_upper"}.issubset(fut.columns):
+        return point, point
+    y = fut["yhat"].clip(lower=0).to_numpy(float)
+    lo_w = (y - fut["yhat_lower"].clip(lower=0).to_numpy(float)).clip(min=0)
+    hi_w = (fut["yhat_upper"].to_numpy(float) - y).clip(min=0)
+    st = _BANDS.stats_for(entry)
+    return _BANDS.total_band(point, lo_w, hi_w, level_sd=st["levelSd"], ref_mean=st["refMean"],
+                             rho=_BANDS.day_correlation(st["oos"], len(fut)),
+                             band_pct=FORECAST_BAND_PCT)
+
+
+def _horizon_prediction(future_fc, horizon_days: int, start=None, end=None, entry=None):
     """Total units expected over the next `horizon_days`, with a band for that TOTAL.
 
-    The point estimate is just the cumulative sum. The band is not: adding up each day's
-    interval assumes every day misses in the same direction, which would give a band so
-    wide it is always "right" and tells you nothing. Daily half-widths are combined in
-    quadrature instead — the same independent-error assumption the safety-stock formula
-    (z·σ·√lead) already makes. That's deliberate: it means the calibration number this
-    log produces is a direct test of whether your BUFFERS are sized correctly, not just
-    whether some abstract interval was pretty.
+    The point estimate is just the cumulative sum. The band is bands.total_band, the one
+    rule for every multi-day range (the month cards use it too): adding up each day's
+    interval assumes every day misses fully in the same direction (always "right", says
+    nothing), and combining them in quadrature assumes the days' misses are unrelated,
+    which caught only ~60% of real weeks against the 80% claimed. total_band measures how
+    the days' errors move together, and how far off the level runs, from the product's
+    own holdout errors. `entry` is the fitted entry those come from; without it the band
+    falls back to quadrature. What it was built from is returned as `bandStats` so the log
+    can rebuild it the same way when a week is revised.
     """
     import numpy as _np
     h = int(horizon_days)
-    seg = future_fc.head(h)
+    if start is not None:
+        # By DATE, not by position. The forecast begins the day after the last recorded
+        # sale, which is only the week's first day when the week is sealed on time. Sealed
+        # on a Monday, head(7) was Monday..Sunday, graded as Sunday..Saturday.
+        s0 = pd.Timestamp(start).normalize()
+        s1 = pd.Timestamp(end).normalize() if end is not None else s0 + pd.Timedelta(days=h - 1)
+        ds = pd.to_datetime(future_fc["ds"]).dt.normalize()
+        seg = future_fc[(ds >= s0) & (ds <= s1)]
+    else:
+        seg = future_fc.head(h)
     if seg is None or len(seg) == 0:
         return None
     yhat = seg["yhat"].clip(lower=0)
     point = float(yhat.sum())
+    days = [d.date().isoformat() for d in pd.to_datetime(seg["ds"])]
+    base = {"predicted": point, "countFrom": days[0], "days": len(days)}
     if not {"yhat_lower", "yhat_upper"}.issubset(seg.columns):
-        return {"predicted": point, "lo": None, "hi": None}
+        return {**base, "lo": None, "hi": None,
+                "daily": [{"d": d, "y": round(float(v), 3), "lo": 0.0, "hi": 0.0}
+                          for d, v in zip(days, yhat)]}
     lo_w = (yhat - seg["yhat_lower"].clip(lower=0)).clip(lower=0)
     hi_w = (seg["yhat_upper"] - yhat).clip(lower=0)
-    lo_tot = float(_np.sqrt(float((lo_w ** 2).sum())))
-    hi_tot = float(_np.sqrt(float((hi_w ** 2).sum())))
-    return {"predicted": point,
-            "lo": max(0.0, point - lo_tot),
-            "hi": point + hi_tot}
+    st = _BANDS.stats_for(entry) if entry else {"levelSd": 0.0, "refMean": None, "oos": None}
+    bs = {"levelSd": st["levelSd"], "refMean": st["refMean"],
+          "rho": round(_BANDS.day_correlation(st["oos"], len(seg)), 4)}
+    lo_t, hi_t = _BANDS.total_band(point, lo_w.to_numpy(float), hi_w.to_numpy(float),
+                                   level_sd=bs["levelSd"], ref_mean=bs["refMean"], rho=bs["rho"],
+                                   band_pct=FORECAST_BAND_PCT)
+    return {**base,
+            "lo": lo_t,
+            "hi": hi_t,
+            "bandStats": bs,
+            "daily": [{"d": d, "y": round(float(v), 3), "lo": round(float(a), 3), "hi": round(float(b), 3)}
+                      for d, v, a, b in zip(days, yhat, lo_w, hi_w)]}
+
+
+def _local_now():
+    """Now, on the store's clock when the app knows it (set from the browser)."""
+    if _APP_TZ:
+        try:
+            return pd.Timestamp.now(tz=_APP_TZ).tz_localize(None)
+        except Exception:                                   # noqa: BLE001
+            pass
+    return pd.Timestamp.now()
+
+
+def _price_path_now(sid: str, entry: dict, days: list) -> dict:
+    """{date: price} for `days` as things stand NOW: the product's saved events plus the
+    shelf price the POS reports, by the same rules the forecast uses (scheduled_prices).
+
+    Read from the sources rather than from the cached forecast, so a shelf change the
+    hourly reading has seen counts even when that product's refit is still queued."""
+    base = entry.get("last_price")
+    if not base or not days:
+        return {}
+    try:
+        evs = list((_catalog.get(sid) or {}).get("events") or entry.get("events") or [])
+        last = entry.get("df_train")
+        first = ((pd.to_datetime(last["ds"]).max() + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+                 if last is not None and len(last) else str(days[0])[:10])
+        pos = _LP.forecast_events(_live.get(sid) if _live_readings_apply(sid) else None,
+                                  first, str(days[-1])[:10], recorded_price=base)
+        bounds = (entry.get("price_response") or {}).get("bounds")
+        return _UP.future_price_path([str(d)[:10] for d in days], pos + evs, base, bounds=bounds)
+    except Exception:                                       # noqa: BLE001
+        return {}
+
+
+def _price_path_used(entry: dict, days: list) -> dict:
+    """{date: price} as the CACHED forecast assumed it: the events and shelf-price inputs it
+    was last built with. Sealing uses this, not _price_path_now: a product whose refit is
+    still queued (the hourly reading refits a few at a time) must be sealed at the price
+    its forecast really assumed, so the next reconcile sees the change and revises it."""
+    base = entry.get("last_price")
+    if not base or not days:
+        return {}
+    try:
+        evs = list(entry.get("pos_events") or []) + list(entry.get("events") or [])
+        bounds = (entry.get("price_response") or {}).get("bounds")
+        return _UP.future_price_path([str(d)[:10] for d in days], evs, base, bounds=bounds)
+    except Exception:                                       # noqa: BLE001
+        return {}
+
+
+def _price_effect(entry: dict):
+    """f(day, price) -> this product's demand at `price` relative to its recorded price,
+    as its own forecast applies price. None when price doesn't move its forecast.
+
+    Two mechanisms, as in _price_response: a measured or borrowed elasticity, or Prophet's
+    own price input. For Prophet the model is asked directly, the same day at both prices."""
+    pr = entry.get("price_response") or {}
+    base = entry.get("last_price")
+    if not pr.get("applies") or not base:
+        return None
+    if pr.get("elasticity") is not None and pr.get("reason") in ("measured", "borrowed"):
+        el, kr = float(pr["elasticity"]), pr.get("knownRange")
+        return lambda day, p: float(_UP.price_response(el, base, p, kr))
+    # Prophet's own price input. Not reached today (build_entry fits Prophet without price
+    # and applies the cross-checked reading on top, the branch above), kept for when it is.
+    eng = entry.get("engine")
+    if pr.get("reason") != "modelled" or eng is None or not hasattr(eng, "_predict"):
+        return None
+    from forecast_engine import MAX_PRICE_LIFT as _MX, MIN_PRICE_RATIO as _MN
+    memo = {}
+
+    def at(p):
+        k = round(float(p), 4)
+        if k not in memo:
+            b = eng._predict(eng.events, price_override=float(p))
+            memo[k] = dict(zip(pd.to_datetime(b["ds"]).dt.strftime("%Y-%m-%d"),
+                               b["yhat"].clip(lower=0).astype(float)))
+        return memo[k]
+
+    def fn(day, p):
+        y_p, y_b = at(p).get(day), at(base).get(day)
+        if not y_p or not y_b:
+            return 1.0
+        return float(min(max(y_p / y_b, _MN), _MX))
+    return fn
+
+
+def _fmt_days(days: list) -> str:
+    ds = sorted(days)
+    a, b = pd.Timestamp(ds[0]), pd.Timestamp(ds[-1])
+    return a.strftime("%a") if a == b else f"{a.strftime('%a')}–{b.strftime('%a')}"
+
+
+def _livelog_reconcile(skus=None, *, trigger: str = "price", now=None) -> dict:
+    """Bring open weeks in line with the price each remaining day will now sell at.
+
+    Every sealed, ungraded week remembers the price each of its days was forecast at. When
+    that stops being the price the day will sell at (a promotion saved partway through the
+    week, a shelf price changed at the till), those days, and only those, are revised: the
+    ORIGINAL forecast for the day times this product's own price effect, new price against
+    old. Days already sold are never touched. Today, when the change lands partway through
+    it, takes the effect only on the share of a normal day's sales still to come.
+
+    Idempotent: once a day carries the new price there is nothing left to find, so running
+    it on every trigger (and every tick, to catch anything missed) is safe."""
+    t_now = pd.Timestamp(now) if now is not None else _local_now()
+    # The log's own clock (UTC) for "is this week already due"; a test's `now` is taken as it.
+    _utc_now = (t_now.to_pydatetime().replace(tzinfo=datetime.timezone.utc) if now is not None else None)
+    today_s = t_now.strftime("%Y-%m-%d")
+    hour = t_now.hour + t_now.minute / 60.0
+    snap = _cache()
+    wanted = set(str(x) for x in skus) if skus is not None else None
+    revised, dirty = [], False
+    # Only the loaded store's weeks: another store's (or a paused one's) weeks were made
+    # for its own products, and a same-code product loaded now says nothing about them.
+    _owner = _log_owner()
+    for e in list(_flog.all()):
+        if _owner is None or (e.get("store") or _owner) != _owner:
+            continue
+        sid = e.get("sku")
+        if wanted is not None and sid not in wanted:
+            continue
+        # Never a week already due for grading on the log's own clock: in the evening in
+        # the US it is already the next day in UTC, and grading may be under way.
+        if _FL.is_scored(e) or _FL.is_due(e, _utc_now) or e.get("dueAt", "") < today_s:
+            continue
+        daily = e.get("daily") or []
+        open_days = [d for d in daily if d.get("d", "") >= today_s and d.get("price") is not None]
+        if not open_days:
+            continue
+        entry = snap.get(sid) or {}
+        path = _price_path_now(sid, entry, [d["d"] for d in open_days])
+        diff = [d for d in open_days
+                if path.get(d["d"]) and abs(path[d["d"]] - float(d["price"])) > 0.005 * max(float(d["price"]), 0.01)]
+        if not diff:
+            continue
+        eff = _price_effect(entry)
+        factors, split = {}, None
+        for d in diff:
+            p_old, p_new = float(d["price"]), float(path[d["d"]])
+            r = 1.0
+            if eff is not None:
+                try:
+                    m_old = eff(d["d"], p_old)
+                    r = eff(d["d"], p_new) / m_old if m_old > 0 else 1.0
+                except Exception:                           # noqa: BLE001
+                    r = 1.0
+            if d["d"] == today_s:
+                start_h = hour
+                lv = (_live.get(sid) if _live_readings_apply(sid) else None) or {}
+                # When the POS says when its discount began, and today was sealed at the
+                # undiscounted shelf price, that start is when the change happened: an
+                # earlier day means all of today. (A discount that later got deeper keeps
+                # the hour it was noticed: its start time belongs to the first step.)
+                _lp = lv.get("listPrice")
+                if (trigger == "shelf" and lv.get("discounted") and lv.get("discountFrom")
+                        and _lp is not None and abs(p_old - float(_lp)) <= 0.005 * max(float(_lp), 0.01)):
+                    try:
+                        df_ = pd.Timestamp(lv["discountFrom"])
+                        if df_.tzinfo is not None:           # onto the store's clock, naive
+                            df_ = df_.tz_convert(_APP_TZ).tz_localize(None) if _APP_TZ else df_.tz_convert(None)
+                        if df_.strftime("%Y-%m-%d") < today_s:
+                            start_h = 0.0
+                        elif (df_.strftime("%Y-%m-%d") == today_s and df_ <= t_now
+                              and "T" in str(lv["discountFrom"])):
+                            start_h = df_.hour + df_.minute / 60.0
+                    except Exception:                       # noqa: BLE001
+                        pass
+                share, basis = _today_sales.share_after(start_h)
+                split = (start_h, share, basis)
+                r = (1.0 - share) + share * r
+            factors[d["d"]] = (r, p_new, p_old)
+        first = diff[0]
+        p0, p1 = float(first["price"]), float(path[first["d"]])
+        what = ("promotion or price change saved" if trigger == "planned"
+                else "shelf price changed" if trigger == "shelf" else "price changed")
+        when = ""
+        if split is not None:
+            hh = int(split[0]); ap = "AM" if hh < 12 else "PM"; h12 = hh % 12 or 12
+            when = f", from ~{h12} {ap} {pd.Timestamp(today_s).strftime('%a')}"
+        reason = f"{what}: {_fmt_days([d['d'] for d in diff])} ${p0:.2f} → ${p1:.2f}{when}"
+        if eff is None:
+            reason += " (this product's forecast doesn't respond to price)"
+        with _flog._lock:                                   # noqa: SLF001 - same module family
+            cur = _flog._entries.get(e["id"])
+            if cur is None or _FL.is_scored(cur):
+                continue
+            # Re-checked under the lock: only days still carrying the price the factor was
+            # worked out from. Two triggers at once (the hourly reading and a tick) would
+            # otherwise both apply the same change, 1.5x becoming 2.25x.
+            _now_p = {d["d"]: d.get("price") for d in (cur.get("daily") or [])}
+            ok = {k: (f[0], f[1]) for k, f in factors.items()
+                  if _now_p.get(k) is not None and abs(float(_now_p[k]) - f[2]) <= 1e-6}
+            if not ok:
+                continue
+            new = _FL.revise_days(cur, ok, reason)
+            if new is not cur:
+                _flog._entries[e["id"]] = new
+                dirty = True
+                if new.get("amended") and new.get("predicted") != cur.get("predicted"):
+                    revised.append({"id": e["id"], "reason": reason,
+                                    "before": cur.get("predicted"), "after": new.get("predicted"),
+                                    "splitBasis": split[2] if split else None})
+    if dirty:
+        with _flog._lock:                                   # noqa: SLF001
+            _flog.save()                                    # once per pass, not once per product
+    return {"revised": len(revised), "entries": revised}
+
+
+# ── Whose record: the live log is kept per store ────────────────────────────────────
+# One log file, but every week is filed under the store it was predicted for (its
+# connection id), or "sheets" when it was sealed from spreadsheets with no store at all.
+# The Live accuracy tab shows the record of what's loaded; a paused store's weeks are kept
+# and keep being graded against that store's own sales, but they don't show while your
+# spreadsheets are loaded.
+LOG_SHEETS = "sheets"
+
+
+def _log_owner() -> str | None:
+    """Whose record goes with what's loaded: the store in use, or None while spreadsheets
+    are loaded and a store is saved (nothing of theirs is tracked)."""
+    sid = _showing_store_id()
+    if sid:
+        return sid
+    return None if _CONN.list_all() else LOG_SHEETS
+
+
+def _store_products(owner) -> set:
+    """The products a store lists: its loaded catalog while it's in use, else the copy
+    set aside when it was paused. Empty for spreadsheets or an unknown store."""
+    if not owner or owner == LOG_SHEETS:
+        return set()
+    try:
+        if _showing_store_id() == owner:
+            with _state_lock:
+                return {str(k) for k in _catalog}
+        path = os.path.join(_WS._slot_dir(_WS.store_slot(owner)), "catalog", "manifest.json")
+        with open(path) as fh:
+            return {str(k) for k in (json.load(fh).get("skus") or {})}
+    except Exception:                                        # noqa: BLE001
+        return set()
+
+
+def _claim_legacy_log() -> None:
+    """Weeks sealed before the log recorded whose they were. They were only ever sealed
+    for the store in use, so they're the store's: the one showing, else the most recently
+    used saved store."""
+    try:
+        if None not in _flog.stores():
+            _flog.dedupe()
+            return
+        sid = _showing_store_id()
+        if not sid:
+            saved = _CONN.list_all()
+            sid = saved[0]["id"] if saved else LOG_SHEETS
+        _flog.claim_untagged(sid)
+        _flog.dedupe()
+    except Exception as exc:                                # noqa: BLE001
+        print(f"Live log: could not file older weeks ({exc}).")
 
 
 @app.post("/api/livelog/snapshot")
@@ -5953,6 +7711,11 @@ def livelog_snapshot(payload: dict = Body(default={})):
     horizons = payload.get("horizons") or DEFAULT_LOG_HORIZONS
     cadence = payload.get("cadence") or _FL.WEEKLY
     rows, skipped = [], []
+    origin = _FL.period_origin(cadence=cadence)
+    _owner = _log_owner()
+    if _owner is None:          # spreadsheets loaded while a store is paused: not tracked
+        return {"added": 0, "skipped": 0, "candidates": 0, "reason": "store-paused",
+                "summary": _flog.summary()}
     # A snapshot, not the lock: sealing the week must not queue behind a refit that
     # holds _state_lock for minutes — a missed seal is a permanent hole in the record.
     _snap = _cache()
@@ -5965,16 +7728,24 @@ def livelog_snapshot(payload: dict = Body(default={})):
             continue
         name = (_catalog.get(sid) or {}).get("sku_name") or sid
         for h in horizons:
-            pred = _horizon_prediction(fc, h)
+            pred = _horizon_prediction(fc, h, start=origin, entry=e)
             if pred is None:
                 skipped.append(sid)
                 continue
+            # The price each day is forecast at, so a later change of price can be found
+            # and the week revised for it (see _livelog_reconcile).
+            _pp = _price_path_used(e, [d["d"] for d in pred["daily"]])
+            for _d in pred["daily"]:
+                _d["price"] = _pp.get(_d["d"])
             rows.append({"sku": sid, "skuName": name, "horizonDays": int(h),
                          "predicted": pred["predicted"], "lo": pred["lo"], "hi": pred["hi"],
+                         "countFrom": pred["countFrom"], "daily": pred["daily"],
+                         "bandStats": pred.get("bandStats"),
                          # The same constant the chart is drawn to, so what the log grades
                          # and what the user sees can never diverge.
-                         "band": FORECAST_BAND_PCT, "model": (e.get("details") or {}).get("route")})
-    res = _flog.snapshot(rows, cadence=cadence)
+                         "band": FORECAST_BAND_PCT, "model": (e.get("details") or {}).get("route"),
+                         "store": _owner})
+    res = _flog.snapshot(rows, cadence=cadence, origin=origin)
     return {**res, "skipped": len(skipped), "candidates": len(rows),
             "nextOrigin": _FL.next_origin(cadence=cadence).isoformat(),
             "summary": _flog.summary()}
@@ -6021,20 +7792,38 @@ def livelog_score(payload: dict = Body(default={})):
 
     Anything not yet due is untouched — the clock decides, not the button.
     """
-    pending = _flog.pending()
+    _claim_legacy_log()
     due = _flog.due()
     if not due:
         return {"scored": 0, "unavailable": 0, "reason": "nothing-due",
                 "summary": _flog.summary()}
-    source, creds = _livelog_connection(payload)
-    try:
-        fn = _SRC.actuals_provider(source, pending, creds)
-    except Exception as exc:
-        raise HTTPException(400, f"Could not read the store: {exc}")
-    res = _flog.score_due(fn)
-    return {**res, "source": source, "sourceFailed": bool(getattr(fn, "failed", False)),
-            "lookbackDays": getattr(fn, "days", None),
-            "summary": _flog.summary()}
+    # Each store's weeks are graded against THAT store's sales. It used to read whichever
+    # store was used most recently, for every week in the log.
+    total = {"scored": 0, "unavailable": 0, "scoredIds": [], "stillWaiting": 0}
+    failed, last_source, lookback = False, None, None
+    for owner in sorted({e.get("store") for e in due}, key=str):
+        if owner == LOG_SHEETS:
+            if _CONN.list_all():
+                continue        # spreadsheet predictions can't be graded against a store
+            source, creds = _livelog_connection(payload)
+        elif owner and _CONN.get(owner):
+            full = _CONN.get(owner) or {}
+            source, creds = full.get("source"), (full.get("creds") or {})
+        else:
+            continue            # that store was deleted: nothing to grade against
+        pending = [e for e in _flog.pending() if e.get("store") == owner]
+        try:
+            fn = _SRC.actuals_provider(source, pending, creds,
+                                       known_skus=_store_products(owner))
+        except Exception as exc:
+            raise HTTPException(400, f"Could not read the store: {exc}")
+        res = _flog.score_due(fn, select=lambda e, o=owner: e.get("store") == o)
+        total["scored"] += res["scored"]; total["unavailable"] += res["unavailable"]
+        total["scoredIds"] += res["scoredIds"]; total["stillWaiting"] = res["stillWaiting"]
+        failed = failed or bool(getattr(fn, "failed", False))
+        last_source, lookback = source, getattr(fn, "days", None)
+    return {**total, "source": last_source, "sourceFailed": failed,
+            "lookbackDays": lookback, "summary": _flog.summary()}
 
 
 @app.post("/api/livelog/tick")
@@ -6052,6 +7841,7 @@ def livelog_tick(payload: dict = Body(default={})):
     same one set of predictions and grades nothing new.
     """
     out = {"snapshot": None, "score": None, "stock": None}
+    _claim_legacy_log()
     source, creds = _livelog_connection(payload)
     out["source"] = source
     # Read inventory FIRST. Shopify keeps no queryable stock history, so a reading missed
@@ -6062,11 +7852,30 @@ def livelog_tick(payload: dict = Body(default={})):
         out["stock"] = _SRC.sample_stock(source, _slog, creds)
     except Exception as exc:
         out["stock"] = {"ok": False, "error": str(exc), "added": 0}
+    # New predictions are sealed only while a store in use is what's loaded. Spreadsheets
+    # loaded while the store is paused would otherwise be sealed and later graded against
+    # the store's real sales, for products it doesn't have. Grading what was already sealed
+    # carries on either way.
+    _sid = _showing_store_id()
+    if _sid and any(c["id"] == _sid for c in _CONN.list_active()):
+        try:
+            out["snapshot"] = livelog_snapshot({"horizons": payload.get("horizons"),
+                                                "cadence": payload.get("cadence")})
+        except Exception as exc:
+            out["snapshot"] = {"error": str(exc), "added": 0}
+    elif _CONN.list_all():
+        out["snapshot"] = {"skipped": "store-paused", "added": 0}
+    else:
+        try:
+            out["snapshot"] = livelog_snapshot({"horizons": payload.get("horizons"),
+                                                "cadence": payload.get("cadence")})
+        except Exception as exc:
+            out["snapshot"] = {"error": str(exc), "added": 0}
+    # Anything a trigger missed (a refit that failed, a change made while this was down).
     try:
-        out["snapshot"] = livelog_snapshot({"horizons": payload.get("horizons"),
-                                            "cadence": payload.get("cadence")})
-    except Exception as exc:
-        out["snapshot"] = {"error": str(exc), "added": 0}
+        out["revised"] = _livelog_reconcile()
+    except Exception as exc:                                # noqa: BLE001
+        out["revised"] = {"error": str(exc), "revised": 0}
     if _flog.due():
         try:
             # Pass the resolved connection through rather than re-resolving from an empty
@@ -6223,17 +8032,41 @@ def availability_read(sku: str = Query(...), days: int = Query(default=60, ge=1,
 
 @app.get("/api/livelog")
 def livelog_read(sku: str | None = Query(default=None), limit: int = Query(default=500, ge=1, le=5000)):
-    entries = _flog.for_sku(sku) if sku else _flog.all()
+    _claim_legacy_log()
+    owner = _log_owner()
+    mine = _flog.for_store(owner) if owner is not None else []
+    # A product that has left the store (deleted, or its SKU changed in the POS) can't be
+    # graded: there are no sales under that code to read. Such weeks used to sit as
+    # "ready" for ever and count as products in the week. They're listed as gone and
+    # left out of the week's figures; weeks graded before it left keep their result.
+    listed = _store_products(owner) if owner not in (None, LOG_SHEETS) else None
+    gone = ({e["id"] for e in mine if not _FL.is_scored(e) and e["sku"] not in listed}
+            if listed else set())
+    counted = [e for e in mine if e["id"] not in gone]
+    entries = [e for e in mine if e["sku"] == str(sku)] if sku else mine
     entries = list(reversed(entries))[:limit]
     out = []
     for e in entries:
         d = dict(e)
         d["dueInDays"] = _FL.days_until_due(e)
         d["isDue"] = _FL.is_due(e)
+        d["gone"] = e["id"] in gone
         out.append(d)
     org = _FL.period_origin()
-    return {"entries": out, "weeks": _FL.by_week(_flog.all()),
-            "summary": _flog.summary(), "perSku": _FL.per_sku(_flog.all()),
+    # While spreadsheets are loaded and a store is paused, say whose record exists instead
+    # of showing the store's weeks as though they were about the spreadsheet.
+    paused = None
+    if owner is None:
+        conns = {c["id"]: c for c in _CONN.list_all()}
+        kept = {st: len(_flog.for_store(st)) for st in _flog.stores() if st in conns}
+        if kept:
+            st = max(kept, key=kept.get)
+            paused = {"label": conns[st].get("label") or "Your store", "entries": kept[st],
+                      "weeks": len({e["week"] for e in _flog.for_store(st)})}
+    return {"entries": out, "weeks": _FL.by_week(counted),
+            "showing": "store" if owner not in (None, LOG_SHEETS) else "sheets",
+            "tracked": owner is not None, "pausedStore": paused,
+            "summary": _FL.summarise(counted), "perSku": _FL.per_sku(counted),
             "cadence": _FL.WEEKLY,
             "currentOrigin": org.isoformat(),
             "currentPeriodEnds": (org + _dt.timedelta(days=6)).isoformat(),
@@ -6249,35 +8082,29 @@ def livelog_amend(payload: dict = Body(default={})):
     visible rather than silent. Already-graded weeks are refused outright.
     """
     sku, week = payload.get("sku"), payload.get("week")
-    reason = payload.get("reason") or "promotion declared mid-week"
     if not sku or not week:
         raise HTTPException(400, "sku and week are required")
-    entry = next((e for e in _flog.for_sku(sku) if e.get("origin") == str(week)[:10]), None)
+    _owner = _log_owner()
+    entry = next((e for e in _flog.for_sku(sku) if e.get("origin") == str(week)[:10]
+                  and (e.get("store") or _owner) == _owner), None)
     if entry is None:
         raise HTTPException(404, "no entry for that product and week")
     if _FL.is_scored(entry):
         raise HTTPException(409, "that week is already graded")
 
-    # Re-derive the week's forecast WITH the promotion now scheduled, over the days that
-    # remain. Days already elapsed keep what was originally expected — the campaign
-    # cannot lift sales that have already happened.
-    e = _cache().get(sku) or {}
-    fc = e.get("future_fc")
-    if fc is None or not len(fc):
-        raise HTTPException(409, "no current forecast to revise from")
-    h = int(entry.get("horizonDays") or 7)
-    pred = _horizon_prediction(fc, h)
-    if pred is None:
-        raise HTTPException(409, "could not build a revised figure")
-
-    with _flog._lock:                                   # noqa: SLF001 - same module family
-        _flog._entries[entry["id"]] = _FL.amend(
-            entry, pred["predicted"], reason, lo=pred["lo"], hi=pred["hi"])
-        _flog.save()
-    return {"amended": True, "entry": _flog._entries[entry["id"]]}
+    # The same path every trigger takes: only days whose price has changed move, each by
+    # this product's own price effect on its ORIGINAL forecast. Re-forecasting the rest of
+    # the week here would grade a forecast made with the week's first days already known.
+    _livelog_reconcile([sku], trigger="planned")
+    return {"amended": bool((_flog._entries.get(entry["id"]) or {}).get("amended")),
+            "entry": _flog._entries.get(entry["id"])}
 
 
 @app.post("/api/livelog/reset")
 def livelog_reset():
-    _flog.purge()
-    return {"ok": True, "summary": _flog.summary()}
+    """Start the record over, for what's loaded only: another store's weeks are kept."""
+    _claim_legacy_log()
+    owner = _log_owner()
+    if owner is not None:
+        _flog.purge_store(owner)
+    return {"ok": True, "summary": _FL.summarise(_flog.for_store(owner) if owner else [])}

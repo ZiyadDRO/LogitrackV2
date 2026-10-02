@@ -2,8 +2,37 @@
 
 // "Today" is computed at CALL time, not module-load time — a tab left open past
 // midnight used to keep showing yesterday's dates and urgency until a refresh.
-export function todayMs() { return Date.now(); }
-export function todayStr() { return new Date().toISOString().split("T")[0]; }
+//
+// And on the STORE's clock. These used the UTC date, so from 8pm Eastern the browser was
+// already on tomorrow: order-by dates showed a day late, "Mark received" recorded
+// tomorrow (adding a day to measured lead times), and PO arrivals counted a day short.
+// The zone comes from the server (/api/store-clock, set in App via setStoreZone), the same
+// one the forecasts use, so the page and the server can't disagree about the date. Until
+// it arrives, the browser's own calendar date is used, never UTC.
+let _storeZone = null;
+export function setStoreZone(zone) { _storeZone = zone || null; }
+export function storeZone() { return _storeZone; }
+const _pad2 = (n) => String(n).padStart(2, "0");
+/** Today's date on the store's clock, "YYYY-MM-DD". */
+export function todayStr() {
+  const now = new Date();
+  if (_storeZone) {
+    try {
+      const parts = new Intl.DateTimeFormat("en-US", { timeZone: _storeZone, year: "numeric",
+        month: "2-digit", day: "2-digit" }).formatToParts(now);
+      const get = (t) => parts.find((p) => p.type === t)?.value;
+      if (get("year") && get("month") && get("day")) return `${get("year")}-${get("month")}-${get("day")}`;
+    } catch { /* unknown zone: fall through to the local calendar */ }
+  }
+  return `${now.getFullYear()}-${_pad2(now.getMonth() + 1)}-${_pad2(now.getDate())}`;
+}
+/** Midnight UTC of the store's today: the day grid every date in the app sits on (the
+ *  server sends dates as UTC midnights, "2026-08-30" parses as one). Not "now": date
+ *  arithmetic from the current moment is what drifted a day in the evening. */
+export function todayMs() {
+  const [y, m, d] = todayStr().split("-").map(Number);
+  return Date.UTC(y, m - 1, d);
+}
 
 /* stock defaults to 0, NOT 500.
  *
@@ -213,7 +242,11 @@ export function buildScorecardBody(skuList, skuParams, openPOs, suppliers, trail
          overdue-reorder badge. With it, the server suppresses every figure that is
          stock-divided-by-demand rather than publishing arithmetic on a placeholder. */
       stockSource: p.stockSource || "unknown",
-      leadTime: planningLeadTime(s.id, p, suppliers, { ignoreOneOff: true }).days,
+      /* The lead time the FORECASTS plan on, one-off slow shipment included. This used to
+         ignore the one-off, so with a 45-day next shipment on a 14-day line the product
+         page said "reorder overdue" while this badge said "Reorder due". (The backtest's
+         signature in App.jsx ignores the one-off on purpose: it measures the normal lane.) */
+      leadTime: planningLeadTime(s.id, p, suppliers).days,
       coverage: p.coverage,
       unitCost: p.unitCost ?? null,
       fees: p.fees ?? 0,
@@ -490,9 +523,8 @@ export function poEtaDays(po) {
      the previous local day: every ETA came back a day short, so in-transit stock started
      counting toward cover a day before it could possibly arrive. */
   const etaUtc = Date.UTC(eta.getUTCFullYear(), eta.getUTCMonth(), eta.getUTCDate());
-  const now = new Date();
-  const todayUtc = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
-  return Math.max(0, Math.round((etaUtc - todayUtc) / 86400000));
+  // Today on the store's clock, on the same UTC-midnight grid.
+  return Math.max(0, Math.round((etaUtc - todayMs()) / 86400000));
 }
 
 
@@ -728,6 +760,82 @@ export function adoptParkedOrders(suppliers, supId, skuId) {
   if (rest.length) next[UNASSIGNED_SUP_ID] = { ...led, orders: rest };
   else delete next[UNASSIGNED_SUP_ID];
   return next;
+}
+
+/* ─── THE OPEN PO AND ITS SUPPLIER ORDER ──────────────────────────────────────
+ *
+ * A product has one open PO (openPOs[skuId]) and each PO is filed as an order in the
+ * supplier history. They are linked by `orderId` on the PO. Before the link, marking ANY
+ * open order for a product received cleared its PO, and clearing the PO marked the
+ * FIRST open order received, so with two orders on the water one arrival cancelled the
+ * other. POs saved before the link are matched by order date and quantity, and only when
+ * that picks out exactly one order.
+ */
+export function findPoOrder(suppliers, skuId, po) {
+  if (!po) return null;
+  const hits = [];
+  for (const sup of Object.values(suppliers || {})) {
+    (sup?.orders || []).forEach(o => {
+      if (o.skuId !== skuId || o.receivedDate) return;
+      if (po.orderId ? o.id === po.orderId
+                     : (o.orderedDate === po.ordered && Number(o.qty) === Number(po.qty))) {
+        hits.push({ supId: sup.id, order: o });
+      }
+    });
+  }
+  if (po.orderId) return hits[0] || null;
+  if (hits.length === 1) return hits[0];
+  if (hits.length > 1) return null;
+  // Legacy PO, nothing matched on date and quantity: fall back only when the product has
+  // a single open order, so it can't be the wrong one.
+  const open = [];
+  for (const sup of Object.values(suppliers || {})) {
+    (sup?.orders || []).forEach(o => { if (o.skuId === skuId && !o.receivedDate) open.push({ supId: sup.id, order: o }); });
+  }
+  return open.length === 1 ? open[0] : null;
+}
+
+/** Does the open PO for `skuId` belong to this supplier order? */
+export function poIsOrder(openPOs, suppliers, skuId, orderId) {
+  const po = openPOs?.[skuId];
+  if (!po) return false;
+  if (po.orderId) return po.orderId === orderId;
+  return findPoOrder(suppliers, skuId, po)?.order?.id === orderId;
+}
+
+/** Set one order's fields. Returns the next suppliers map. */
+export function updateOrder(suppliers, supId, orderId, patch) {
+  const sup = suppliers?.[supId];
+  if (!sup) return suppliers;
+  return { ...suppliers, [supId]: { ...sup,
+    orders: (sup.orders || []).map(o => o.id === orderId ? { ...o, ...patch } : o) } };
+}
+
+/* Does a delivery that arrived on `arrivedOn` still need adding to the stock figure?
+ * Not when the stock was COUNTED after it arrived: the count already includes it, and
+ * adding it again double-counts. Logging an old delivery for the lead-time record used
+ * to add its units to today's stock regardless. A delivery arriving today is new stock;
+ * with no count on file, one that arrived before today follows `pastDefault`. */
+export function arrivalAddsToStock(params, arrivedOn, { pastDefault = false } = {}) {
+  const day = String(arrivedOn || "").slice(0, 10);
+  if (!day) return false;
+  // Arriving today: the arrival is now, after any count, so it adds.
+  if (day >= todayStr()) return true;
+  const counted = params?.stockCountedAt ? isoToStoreDay(params.stockCountedAt) : null;
+  // Counted on a later day: the count already includes it. (Counted the same day is
+  // ambiguous; it's treated as before the delivery, as a delivery marked today would be.)
+  if (counted && counted > day) return false;
+  return counted ? true : pastDefault;
+}
+
+/** The store's calendar day an ISO timestamp falls on. */
+function isoToStoreDay(iso) {
+  try {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return String(iso).slice(0, 10);
+    const tz = _storeZone;
+    return tz ? d.toLocaleDateString("en-CA", { timeZone: tz }) : d.toLocaleDateString("en-CA");
+  } catch { return String(iso).slice(0, 10); }
 }
 
 /** A supplier's typed baseline for one lane. Set once, inherited by every product under

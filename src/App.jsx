@@ -9,14 +9,15 @@ import SupplierPanel from './components/SupplierPanel';
 import UploadPanel from './components/UploadPanel';
 import { FleetBento } from './components/FleetViews';
 import { CostsSheet } from './components/UnitEconomics';
+import { ClosedDaysSheet } from './components/ClosedDays';
 import { terminal, MONO, SANS } from './lib/theme';
 import { SkuListItem, FolderRow } from './components/Sidebar';
 import { AssignFolderModal } from './components/modals';
 import { ErrorToasts } from './components/common';
-import { API, TZ, fetchJson } from './lib/api';
+import { API, fetchJson, forecastUrl } from './lib/api';
 import { loadStorage, saveStorage } from './lib/storage';
 import { GROQ_API_KEY } from './lib/ai';
-import { DEFAULT_PARAMS, autoStrategy, makeFolderId, poEtaDays, planningLeadTime, leadTimeConfirmed, planRecompute, sanitizeParams, sanitizeAllParams, namedSuppliers, buildScorecardBody } from './lib/helpers';
+import { DEFAULT_PARAMS, autoStrategy, makeFolderId, poEtaDays, planningLeadTime, leadTimeConfirmed, planRecompute, sanitizeParams, sanitizeAllParams, namedSuppliers, buildScorecardBody, setStoreZone, todayStr } from './lib/helpers';
 
 // ─── ROOT APP ─────────────────────────────────
 export default function App() {
@@ -44,6 +45,14 @@ export default function App() {
   const [btDiag,       setBtDiag]       = useState(null);
   const [showCategorize, setShowCategorize] = useState(false);
   const [showCosts, setShowCosts] = useState(false);
+  const [showClosed, setShowClosed] = useState(false);
+  const [closedCount, setClosedCount] = useState(0);
+  const loadClosedCount = useCallback(() => {
+    fetch(`${API}/api/closed-days`).then(r => r.ok ? r.json() : null)
+      .then(d => { if (d) setClosedCount((d.settings?.dates?.length || 0) + (d.settings?.yearly?.length || 0)); })
+      .catch(() => {});
+  }, []);
+  useEffect(() => { loadClosedCount(); }, [loadClosedCount]);
   const [skuForecasts, setSkuForecasts] = useState([]);
   const [scorecardRows, setScorecardRows] = useState([]);
   const skuForecastsRef = useRef([]);
@@ -168,6 +177,10 @@ export default function App() {
   // unitCost/fees set from the Scorecard) still has stock/leadTime/coverage —
   // otherwise the forecast URL gets "undefined" and the API returns 422.
   const getParams = id => sanitizeParams({ ...DEFAULT_PARAMS, ...(skuParams[id] || {}) });
+  // The lead time each product is PLANNED on (measured P80, supplier baseline, one-off
+  // slow shipment...). Every badge and band that depends on a lead time reads this, not
+  // the typed field, so they agree with the forecast behind them.
+  const leadTimeOf = id => planningLeadTime(id, getParams(id), suppliers).days;
 
   const loadScorecardRows = useCallback(async (list = skuList, params = skuParams, pos = openPOs) => {
     if (!list.length) { setScorecardRows([]); return; }
@@ -178,41 +191,47 @@ export default function App() {
       body: JSON.stringify(buildScorecardBody(list, params, pos, suppliers)),
     }, "Loading product status");
     setScorecardRows(res?.rows || []);
-  }, [skuList, skuParams, openPOs]);
+  }, [skuList, skuParams, openPOs, suppliers]);
 
   const refreshSkuSummary = useCallback(async (skuId, p) => {
-    const { stock, leadTime, coverage } = p;
     const po = openPOs[skuId];
-    const etaQ = poEtaDays(po) != null ? `&on_order_eta_days=${poEtaDays(po)}` : "";
-    const plt1 = planningLeadTime(skuId, p, suppliers).days;
-    const oq = po ? po.qty : 0;
     const existing = skuForecastsRef.current.find(f => f.skuId === skuId);
-    const strategy = autoStrategy(existing?.demandVolatilityColor);
-    // Pass cost/protection so the fleet view's protection level matches the detail
-    // panel (otherwise it falls back to Standard with no margin known).
-    const costQ = (p.unitCost != null && p.unitCost !== "") ? `&unit_cost=${p.unitCost}` : "";
-    const feesQ = (p.fees != null && p.fees !== "") ? `&fees=${p.fees}` : "";
-    const protQ = p.protection ? `&protection=${p.protection}` : "";
-    // plt1 is the PLANNED lead time (lane-aware, clamped). `leadTime` is the raw field and
-    // must never reach the API — that mismatch is what 422'd.
-    const fc = await fetchJson(`${API}/api/forecast?sku_id=${encodeURIComponent(skuId)}&stock=${stock}&lead_time_days=${plt1}&coverage_days=${coverage}&strategy=${strategy}&forecast_months=3&units_on_order=${oq}${etaQ}${costQ}${feesQ}${protQ}&stock_source=${encodeURIComponent(p.stockSource || "unknown")}${p.stockCountedAt ? `&stock_counted_at=${encodeURIComponent(p.stockCountedAt)}` : ""}&tz=${TZ}`,
+    // The shared builder (lib/api.js forecastUrl), so this and the product page can't
+    // ask different questions about the same product.
+    const fc = await fetchJson(forecastUrl(skuId, { ...DEFAULT_PARAMS, ...p }, {
+        leadTime: planningLeadTime(skuId, p, suppliers).days,
+        onOrderQty: po ? po.qty : 0, onOrderEta: poEtaDays(po),
+        strategy: autoStrategy(existing?.demandVolatilityColor) }),
       undefined, `Forecast for ${skuId}`);
     if (!fc) return;
     setSkuForecasts(prev => [...prev.filter(f => f.skuId !== skuId), fc]);
-  }, [openPOs]);
+  }, [openPOs, suppliers]);
 
-  const updateParams = useCallback((id, p) => { setSkuParams(prev => ({ ...prev, [id]: p })); refreshSkuSummary(id, p); }, [refreshSkuSummary]);
+  // The latest params, readable from callbacks without waiting for a re-render. Two quick
+  // updates (stock received, then an edit) otherwise each started from the same old copy.
+  const skuParamsRef = useRef(skuParams);
+  useEffect(() => { skuParamsRef.current = skuParams; }, [skuParams]);
+
+  /* Save only the fields that changed, onto the product they were changed on. The product
+     page used to hand back its whole draft, addressed to whichever product was open when
+     the save fired, so it could put back stock that had just been received, or write one
+     product's settings onto another. */
+  const patchParams = useCallback((id, patch) => {
+    if (!id || !patch) return;
+    const next = { ...DEFAULT_PARAMS, ...(skuParamsRef.current[id] || {}), ...patch };
+    skuParamsRef.current = { ...skuParamsRef.current, [id]: next };
+    setSkuParams(prev => ({ ...prev, [id]: { ...DEFAULT_PARAMS, ...(prev[id] || {}), ...patch } }));
+    refreshSkuSummary(id, next);
+  }, [refreshSkuSummary]);
 
   // Add received units to a SKU's on-hand stock, then refresh its forecast so the
   // dashboard (and scorecard) reflect the new level. Used when an order arrives.
   const receiveStock = useCallback((skuId, qty) => {
     const q = Number(qty);
     if (!skuId || !Number.isFinite(q) || q === 0) return;
-    const cur  = { ...DEFAULT_PARAMS, ...(skuParams[skuId] || {}) };
-    const next = { ...cur, stock: (Number(cur.stock) || 0) + q };
-    setSkuParams(prev => { const u = { ...prev, [skuId]: next }; saveStorage("logitrack_params", u); return u; });
-    refreshSkuSummary(skuId, next);
-  }, [skuParams, refreshSkuSummary]);
+    const cur  = { ...DEFAULT_PARAMS, ...(skuParamsRef.current[skuId] || {}) };
+    patchParams(skuId, { stock: (Number(cur.stock) || 0) + q });
+  }, [patchParams]);
 
   const loadSkuList = useCallback(async (currentParams, currentPOs) => {
     const pos    = currentPOs    ?? {};
@@ -261,17 +280,19 @@ export default function App() {
     if (seeded) { setSkuParams(params); saveStorage("logitrack_params", params); }
     const forecasts = await Promise.all(data.map(s => {
       const p  = { ...DEFAULT_PARAMS, ...(params[s.id] || {}) };
-      const oq = pos[s.id] ? pos[s.id].qty : 0;
-      const eta = poEtaDays(pos[s.id]);
-      const etaQ2 = eta != null ? `&on_order_eta_days=${eta}` : "";
-      const plt = planningLeadTime(s.id, p, suppliers).days;
-      return fetchJson(`${API}/api/forecast?sku_id=${encodeURIComponent(s.id)}&stock=${p.stock}&lead_time_days=${plt}&coverage_days=${p.coverage}&strategy=balanced&forecast_months=3&units_on_order=${oq}${etaQ2}&stock_source=${encodeURIComponent(p.stockSource || "unknown")}&tz=${TZ}`,
+      const po = pos[s.id];
+      // Same builder as the per-product refresh and the product page. This call used to
+      // leave out cost, fees, the chosen protection level and the count time, so after a
+      // reload the Fleet's order quantities differed from the product page's.
+      return fetchJson(forecastUrl(s.id, p, {
+          leadTime: planningLeadTime(s.id, p, suppliers).days,
+          onOrderQty: po ? po.qty : 0, onOrderEta: poEtaDays(po) }),
         undefined, `Forecast for ${s.id}`);
     }));
     setSkuForecasts(forecasts.filter(Boolean));
     await loadScorecardRows(data, params, pos);
     if (!activeSku && data.length === 1) setActiveSku(data[0].id);
-  }, [activeSku, loadScorecardRows]);
+  }, [activeSku, loadScorecardRows, suppliers]);
 
   // Bumped to force the open SKU detail panel to refetch its forecast (e.g. after
   // categorization re-routes a product). Fleet-level data refreshes via loadSkuList.
@@ -292,8 +313,29 @@ export default function App() {
      ask again. Polling stops as soon as it resolves; it never runs in a steady state. */
   const [restoring, setRestoring] = useState(false);
   const [restoreNote, setRestoreNote] = useState(null);
+  /* Pausing or resuming a store swaps which products are loaded, and the server re-fits
+     them in the background exactly like a restore on boot. Bumping this re-runs the same
+     wait-then-reload, with a note saying what's now showing. */
+  const [wsSwitch, setWsSwitch] = useState({ n: 0, label: null });
+  /* The store's time zone, from the server, so every date on the page is the store's
+     date (lib/helpers todayStr). Re-read when the loaded workspace changes (a different
+     store can keep a different clock) and when the zone is picked on the Closed days
+     panel. Held in state only so the page re-renders once it arrives. */
+  const [storeClock, setStoreClock] = useState(null);
+  const loadStoreClock = useCallback(async () => {
+    try {
+      const r = await fetch(`${API}/api/store-clock`);
+      if (!r.ok) return;
+      const c = await r.json();
+      setStoreZone(c?.zone || null);
+      setStoreClock(c);
+    } catch { /* keep the browser's own calendar until the server answers */ }
+  }, []);
+  useEffect(() => { loadStoreClock(); }, [wsSwitch.n, loadStoreClock]);
+  const handleWorkspaceSwitch = (label) => { setWsSwitch(prev => ({ n: prev.n + 1, label })); loadClosedCount(); };
   useEffect(() => {
     let stop = false, timer = null, noteTimer = null;
+    const switched = wsSwitch.n > 0;
     const check = async () => {
       try {
         const h = await (await fetch(`${API}/api/health`)).json();
@@ -304,7 +346,16 @@ export default function App() {
         // Finished (or there was nothing to restore). Pick up whatever landed, and say
         // what came back: a silent restore is indistinguishable from a fresh empty app,
         // and the difference matters when the numbers on screen are a week old.
-        if (h?.skus) {
+        if (switched) {
+          // Always reload after a switch, including to an empty set, or the previous
+          // workspace's products would stay on screen.
+          setActiveSku(null);   // the product list is a different set now
+          await loadSkuList(skuParams, openPOs);
+          const n = Number(h?.skus || 0);
+          setRestoreNote(`${wsSwitch.label || "Switched."} `
+            + (n ? `${n} product${n === 1 ? "" : "s"} loaded.` : "Nothing loaded yet: upload a spreadsheet."));
+          noteTimer = setTimeout(() => setRestoreNote(null), 12000);
+        } else if (h?.skus) {
           loadSkuList(skuParams, openPOs);
           if (h?.restore?.status === "ready") {
             const n = h.skus, m = Number(h.measured || 0);
@@ -317,8 +368,21 @@ export default function App() {
     };
     check();
     return () => { stop = true; clearTimeout(timer); clearTimeout(noteTimer); };
-  }, []);   // eslint-disable-line react-hooks/exhaustive-deps
+  }, [wsSwitch.n]);   // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => { skuList.forEach(s => refreshSkuSummary(s.id, getParams(s.id))); }, [openPOs]);
+  /* A supplier change (a delivery logged, a lead time measured, a product reassigned)
+     moves the lead time products are PLANNED on. Refresh the ones whose planned lead
+     time actually moved; the scorecard refreshes through loadScorecardRows. */
+  const plannedLeadRef = useRef({});
+  useEffect(() => {
+    const prev = plannedLeadRef.current, now = {};
+    skuList.forEach(s => {
+      const p = getParams(s.id);
+      now[s.id] = planningLeadTime(s.id, p, suppliers).days;
+      if (prev[s.id] !== undefined && prev[s.id] !== now[s.id]) refreshSkuSummary(s.id, p);
+    });
+    plannedLeadRef.current = now;
+  }, [suppliers, skuList]);   // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => { loadScorecardRows(skuList, skuParams, openPOs); }, [skuList, skuParams, openPOs, loadScorecardRows]);
 
   // ── The measured protection recommendation, kept current on its own ──────────
@@ -444,11 +508,19 @@ export default function App() {
   }, [btSignature]);   // eslint-disable-line react-hooks/exhaustive-deps
 
   const costDebounce = useRef(null);
+  /* A cost or fee edit doesn't re-run the test: it re-prices the one already measured
+     (the units short and carried don't change, only what they're worth), which takes a
+     moment rather than minutes. It used to happen silently, so an edit looked ignored.
+     null | "pending" | "done". */
+  const [recostNote, setRecostNote] = useState(null);
+  const recostNoteTimer = useRef(null);
   const costFirstRun = useRef(true);
   useEffect(() => {
     if (costFirstRun.current) { costFirstRun.current = false; return; }
     if (!skuList.length) return;
     clearTimeout(costDebounce.current);
+    clearTimeout(recostNoteTimer.current);
+    setRecostNote("pending");     // say so straight away; the re-price itself takes a moment
     costDebounce.current = setTimeout(async () => {
       const costs = {};
       Object.entries(skuParams).forEach(([sku, q]) => {
@@ -462,10 +534,19 @@ export default function App() {
         });
         const d = await r.json();
         // No stored run to re-price (first session, or a restart) → do it the slow way.
-        if (!d?.recosted) { triggerBacktest("costs-changed"); return; }
+        if (!d?.recosted) {
+          const started = await triggerBacktest("costs-changed");
+          // Started: the "Testing…" notice takes over. Not started (no product has a
+          // confirmed lead time yet): say the edit was kept, rather than nothing at all.
+          setRecostNote(started ? null : "none");
+          if (!started) recostNoteTimer.current = setTimeout(() => setRecostNote(null), 6000);
+          return;
+        }
         skuList.forEach((s) => refreshSkuSummary(s.id, getParams(s.id)));
         loadScorecardRows(skuList, skuParams, openPOs);
-      } catch { /* keep what's on screen */ }
+        setRecostNote("done");
+        recostNoteTimer.current = setTimeout(() => setRecostNote(null), 4000);
+      } catch { setRecostNote(null); /* keep what's on screen */ }
     }, 1500);
     return () => clearTimeout(costDebounce.current);
   }, [btCostSignature]);   // eslint-disable-line react-hooks/exhaustive-deps
@@ -496,7 +577,7 @@ export default function App() {
     } catch { triggerBacktest("params-changed"); }
   }, [skuList, skuParams, holdingPct, watchBacktest]);   // eslint-disable-line react-hooks/exhaustive-deps
 
-  const triggerBacktest = useCallback(async (trigger) => {
+  const triggerBacktest = useCallback(async (trigger, method = {}) => {
     // Send EVERY distinct lead/coverage pair your products use, not just the commonest.
     // Scoring extra pairs is nearly free (the models are fitted once and scored at each),
     // and without this a product whose lead time you changed could never be re-measured —
@@ -509,7 +590,7 @@ export default function App() {
       const k = `${L}/${C}`;
       if (!seen.has(k)) { seen.add(k); combos.push({ lead: L, coverage: C }); }
     });
-    if (!combos.length) return;   // nothing has a confirmed lead time yet
+    if (!combos.length) return false;   // nothing has a confirmed lead time yet
     const commonest = (key, fallback) => {
       const counts = {};
       skuList.forEach((s) => { const v = getParams(s.id)[key] ?? fallback; counts[v] = (counts[v] || 0) + 1; });
@@ -526,10 +607,14 @@ export default function App() {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ lead: commonest("leadTime", DEFAULT_PARAMS.leadTime),
                                coverage: commonest("coverage", DEFAULT_PARAMS.coverage),
-                               combos, costs, holding: Number(holdingPct) || 25, trigger }),
+                               combos, costs, holding: Number(holdingPct) || 25, trigger,
+                               // The Backtest tab's method settings, when it asks.
+                               ...(method.horizon ? { horizon: method.horizon } : {}),
+                               ...(method.minTrain ? { minTrain: method.minTrain } : {}) }),
       });
       watchBacktest();
-    } catch { /* a failed trigger just leaves the cost-curve estimate in place */ }
+      return true;
+    } catch { return false; /* a failed trigger just leaves the cost-curve estimate in place */ }
   }, [skuList, skuParams, holdingPct, watchBacktest]);   // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleUploadSuccess = async (info) => {
@@ -731,11 +816,16 @@ export default function App() {
   const buildExportSkus = () => {
     const out = {};
     (skuList || []).forEach(s => {
-      const p = skuParams[s.id] || {};
+      // The same settings the screen plans with: defaults merged in, the PLANNED lead
+      // time (not the typed field), and where the stock figure came from. Without the
+      // last one a hand-counted product exported as "not counted" with order qty 0.
+      const p = getParams(s.id);
       const po = openPOs[s.id];
       out[s.id] = {
-        stock: p.stock, leadTime: p.leadTime, coverage: p.coverage, months: p.months,
+        stock: p.stock, leadTime: planningLeadTime(s.id, p, suppliers).days,
+        coverage: p.coverage, months: p.months,
         unitCost: p.unitCost, fees: p.fees, protection: p.protection,
+        stockSource: p.stockSource, stockCountedAt: p.stockCountedAt || null,
         unitsOnOrder: po ? po.qty : 0, hasOpenPo: !!po,
         // so the scorecard/export price a shipment by when it lands, like the panel does
         onOrderEtaDays: poEtaDays(po),
@@ -760,11 +850,13 @@ export default function App() {
       setExporting(null);
     }
   };
-  const _today = () => new Date().toISOString().slice(0, 10);   // YYYY-MM-DD
+  const _today = () => todayStr();   // YYYY-MM-DD, on the store's clock
   const exportSku = (sid) => downloadExport("sku", `/api/export/sku/${encodeURIComponent(sid)}`, { skus: buildExportSkus() }, `${sid}_forecast_${_today()}.xlsx`);
   const exportFleet = () => downloadExport("fleet", "/api/export/fleet", { skus: buildExportSkus(), folders }, `logitrack_fleet_${_today()}.xlsx`);
   const exportSuppliers = () => downloadExport("suppliers", "/api/export/suppliers", { suppliers }, `logitrack_suppliers_${_today()}.xlsx`);
-  const exportAll = () => downloadExport("all", "/api/export/all", { skus: buildExportSkus(), folders, suppliers }, `logitrack_full_report_${_today()}.xlsx`);
+  // openPOs too: the report's "Open POs" sheet is built from them (and from supplier
+  // orders still in transit). It was always empty because nothing sent them.
+  const exportAll = () => downloadExport("all", "/api/export/all", { skus: buildExportSkus(), folders, suppliers, openPOs }, `logitrack_full_report_${_today()}.xlsx`);
 
   const ungroupedSkus  = skuList.filter(s => !Object.values(folders).some(f => f.skuIds.includes(s.id)));
   const scoreBySkuApp  = Object.fromEntries((scorecardRows || []).map(r => [r.skuId, r]));
@@ -952,6 +1044,7 @@ export default function App() {
               openPOs={openPOs} activeSku={activeSku} onSelectSku={setActiveSku} onDeleteSku={handleDeleteSku}
               onRename={renameFolder} onDelete={deleteFolder} onToggleCollapse={toggleFolderCollapse}
               onRemoveSkuFromFolder={removeSkuFromFolder} onAddSubfolder={createSubfolder} lm={lm} scoreBySku={scoreBySkuApp}
+              leadTimeOf={leadTimeOf}
               availability={availability.skus || {}} samplerEnabled={availability.sampler?.enabled !== false} />
           ))}
 
@@ -960,6 +1053,7 @@ export default function App() {
             return (
               <SkuListItem key={sku.id} sku={sku} isActive={activeSku === sku.id} onClick={() => setActiveSku(sku.id)}
                 onDelete={handleDeleteSku} reorderDays={fc?.daysUntilReorder} hasOpenPO={!!openPOs[sku.id]} lm={lm}
+                leadTimeDays={leadTimeOf(sku.id)}
                 healthStatus={scoreBySkuApp[sku.id]?.status}
                 provisional={fc?.tooNew || fc?.young}
                 availability={(availability.skus || {})[sku.id]}
@@ -976,6 +1070,7 @@ export default function App() {
         <div style={{ height: importHeight ?? undefined }} className={`p-4 border-t ${divider} space-y-3 shrink-0 overflow-y-auto sku-scroll`}>
           <div className={`text-[13px] uppercase tracking-widest ${importLabel} font-bold`}>Import Data</div>
           <UploadPanel onUploadSuccess={handleUploadSuccess} onUploadError={setUploadError}
+            onWorkspaceSwitch={handleWorkspaceSwitch}
             isUploading={isUploading} setIsUploading={setIsUploading} lm={lm} holdingPct={holdingPct} setHoldingPct={setHoldingPct}
             uplift={availability.uplift} availCounts={availability.counts} />
           {uploadError && (
@@ -1009,6 +1104,12 @@ export default function App() {
               For accurate seasonality, re-export a file that runs up to the present.
             </div>
           )}
+          {uploadInfo?.storePaused && (
+            <div className={`text-[14px] rounded-lg p-2 leading-relaxed border ${"bg-[var(--t-panel)] border-[var(--t-line)] text-[var(--t-soft)]"}`}>
+              <span className="font-semibold">{uploadInfo.storePaused}</span> was paused so this loads on its own.
+              {" "}Its login and products are kept; switch it back on under Connect store.
+            </div>
+          )}
           {uploadInfo && (
             <div className={`text-[14px] rounded-lg border overflow-hidden ${"text-[var(--t-good)] bg-[var(--t-good-soft)] border-[var(--t-good-line)]"}`}>
               <button onClick={() => setShowUploadDetails(v => !v)} className="w-full flex items-center justify-between gap-2 p-2 text-left">
@@ -1032,15 +1133,19 @@ export default function App() {
                       {uploadInfo.loadedSkus.filter(s => s.stockoutRowsDropped > 0).map(s => `${s.id}: ${s.stockoutRowsDropped} zero-stock days excluded`).join(" · ")}
                     </span>
                   )}
-                  {uploadInfo.dataQuality && (uploadInfo.dataQuality.duplicateRowsMerged > 0 || uploadInfo.dataQuality.missingSalesFilledZero > 0 || uploadInfo.dataQuality.badDatesDropped > 0 || uploadInfo.dataQuality.missingDaysFilled > 0) && (
+                  {uploadInfo.dataQuality && (uploadInfo.dataQuality.duplicateRowsMerged > 0 || uploadInfo.dataQuality.missingSalesFilledZero > 0 || uploadInfo.dataQuality.badDatesDropped > 0 || uploadInfo.dataQuality.missingDaysFilled > 0 || uploadInfo.dataQuality.fileRepeatedTimes > 1) && (
                     <span className={`block ${"text-[var(--t-dim)]"}`}>
                       Cleaned: {[
-                        uploadInfo.dataQuality.duplicateRowsMerged > 0 && `${uploadInfo.dataQuality.duplicateRowsMerged} duplicate row${uploadInfo.dataQuality.duplicateRowsMerged !== 1 ? "s" : ""} merged (no double-counting)`,
+                        uploadInfo.dataQuality.fileRepeatedTimes > 1 && `the file's rows were repeated ${uploadInfo.dataQuality.fileRepeatedTimes} times over, so one copy was used`,
+                        uploadInfo.dataQuality.duplicateRowsMerged > 0 && `${uploadInfo.dataQuality.duplicateRowsMerged} rows on the same day added into daily totals`,
                         uploadInfo.dataQuality.missingSalesFilledZero > 0 && `${uploadInfo.dataQuality.missingSalesFilledZero} missing sales value${uploadInfo.dataQuality.missingSalesFilledZero !== 1 ? "s" : ""} set to 0`,
                         uploadInfo.dataQuality.badDatesDropped > 0 && `${uploadInfo.dataQuality.badDatesDropped} unreadable date${uploadInfo.dataQuality.badDatesDropped !== 1 ? "s" : ""} dropped`,
                         uploadInfo.dataQuality.missingDaysFilled > 0 && `${uploadInfo.dataQuality.missingDaysFilled.toLocaleString()} missing calendar day${uploadInfo.dataQuality.missingDaysFilled !== 1 ? "s" : ""} filled as 0-sale days`,
                       ].filter(Boolean).join(" · ")} · {uploadInfo.dataQuality.rowsUsed?.toLocaleString()} rows used
                     </span>
+                  )}
+                  {uploadInfo.dataQuality?.dateFormat && (
+                    <span className={`block ${"text-[var(--t-dim)]"}`}>{uploadInfo.dataQuality.dateFormat}</span>
                   )}
                   {uploadInfo.errors?.length > 0 && <span className={`block ${"text-[var(--t-warn)]"}`}>{uploadInfo.errors.join(" ")}</span>}
                 </div>
@@ -1131,7 +1236,7 @@ export default function App() {
               <span className={`ml-1 text-[13px] font-mono px-1.5 py-0.5 rounded border ${"border-[var(--t-line)] text-[var(--t-dim)]"}`}>⌘K</span>
             </button>
             <ThemeToggle />
-            <span className={`text-[14px] ${dateText} font-mono`}>{new Date().toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" })}</span>
+            <span className={`text-[14px] ${dateText} font-mono`}>{new Date(`${todayStr()}T00:00:00Z`).toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric", timeZone: "UTC" })}</span>
           </div>
         </div>
 
@@ -1167,7 +1272,7 @@ export default function App() {
             </div>
           ) : activeSku ? (
             <SkuDetailPanel skuId={activeSku} skuList={skuList} params={getParams(activeSku)}
-              onParamChange={p => updateParams(activeSku, p)} openPOs={openPOs} setOpenPOs={setOpenPOs}
+              onParamChange={patchParams} openPOs={openPOs} setOpenPOs={setOpenPOs}
               apiKey={GROQ_API_KEY} lm={lm} suppliers={suppliers} setSuppliers={setSuppliers} receiveStock={receiveStock}
               refreshNonce={refreshNonce} onExport={() => exportSku(activeSku)} exporting={exporting === "sku"}
               arrival={arrivals.find(a => a.skuId === activeSku) || null}
@@ -1181,7 +1286,8 @@ export default function App() {
             <BacktestTab api={API} lm={lm} skuParams={skuParams}
               holdingPct={holdingPct} setHoldingPct={setHoldingPct} res={btRes} setRes={setBtRes} diag={btDiag} setDiag={setBtDiag}
               waiting={btWaiting.map(id => skuList.find(s => s.id === id)?.name || id)} waitingIds={btWaiting}
-              onPickSku={(id) => { setActiveSku(id); setActiveView("fleet"); }} />
+              onPickSku={(id) => { setActiveSku(id); setActiveView("fleet"); }}
+              onRetest={(method) => triggerBacktest("retest", method)} />
           ) : activeView === "live" ? (
             <div className="flex-1 overflow-y-auto p-4 sm:p-6">
               <LiveAccuracy api={API} lm={lm}
@@ -1207,10 +1313,11 @@ export default function App() {
                     onConfirm={confirmArrival} onIgnore={ignoreArrival} />
                 </div>
               )}
-              <FleetBento skuForecasts={skuForecasts} getParams={getParams}
+              <FleetBento skuForecasts={skuForecasts} getParams={getParams} leadTimeOf={leadTimeOf}
                 openPOs={openPOs} onSelectSku={setActiveSku} lm={lm}
                 onExportFleet={exportFleet} onExportAll={exportAll} exporting={exporting}
-                scorecardRows={scorecardRows} onEditCosts={() => setShowCosts(true)} />
+                scorecardRows={scorecardRows} onEditCosts={() => setShowCosts(true)}
+                onClosedDays={() => setShowClosed(true)} closedCount={closedCount} />
             </div>
           )}
         </div>
@@ -1234,6 +1341,28 @@ export default function App() {
           </span>
         </div>
       )}
+      {recostNote && btJob?.status !== "running" && (
+        <div className={`fixed bottom-4 left-1/2 -translate-x-1/2 z-40 flex items-center gap-2.5 px-4 py-2.5 rounded-full border shadow-lg text-[15px] ${"bg-[var(--t-panel)] border-[var(--t-accent-line)] text-[var(--t-soft)]"}`}>
+          {recostNote === "pending" ? (
+            <svg className={`h-3.5 w-3.5 animate-spin ${"text-[var(--t-accent)]"}`} fill="none" viewBox="0 0 24 24">
+              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.4 0 0 5.4 0 12h4z" />
+            </svg>
+          ) : <span className={"text-[var(--t-good)]"}>✓</span>}
+          <span>
+            <span className="font-semibold">
+              {recostNote === "pending" ? "Re-pricing your protection levels…"
+                : recostNote === "none" ? "Saved"
+                : "Protection levels re-priced"}
+            </span>
+            <span className={`ml-1.5 ${"text-[var(--t-dim)]"}`}>
+              {recostNote === "none"
+                ? "there's no finished protection test to re-price yet; the next one will use it"
+                : "a cost, fee or holding-rate change only changes what the tested shortfalls are worth, so no re-test is needed"}
+            </span>
+          </span>
+        </div>
+      )}
       {btJob?.status === "error" && (
         <div className={`fixed bottom-4 left-1/2 -translate-x-1/2 z-40 px-4 py-2.5 rounded-full border shadow-lg text-[15px] ${"bg-[var(--t-bad-soft)] border-[var(--t-bad-line)] text-[var(--t-bad)]"}`}>
             <span className="font-semibold">Protection test failed.</span> Still using estimates. <span className="font-mono opacity-80">{btJob.error}</span>
@@ -1243,6 +1372,9 @@ export default function App() {
 
       <AiDrawer skuForecasts={skuForecasts} skuParams={skuParams} skuList={skuList}
         openPOs={openPOs} folders={folders} apiKey={GROQ_API_KEY} suppliers={suppliers} api={API} />
+
+      <ClosedDaysSheet open={showClosed} onClose={() => setShowClosed(false)} api={API} lm={lm}
+        onChanged={() => { loadClosedCount(); loadStoreClock(); onCatalogChanged(); }} />
 
       <CostsSheet open={showCosts} onClose={() => setShowCosts(false)}
         skuList={skuList} scorecardRows={scorecardRows} skuParams={skuParams}

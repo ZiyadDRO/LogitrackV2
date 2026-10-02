@@ -52,9 +52,14 @@ check("it counts about as much as the time it was open",
 
 print("\n— a 90-minute window cannot invent a number —")
 tiny = C.estimate_demand(5, closing_stock=0, hours_in_stock=1.5)
-check("6% of a day is treated as no information", tiny["kind"] == C.UNAVAILABLE, tiny["kind"])
-check("...so nothing is estimated from it", tiny["estimate"] is None)
-check("...and it carries no weight in the fit", tiny["weight"] == 0.0)
+check("6% of a day is too little to scale anything up", tiny.get("uplift") in (None, 1.0), str(tiny))
+check("...but the 5 it SOLD are kept, as a floor", tiny["estimate"] == 5 and tiny["floor"] is True, str(tiny))
+check("...at reduced weight", 0 < tiny["weight"] < 1.0, str(tiny["weight"]))
+zero_h = C.estimate_demand(4, closing_stock=0, hours_in_stock=0)
+check("a day with sales but 0 tracked hours isn't dropped (polling missed a restock)",
+      zero_h["kind"] != C.UNAVAILABLE and zero_h["estimate"] == 4, str(zero_h))
+none_sold = C.estimate_demand(0, closing_stock=0, hours_in_stock=1.5)
+check("6% of a day with nothing sold is still no information", none_sold["kind"] == C.UNAVAILABLE)
 near = C.estimate_demand(5, closing_stock=0, hours_in_stock=2.5)
 check("just above the floor, it IS used", near["kind"] == C.PARTIAL, near["kind"])
 check("...but the uplift is capped", near["capped"] is True, str(near))
@@ -140,6 +145,13 @@ check("malformed samples are skipped, not fatal",
       C.hours_in_stock_from_samples([{"ts": "not-a-date", "onHand": 1}, S(0, 10)], "2026-08-10") == 24.0)
 check("a reading from before the day carries into it",
       C.hours_in_stock_from_samples([{"ts": "2026-08-09T22:00:00Z", "onHand": 8}], "2026-08-10") == 24.0)
+check("...but not for ever: a reading from weeks before says nothing about the day",
+      C.hours_in_stock_from_samples([{"ts": "2026-07-20T12:00:00Z", "onHand": 8}], "2026-08-10") is None)
+check("a level confirmed by a later reading holds across the days between",
+      C.hours_in_stock_from_samples([{"ts": "2026-08-01T12:00:00Z", "onHand": 8},
+                                     {"ts": "2026-08-20T12:00:00Z", "onHand": 8}], "2026-08-10") == 24.0)
+check("polling that stopped mid-morning: too little of the day to say",
+      C.hours_in_stock_from_samples([{"ts": "2026-08-09T06:00:00Z", "onHand": 0}], "2026-08-10") is None)
 
 # ─────────────────────────────────────────────────────────────────────────────────────
 import datetime as _dt

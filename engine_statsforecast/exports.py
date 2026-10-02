@@ -146,7 +146,7 @@ def build_sku_workbook(v: dict) -> Workbook:
         *([("⚠ Forecast below recent sales", (v.get("rateCheck") or {}).get("message"))]
           if v.get("rateCheck") else []),
     ], section="Product & Model")
-    dr = v.get("daysUntilReorder", -1)
+    dr = v.get("daysUntilReorder")
     # The old wording said "no stock column in the file" on EVERY live-connected product,
     # because it tested the training frame for a column a live source never puts there.
     # Square-supplied counts were being reported as assumptions. Provenance now travels
@@ -161,7 +161,8 @@ def build_sku_workbook(v: dict) -> Workbook:
         ("Avg daily demand", v.get("avgDailyDemand")),
         ("Days until stockout", ("Out of stock" if v.get("alreadyOut") else v.get("daysUntilStockout")) if v.get("daysUntilStockout") is not None else "N/A (sufficient)"),
         ("Projected stockout date", _ts_date(v.get("stockoutTimestamp"))),
-        ("Days until reorder", "OVERDUE" if (dr is not None and dr != -1 and dr <= 0) else (dr if dr != -1 else "N/A")),
+        # None = no reorder date. -1 is NOT "none": it's a reorder date that passed yesterday.
+        ("Days until reorder", "OVERDUE" if (dr is not None and dr <= 0) else (dr if dr is not None else "N/A")),
         ("Order-by (reorder) date", _ts_date(v.get("reorderTimestamp"))),
         ("Recommended order qty", v.get("orderQty")),
         ("Order math", f"target {v.get('targetInventory','?')} (cover {v.get('coverageQty','?')} + safety {v.get('safetyStock','?')}) − stock at delivery {v.get('stockAtDelivery','?')}"),
@@ -233,7 +234,7 @@ def build_sku_workbook(v: dict) -> Workbook:
 #  FLEET / SUMMARY HELPERS
 # ═════════════════════════════════════════════════════════════════════════════
 def _fleet_row(v, folder):
-    dr = v.get("daysUntilReorder", -1)
+    dr = v.get("daysUntilReorder")
     cm = v.get("currentMonth") or {}
     prot = v.get("protection") or {}
     stock = _stock_cell(v, short=True)
@@ -264,7 +265,7 @@ def _fleet_row(v, folder):
         stock, v.get("avgDailyDemand"), cm.get("unitsSoFar"),
         ("Out" if v.get("alreadyOut") else (v.get("daysUntilStockout") if v.get("daysUntilStockout") is not None else None)),
         _ts_date(v.get("stockoutTimestamp")),
-        (overdue_lbl if (dr is not None and dr != -1 and dr <= 0) else (dr if dr != -1 else None)),
+        (overdue_lbl if (dr is not None and dr <= 0) else dr),
         _ts_date(v.get("reorderTimestamp")),
         v.get("orderQty"), v.get("safetyStock"), v.get("targetInventory"),
         prot.get("servicePct"), basis, margin,
@@ -298,17 +299,19 @@ def _reorder_sheet(ws, items):
     r = _title(ws, "Reorder Plan (soonest first)", _stamp(), 8)
 
     def keyf(it):
-        d = it["view"].get("daysUntilReorder", 99999)
-        return 99999 if d == -1 or d is None else d
+        d = it["view"].get("daysUntilReorder")
+        return 99999 if d is None else d
     rows = []
     for it in sorted(items, key=keyf):
-        v = it["view"]; dr = v.get("daysUntilReorder", -1)
-        if dr == -1 or dr is None:
+        # A product whose order-by date was yesterday (-1) belongs on this sheet; only
+        # "no reorder date" (None) is left off.
+        v = it["view"]; dr = v.get("daysUntilReorder")
+        if dr is None:
             continue
         rows.append([v.get("skuId"), v.get("skuName"),
                      ("provisional" if v.get("young") else "OVERDUE") if dr <= 0 else f"{dr} days",
                      _ts_date(v.get("reorderTimestamp")),
-                     v.get("daysUntilStockout") if v.get("daysUntilStockout", -1) != -1 else None,
+                     v.get("daysUntilStockout"),
                      _ts_date(v.get("stockoutTimestamp")),
                      v.get("orderQty"), v.get("__stock")])
     if not rows:
@@ -407,9 +410,13 @@ def build_suppliers_workbook(suppliers: list) -> Workbook:
     wb = Workbook(); ws = wb.active; ws.title = "Suppliers"
     r = _title(ws, "Suppliers: reliability KPIs", _stamp(), 7)
     rows = []; hist = []
-    for sup in suppliers:
-        avg, on_time, avgvar, ncomp, ntrans = _supplier_kpis(sup)
-        rows.append([sup.get("name"), len(sup.get("skuIds") or []), ncomp, avg, on_time, avgvar, ntrans])
+    for sup in suppliers or []:
+        # The holding ledger for orders with no supplier is not a supplier: no KPI row,
+        # and its orders are listed as "(no supplier)".
+        ledger = (sup or {}).get("id") == UNASSIGNED_SUP_ID
+        if not ledger:
+            avg, on_time, avgvar, ncomp, ntrans = _supplier_kpis(sup)
+            rows.append([sup.get("name"), len(sup.get("skuIds") or []), ncomp, avg, on_time, avgvar, ntrans])
         for o in (sup.get("orders") or []):
             status = "Received" if o.get("receivedDate") else "In transit"
             lt = ""
@@ -418,7 +425,7 @@ def build_suppliers_workbook(suppliers: list) -> Workbook:
                     lt = (datetime.date.fromisoformat(o["receivedDate"][:10]) - datetime.date.fromisoformat(o["orderedDate"][:10])).days
                 except Exception:
                     lt = ""
-            hist.append([sup.get("name"), o.get("skuId") or "-", o.get("qty"),
+            hist.append(["(no supplier)" if ledger else sup.get("name"), o.get("skuId") or "-", o.get("qty"),
                          o.get("orderedDate"), o.get("expectedDate") or "-", o.get("receivedDate") or "-", lt, status])
     if not rows:
         rows = [["No suppliers added yet", "", "", "", "", "", ""]]
@@ -589,30 +596,67 @@ def _backtest_sheets(wb: Workbook, bt: dict) -> None:
                      ("Days of history", lambda r: r.get("days"))], bt["skipped"])
 
 
-def _open_pos_sheet(ws, items: list) -> None:
-    """Purchase orders on the way. Previously absent from 'everything' entirely."""
-    rows = []
-    for it in items or []:
-        v = it.get("view") or {}
-        for po in (v.get("openPOs") or []):
-            rows.append({"sku": v.get("skuId"), "name": v.get("skuName"), "folder": it.get("folder"), **po})
+UNASSIGNED_SUP_ID = "__unassigned"   # the browser's holding ledger for orders with no supplier
+
+
+def open_po_rows(items: list, open_pos: dict | None, suppliers: list | None) -> list:
+    """Every order on the way: each product's open PO, plus supplier orders still in
+    transit that aren't that PO (logged in the Suppliers tab as "not arrived yet").
+    The sheet used to read a field no forecast view has, so it was always empty."""
+    names = {it.get("view", {}).get("skuId"): it.get("view", {}).get("skuName") for it in items or []}
+    folders = {it.get("view", {}).get("skuId"): it.get("folder") for it in items or []}
+    sup_name = {s.get("id"): s.get("name") for s in suppliers or [] if s}
+    rows, seen = [], set()
+    for sku, po in (open_pos or {}).items():
+        if not isinstance(po, dict):
+            continue
+        if po.get("orderId"):
+            seen.add(po["orderId"])
+        else:   # a PO from before the link: its order is the one with the same date and qty
+            for s in suppliers or []:
+                for o in (s or {}).get("orders") or []:
+                    if (o.get("skuId") == sku and not o.get("receivedDate")
+                            and o.get("orderedDate") == po.get("ordered") and o.get("qty") == po.get("qty")):
+                        seen.add(o.get("id"))
+        sup = po.get("supplier") or sup_name.get(po.get("supplierId")) or po.get("newSupplierName")
+        rows.append({"sku": sku, "name": names.get(sku), "folder": folders.get(sku),
+                     "supplier": sup or "(no supplier)", "units": po.get("qty"),
+                     "ordered": po.get("ordered"), "expected": po.get("delivery"),
+                     "source": "Product page"})
+    for s in suppliers or []:
+        for o in (s or {}).get("orders") or []:
+            if o.get("receivedDate") or o.get("id") in seen:
+                continue
+            sku = o.get("skuId")
+            rows.append({"sku": sku or "-", "name": names.get(sku), "folder": folders.get(sku),
+                         "supplier": "(no supplier)" if s.get("id") == UNASSIGNED_SUP_ID else s.get("name"),
+                         "units": o.get("qty"), "ordered": o.get("orderedDate"),
+                         "expected": o.get("expectedDate"), "source": "Supplier history"})
+    rows.sort(key=lambda r: (str(r.get("expected") or "9999"), str(r.get("sku"))))
+    return rows
+
+
+def _open_pos_sheet(ws, items: list, open_pos: dict | None = None, suppliers: list | None = None) -> None:
+    """Purchase orders on the way."""
+    rows = open_po_rows(items, open_pos, suppliers)
     _rows_sheet(ws, "Open purchase orders",
                 [("Product", lambda r: r.get("sku")), ("Name", lambda r: r.get("name")),
                  ("Folder", lambda r: r.get("folder")), ("Supplier", lambda r: r.get("supplier")),
-                 ("Units", lambda r: r.get("units") or r.get("qty")),
-                 ("Ordered", lambda r: r.get("orderedOn") or r.get("ordered")),
-                 ("Expected", lambda r: r.get("expected") or r.get("eta"))],
+                 ("Units", lambda r: r.get("units")),
+                 ("Ordered", lambda r: r.get("ordered")),
+                 ("Expected", lambda r: r.get("expected")),
+                 ("Logged on", lambda r: r.get("source"))],
                 rows, None if rows else "No open purchase orders recorded.")
 
 
 def build_all_workbook(items: list, suppliers: list, scorecard_rows: list,
-                       backtest: dict | None = None) -> Workbook:
+                       backtest: dict | None = None, open_pos: dict | None = None) -> Workbook:
     wb = Workbook(); ws = wb.active; ws.title = "Fleet Summary"
     _fleet_summary_sheet(ws, items, "Fleet Summary: all SKUs")
     _reorder_sheet(wb.create_sheet("Reorder Plan"), items)
     _monthly_sheet(wb.create_sheet("Monthly Forecast"), items)
     _scorecard_sheet(wb.create_sheet("Scorecard"), scorecard_rows or [])
-    _open_pos_sheet(wb.create_sheet("Open POs"), items)
+    _open_pos_sheet(wb.create_sheet("Open POs"), items, open_pos, suppliers)
     _backtest_sheets(wb, backtest or {})
     # suppliers (reuse the two-sheet builder's content)
     sup_wb = build_suppliers_workbook(suppliers or [])

@@ -67,6 +67,17 @@ check("the second day is attributed too", by[("2026-08-02", "HDL")]["units_sold"
 check("the report counts the bundle sales", rep["bundleUnits"] == 4.0, str(rep))
 check("...and the units pushed down", rep["addedUnits"] == 16.0, str(rep["addedUnits"]))
 
+print("\n— a component with several rows on one day gets the kit's units once —")
+rows_many = [
+    {"date": "2026-08-01", "sku": "KIT", "units_sold": 2},
+    {"date": "2026-08-01", "sku": "VAN", "units_sold": 1},     # one row per sale
+    {"date": "2026-08-01", "sku": "VAN", "units_sold": 1},
+    {"date": "2026-08-01", "sku": "VAN", "units_sold": 1},
+]
+out_m, _ = B.attribute(rows_many, MAP)
+van_total = sum(r["units_sold"] for r in out_m if r["sku"] == "VAN")
+check("3 sold alone + 2 via kits = 5, not 3 + 2 x 3", van_total == 5, str(van_total))
+
 print("\n— without a map, nothing changes at all —")
 out2, rep2 = B.attribute(rows, {})
 check("rows come back identical", out2 == rows)

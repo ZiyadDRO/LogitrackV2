@@ -79,6 +79,9 @@ def save(catalog: dict, extras: dict | None = None) -> bool:
                 # Which attributes a person set by hand. Those win over what the store's
                 # own data says on a re-sync; the rest follow the store.
                 "attrs_set": sorted(entry.get("attrs_set") or []),
+                # Which attributes the AI filled in. They never count as set by hand, so
+                # the file's or store's own values replace them.
+                "attrs_ai": sorted(entry.get("attrs_ai") or []),
                 "mode": entry.get("mode") or "uploaded",
                 "filename": entry.get("filename"),
                 "sources": entry.get("sources") or [],
@@ -88,6 +91,10 @@ def save(catalog: dict, extras: dict | None = None) -> bool:
                 # it a later CSV append would re-anchor Shopify data that must keep its
                 # real dates.
                 "live_source": bool(entry.get("live_source")),
+                # The last real stock figure the file gave (None = it gave none). Only
+                # written when known, so older saves keep their old behaviour on restore.
+                **({"last_known_stock": entry.get("last_known_stock")}
+                   if "last_known_stock" in entry else {}),
                 "rows": int(len(out)),
             }
 
@@ -141,6 +148,7 @@ def load() -> tuple[dict, dict]:
                 "df": df.sort_values("ds").reset_index(drop=True),
                 "attrs": meta.get("attrs") or {},
                 "attrs_set": list(meta.get("attrs_set") or []),
+                "attrs_ai": list(meta.get("attrs_ai") or []),
                 "sku_name": meta.get("sku_name") or sid,
                 "mode": meta.get("mode") or "uploaded",
                 "filename": meta.get("filename"),
@@ -148,6 +156,8 @@ def load() -> tuple[dict, dict]:
                 "events": meta.get("events") or [],
                 "date_shift_days": int(meta.get("date_shift_days") or 0),
                 "live_source": bool(meta.get("live_source")),
+                **({"last_known_stock": meta.get("last_known_stock")}
+                   if "last_known_stock" in meta else {}),
             }
         return catalog, (manifest.get("extras") or {})
     except Exception as e:                                  # noqa: BLE001

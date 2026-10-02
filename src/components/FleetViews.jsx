@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
+import { ClosedDaysButton } from './ClosedDays';
 import { urgencyLevel, URGENCY_STYLES, URGENCY_STYLES_LM, formatDate,
-         skuState, SKU_STATES } from '../lib/helpers';
+         skuState, SKU_STATES, stockIsCounted, todayMs } from '../lib/helpers';
 import { Tip } from './common';
 import { loadStorage, saveStorage } from '../lib/storage';
 import { FleetAlertBanner } from './Sidebar';
@@ -92,7 +93,7 @@ export function projectCycles({ curve, stock, firstDay, firstQty, lead, coverage
     lag = Math.max(0, Math.round(Number(dataAge)) - 1);
   } else {
     const t0 = Number(curve[0]?.x);
-    const todayMid = new Date().setHours(0, 0, 0, 0);
+    const todayMid = todayMs();   // store's today, on the same UTC-midnight grid as the curve
     lag = Number.isFinite(t0) ? Math.max(0, Math.round((todayMid - t0) / DAY)) : 0;
   }
   const n = curve.length;
@@ -138,7 +139,7 @@ const DEFAULT_FLEET_TYPES = ["stockout", "reorder", "overstock", "uncounted"];
 const ATTENTION_TYPES = new Set(["stockout", "reorder", "overstock", "uncounted", "dead"]);
 const FLEET_FILTER_KEY = "logitrack_fleet_filter";
 
-export function FleetBento({ skuForecasts, getParams, openPOs, onSelectSku, lm, onExportFleet, onExportAll, exporting, scorecardRows = [], onEditCosts = null }) {
+export function FleetBento({ skuForecasts, getParams, leadTimeOf = null, openPOs, onSelectSku, lm, onExportFleet, onExportAll, exporting, scorecardRows = [], onEditCosts = null, onClosedDays = null, closedCount = 0 }) {
   const T = terminal(lm);
   const PROJ_FILL = projFill(T);        // bars — texture reads at size
   const PROJ_CHIP = projFillSoft(T);    // chips — texture behind digits, so lighter
@@ -146,8 +147,9 @@ export function FleetBento({ skuForecasts, getParams, openPOs, onSelectSku, lm, 
   const scoreBySku = Object.fromEntries((scorecardRows || []).map(r => [r.skuId, r]));
   // Lead time travels in, because the reorder bands are a fraction of it — a
   // 60-day sea line and a 3-day air line do not share a "due soon".
-  const stateOf = s => skuState(s, scoreBySku[s.skuId], !!openPOs[s.skuId],
-                               Number(getParams(s.skuId)?.leadTime) || null);
+  // The PLANNED lead time when App provides it (the typed field is only one input).
+  const leadOf = id => (leadTimeOf ? leadTimeOf(id) : (Number(getParams(id)?.leadTime) || null));
+  const stateOf = s => skuState(s, scoreBySku[s.skuId], !!openPOs[s.skuId], leadOf(s.skuId));
   const bucket = s => stateOf(s).key;
   const counts = { stockout:0, reorder:0, overstock:0, dead:0, healthy:0, uncounted:0, unrated:0 };
   /* Which kinds of product the list on the right shows. Chosen by the viewer and
@@ -230,7 +232,7 @@ export function FleetBento({ skuForecasts, getParams, openPOs, onSelectSku, lm, 
   // "consider ordering," never as hard overdue. "Soon" = forecast reorder OR observed
   // runway within ~10 days. orderQty is 0 for baseline, so we only suggest a qty if known.
 
-  let costKnown = false, invValue = 0, invKnown = false;
+  let costKnown = false, invValue = 0, invKnown = false, invUncounted = 0;
 
   /* How old the sales behind all of this are. Nothing re-imports on a schedule, so this
      page can sit open for days looking perfectly live: the countdowns tick, the week
@@ -334,7 +336,10 @@ export function FleetBento({ skuForecasts, getParams, openPOs, onSelectSku, lm, 
   skuForecasts.forEach(s => {
     const prm = getParams(s.skuId); const c = Number(prm.unitCost); const f = Number(prm.fees) || 0;
     const stk = Number(prm.stock) || 0;
-    if (c > 0) { invValue += stk * c; invKnown = true; }
+    // Only stock someone actually counted. A placeholder (50 units, source "unknown") times
+    // cost is money nobody has seen: 200 uncounted products at $20 read as $200,000.
+    if (c > 0 && stockIsCounted(prm)) { invValue += stk * c; invKnown = true; }
+    else if (c > 0) invUncounted += 1;
     if (openPOs[s.skuId] || !s.orderQty) return;
     /* stateOf, not s.daysUntilReorder — skuState falls back to the scorecard's copy of
        the date, so reading the raw field made products vanish from the plan. */
@@ -355,7 +360,7 @@ export function FleetBento({ skuForecasts, getParams, openPOs, onSelectSku, lm, 
     if (!REPEATABLE(state.key)) return;
     projectCycles({
       curve: s.chartDataFuture, stock: stk, firstDay: days, firstQty: s.orderQty,
-      lead: Number(prm.leadTime) || 14, coverage: Number(prm.coverage) || 30,
+      lead: leadOf(s.skuId) || 14, coverage: Number(prm.coverage) || 30,
       safety: Number(s.safetyStock) || 0, horizonDays: WEEKS * 7,
       dataAge: s.dataAgeDays,
     }).forEach(({ day, qty, est }) => {
@@ -458,6 +463,11 @@ export function FleetBento({ skuForecasts, getParams, openPOs, onSelectSku, lm, 
             <b style={{ ...mono, color:T.ink, fontWeight:600 }}>{toOrder}</b> to order</div>
         </div>
         <div style={{ display:"flex", alignItems:"center", gap:9 }}>
+          {/* A store setting, not an export or a data sheet: its own look, set apart. */}
+          {onClosedDays && (<>
+            <ClosedDaysButton onClick={onClosedDays} count={closedCount} lm={lm} />
+            <span aria-hidden="true" style={{ width:2, alignSelf:"stretch", background:T.line, margin:"2px 3px" }} />
+          </>)}
           {onEditCosts && (
             <button onClick={onEditCosts} style={btnGhost}
               title="What you pay per unit, plus any per-unit fees. Drives margin, profit grade and protection levels.">
@@ -552,7 +562,9 @@ export function FleetBento({ skuForecasts, getParams, openPOs, onSelectSku, lm, 
           <div style={cap}>Inventory value</div>
           <div style={{ ...mono, fontSize:28, fontWeight:500, letterSpacing:"-.03em", marginTop:7, lineHeight:1 }}>{invKnown ? fmt(invValue) : "-"}</div>
           <div style={{ fontSize:14.5, marginTop:6, color:T.soft, fontWeight:500 }}>
-            {invKnown ? "stock on hand" : addCostsLink("add unit costs to value stock")}
+            {invKnown
+              ? (invUncounted ? `counted stock only (${invUncounted} product${invUncounted === 1 ? "" : "s"} not counted)` : "stock on hand")
+              : invUncounted ? "count stock to value it" : addCostsLink("add unit costs to value stock")}
           </div>
           {invKnown && onEditCosts && (
             <div style={{ fontSize:14, marginTop:4 }}>{addCostsLink("Edit costs & fees")}</div>
@@ -627,10 +639,15 @@ export function FleetBento({ skuForecasts, getParams, openPOs, onSelectSku, lm, 
             const tag = b === "dead" ? pill(T.deadBg, T.deadFg, "Dead stock", SKU_STATES.dead.help)
               : b === "overstock" ? pill(T.overBg, T.overFg, sc?.sellThrough != null ? `Overstocked · ${Math.round(sc.sellThrough * 100)}% sold` : "Overstocked", SKU_STATES.overstock.help)
               : b === "stockout" ? pill(T.redBg, T.redFg, d == null ? "Stockout risk" : d < 0 ? `Overdue ${Math.abs(d)}d` : d === 0 ? "Due today" : `Due in ${d}d`, SKU_STATES.stockout.help)
-              : b === "reorder" ? pill(T.blueBg, T.blueFg, d != null ? `Due in ${d}d` : "Due", SKU_STATES.reorder.help)
+              : b === "reorder" ? pill(T.blueBg, T.blueFg, d == null ? "Due" : d < 0 ? `Overdue ${Math.abs(d)}d` : d === 0 ? "Due today" : `Due in ${d}d`, SKU_STATES.reorder.help)
               : b === "healthy" ? pill(T.greenBg, T.greenFg, "Healthy", SKU_STATES.healthy.help)
               : b === "uncounted" ? pill(T.sunken, T.soft, "Not counted", SKU_STATES.uncounted.help)
               : pill("transparent", T.faint, "Not rated", SKU_STATES.unrated.help);
+            /* Out of season is an overlay, not a status: a Christmas line in September is
+               scored by the normal rules and says why it's quiet. */
+            const offTag = sc?.offSeason
+              ? pill(T.sunken, T.soft, "out of season", "Quiet now the same way it was this time last year, and it sold in the months after. Its forecast follows past years, so orders rise ahead of its season.")
+              : null;
             const action = b === "dead" ? "Review / clear"
               : b === "overstock" ? "Reduce orders"
               : b === "uncounted" ? "Count stock"
@@ -652,7 +669,7 @@ export function FleetBento({ skuForecasts, getParams, openPOs, onSelectSku, lm, 
                 </div>
                 <div style={{ display:"flex", alignItems:"center", gap:10, flexShrink:0 }}>
                   {openPOs[s.skuId] && pill(T.blueBg, T.blueFg, "On order")}
-                  {tag}
+                  {tag}{offTag}
                   {actionBtn(openPOs[s.skuId] ? "View" : action, !plain)}
                 </div>
               </div>);

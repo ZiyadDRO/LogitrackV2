@@ -33,6 +33,7 @@ import pandas as pd
 import router as R
 from main import build_entry, lead_window_sigma, _exclude_from_pooling   # the REAL routing + engines — no reimplementation
 from forecast_engine import fill_daily_gaps
+import censoring as _CEN
 
 # The self-calibration inside build_entry refits the engine per holdout window. The
 # backtest ALREADY refits at every cutoff, so run it with fewer windows — the buffer
@@ -107,7 +108,8 @@ def normalize(raw: pd.DataFrame) -> pd.DataFrame:
         df["sku"] = "SERIES"
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df["units_sold"] = pd.to_numeric(df["units_sold"], errors="coerce").fillna(0).clip(lower=0)
-    df = df.dropna(subset=["date"]).drop_duplicates()
+    # Identical rows are real sales (one row per sale), not copies: summed below. See _ingest.
+    df = df.dropna(subset=["date"])
     agg = {c: ("sum" if c == "units_sold" else "last") for c in df.columns if c not in ("sku", "date")}
     df = df.groupby(["sku", "date"], as_index=False).agg(agg).sort_values(["sku", "date"]).reset_index(drop=True)
     df = df.rename(columns={"date": "ds", "units_sold": "y"})
@@ -142,7 +144,11 @@ def _pool_state_as_of(df: pd.DataFrame, cutoff: pd.Timestamp):
         if gc.empty:
             continue
         attrs = {c: (gc[c].dropna().iloc[0] if gc[c].notna().any() else None) for c in attr_cols}
-        entry = {"df": gc[["ds", "y"]].reset_index(drop=True), "attrs": attrs, "sku_name": str(s)}
+        # Price facts travel with the history, as they do in the live catalog: peers lend
+        # their price response and promotion lifts, which can't be read from ds/y alone.
+        keep = ["ds", "y"] + [c for c in ("price", "price_mixed", "price_listed", "on_promotion")
+                              if c in gc.columns]
+        entry = {"df": gc[keep].reset_index(drop=True), "attrs": attrs, "sku_name": str(s)}
         if not _exclude_from_pooling(entry, as_of=cutoff):
             catalog[s] = entry
     base_cols = R.detect_group_columns(catalog)
@@ -150,18 +156,19 @@ def _pool_state_as_of(df: pd.DataFrame, cutoff: pd.Timestamp):
     # Same baseline discipline as production: similarity is measured with the
     # catalog-wide rhythm removed, so a replay pools exactly what live routing would.
     baseline = R.catalog_baseline(catalog)
-    clusters = R.cluster_catalog(groups, catalog, baseline=baseline)
-    return catalog, groups, clusters, baseline
+    family = R.family_map(groups, _meta)
+    clusters = R.cluster_catalog(groups, catalog, baseline=baseline, family=family)
+    return catalog, groups, clusters, baseline, family
 
 
 def _relatives_as_of(df: pd.DataFrame, sku: str, cutoff: pd.Timestamp, pool_cache: dict | None = None):
     key = pd.Timestamp(cutoff).normalize()
     if pool_cache is not None and key in pool_cache:
-        catalog, groups, clusters, baseline = pool_cache[key]
+        catalog, groups, clusters, baseline, _family = pool_cache[key]
     else:
-        catalog, groups, clusters, baseline = _pool_state_as_of(df, cutoff)
+        catalog, groups, clusters, baseline, _family = _pool_state_as_of(df, cutoff)
         if pool_cache is not None:
-            pool_cache[key] = (catalog, groups, clusters, baseline)
+            pool_cache[key] = (catalog, groups, clusters, baseline, _family)
     if sku not in catalog:
         return [], 0, None
     rels, n_rel, _info = R.behavioral_relatives(sku, groups, catalog, clusters, baseline=baseline)
@@ -182,8 +189,9 @@ def _peers_as_of(df: pd.DataFrame, sku: str, cutoff: pd.Timestamp, pool_cache: d
         _relatives_as_of(df, sku, cutoff, pool_cache)
     if pool_cache is None or key not in pool_cache:
         return None
-    catalog, groups, _clusters, _baseline = pool_cache[key]
-    return R.category_peers(sku, groups, catalog) if sku in catalog else None
+    catalog, groups, _clusters, _baseline, _family = pool_cache[key]
+    return (R.category_peers(sku, groups, catalog, family=_family, baseline=_baseline)
+            if sku in catalog else None)
 
 
 def _store_peers_as_of(df, sku, cutoff, pool_cache=None):
@@ -201,13 +209,117 @@ def _store_peers_as_of(df, sku, cutoff, pool_cache=None):
 # ─────────────────────────────────────────────────────────────────────────────
 #  METRICS
 # ─────────────────────────────────────────────────────────────────────────────
-def _cost_as_of(sku_df: pd.DataFrame, cutoff: pd.Timestamp):
-    """The SKU's per-unit cost as known at the cutoff (last non-null 'cost'/'unit_cost'
-    value on or before that date), or None if the data carries no cost column. Lets the
-    tier economics use real cost when the sheet provides it, no-leakage."""
+def _scoreable_days(sku_df: pd.DataFrame) -> pd.DataFrame:
+    """The days a forecast can be graded on: every day training keeps. Only a day with
+    nothing to sell (UNAVAILABLE in censoring: opened empty, sold nothing, closed empty)
+    is left out, the same rule the fit uses.
+
+    This used to keep only rows with units_in_stock > 0. A blank stock cell is NaN, and
+    NaN > 0 is False, so a product with no stock figures in a catalog where others had
+    them lost EVERY day: it was never tested, and every sync asked to test it again. And
+    a day that sold out (closing stock 0, but sold all day) was dropped from scoring while
+    training kept it, so the busiest days were never graded."""
+    if "units_in_stock" not in sku_df.columns:
+        return sku_df
+    stock = pd.to_numeric(sku_df["units_in_stock"], errors="coerce")
+    if stock.isna().all():
+        return sku_df
+    frame = sku_df[["ds", "y"]].copy()
+    frame["units_in_stock"] = stock.to_numpy()
+    kept, _ = _CEN.apply_to_frame(frame.reset_index(drop=True))
+    keep_days = set(pd.to_datetime(kept["ds"]))
+    return sku_df[pd.to_datetime(sku_df["ds"]).isin(keep_days)]
+
+
+PRICE_TOL = 0.005      # same tolerance the live-price feed uses for "a different price"
+
+
+def _window_events(sku_df: pd.DataFrame, cutoff, end) -> list:
+    """The price changes and promotions a test window actually had, as the events a
+    person would have logged for it. Built from the recorded price and on_promotion on
+    the window's own days, in the app's event shapes (promotion / price_change_*).
+
+    Test windows used to be forecast with NO events, so any window containing a sale or
+    a price change was graded as if the model should have guessed it unaided. The
+    live app is always told about a planned promotion; the replay now is too. Only
+    days inside the window are read, and only their price and promotion flags, never
+    their sales: this is what was planned, not what happened.
+    """
+    if sku_df is None or not len(sku_df):
+        return []
+    cutoff, end = pd.Timestamp(cutoff), pd.Timestamp(end)
+    has_price = "price" in sku_df.columns
+    has_promo = "on_promotion" in sku_df.columns
+    if not has_price and not has_promo:
+        return []
+    past = sku_df[sku_df["ds"] <= cutoff]
+    win = sku_df[(sku_df["ds"] > cutoff) & (sku_df["ds"] <= end)].sort_values("ds")
+    if win.empty:
+        return []
+    promo = (pd.to_numeric(win["on_promotion"], errors="coerce").fillna(0) >= 0.5).to_numpy() \
+        if has_promo else np.zeros(len(win), bool)
+    price = pd.to_numeric(win["price"], errors="coerce").to_numpy(float) if has_price \
+        else np.full(len(win), np.nan)
+    base = None
+    if has_price:
+        pp = past.copy()
+        pp["_p"] = pd.to_numeric(pp["price"], errors="coerce")
+        if "on_promotion" in pp.columns:
+            reg = pp[pd.to_numeric(pp["on_promotion"], errors="coerce").fillna(0) < 0.5]["_p"].dropna()
+        else:
+            reg = pp["_p"].dropna()
+        allp = pp["_p"].dropna()
+        base = float(reg.iloc[-1]) if len(reg) else (float(allp.iloc[-1]) if len(allp) else None)
+    days = [d.strftime("%Y-%m-%d") for d in pd.to_datetime(win["ds"])]
+    evs = []
+
+    # Promotions: each run of consecutive promotion days is one promotion, with the
+    # discount the recorded prices show against the regular price before the window.
+    i = 0
+    while i < len(days):
+        if not promo[i]:
+            i += 1; continue
+        j = i
+        while j + 1 < len(days) and promo[j + 1]:
+            j += 1
+        ev = {"type": "promotion", "date": days[i], "end_date": days[j], "label": "Recorded promotion",
+              "origin": "backtest"}
+        pr = price[i:j + 1]; pr = pr[np.isfinite(pr)]
+        if base and len(pr) and float(np.mean(pr)) < base * (1 - PRICE_TOL):
+            ev["discount_pct"] = round(min(100.0, (1 - float(np.mean(pr)) / base) * 100), 1)
+        evs.append(ev)
+        i = j + 1
+
+    # Price changes on the other days: runs at one price different from the regular one.
+    # The run that lasts to the end of the window is a permanent change; any earlier one
+    # was temporary.
+    if base:
+        i = 0
+        while i < len(days):
+            p_i = price[i]
+            if promo[i] or not np.isfinite(p_i) or abs(p_i - base) <= base * PRICE_TOL:
+                i += 1; continue
+            j = i
+            while (j + 1 < len(days) and not promo[j + 1] and np.isfinite(price[j + 1])
+                   and abs(price[j + 1] - p_i) <= max(p_i, 0.01) * PRICE_TOL):
+                j += 1
+            if j == len(days) - 1:
+                evs.append({"type": "price_change_permanent", "date": days[i], "new_price": round(float(p_i), 2),
+                            "label": "Recorded price change", "origin": "backtest"})
+            else:
+                evs.append({"type": "price_change_temporary", "date": days[i], "end_date": days[j],
+                            "new_price": round(float(p_i), 2), "label": "Recorded price change",
+                            "origin": "backtest"})
+            i = j + 1
+    return sorted(evs, key=lambda e: e["date"])
+
+
+def _cost_latest(sku_df: pd.DataFrame):
+    """The product's most recent per-unit cost in the data ('cost'/'unit_cost'), or None.
+    Used as TODAY's cost when the dashboard has none (see _run_cutoff)."""
     for c in ("cost", "unit_cost"):
         if c in sku_df.columns:
-            s = pd.to_numeric(sku_df[sku_df["ds"] <= cutoff][c], errors="coerce").dropna()
+            s = pd.to_numeric(sku_df[c], errors="coerce").dropna()
             if len(s):
                 return float(s.iloc[-1])
     return None
@@ -267,24 +379,24 @@ def _run_cutoff(df, sku, sku_df, cutoff, horizon, combos, service_pct,
     you'd changed could never be re-tested: the catalog-wide run used the most common
     values, so that product stayed permanently 'stale'. Returns one row per pair."""
     rels, n_rel, pool_coh = _relatives_as_of(df, sku, cutoff, pool_cache)
-    # build_entry strips to ds <= cutoff internally → no lookahead.
-    entry = build_entry(sku, sku, sku_df, "uploaded", "backtest", cutoff, [], rels, n_rel,
+    # build_entry strips to ds <= cutoff internally → no lookahead. The window's own
+    # price changes and promotions go in as planned events, as they would in the app.
+    events = _window_events(sku_df, cutoff, cutoff + pd.Timedelta(days=horizon))
+    entry = build_entry(sku, sku, sku_df, "uploaded", "backtest", cutoff, events, rels, n_rel,
                         pool_cohesion=pool_coh,
+                        pool_baseline=(pool_cache[pd.Timestamp(cutoff).normalize()][3]
+                                       if pool_cache and pd.Timestamp(cutoff).normalize() in pool_cache else None),
                         calib_windows=BT_CALIB_WINDOWS, force_route=force_route,
                         peers=_peers_as_of(df, sku, cutoff, pool_cache),
                         store_peers=_store_peers_as_of(df, sku, cutoff, pool_cache))
     fc = entry["forecast"]
     end = cutoff + pd.Timedelta(days=horizon)
     pred = fc[(fc["ds"] > cutoff) & (fc["ds"] <= end)][["ds", "yhat", "yhat_lower", "yhat_upper"]]
-    # Score ONLY in-stock days. A demand forecast is trained on in-stock days (the
-    # engine drops stockout rows), so grading it against stockout days — where sales
-    # were 0 because the shelf was empty — wrongly reads as massive over-forecasting.
-    # The bias scales with how often a SKU was out of stock, which is a scoring
-    # artifact, not a forecast error. Dropping stockout days aligns scoring with
-    # training and measures true demand accuracy.
-    scoring_df = sku_df
-    if "units_in_stock" in sku_df.columns:
-        scoring_df = sku_df[sku_df["units_in_stock"] > 0]
+    # Score the days training keeps. Grading against days the shelf was empty all day
+    # (sales 0 because there was nothing to sell) reads as over-forecasting that scales
+    # with how often a product was out; grading only fully-stocked days skips the
+    # sell-out days, which are the busiest. See _scoreable_days.
+    scoring_df = _scoreable_days(sku_df)
     actual = scoring_df[(scoring_df["ds"] > cutoff) & (scoring_df["ds"] <= end)][["ds", "y"]]
     # MASE scale comes from the UNFILTERED (contiguous) history — see _score_window.
     train_y = sku_df[sku_df["ds"] <= cutoff]["y"].to_numpy(float)
@@ -303,12 +415,20 @@ def _run_cutoff(df, sku, sku_df, cutoff, horizon, combos, service_pct,
         w = mw[(mw["ds"] > lo) & (mw["ds"] <= hi)]
         return float(w[col].clip(lower=0).sum()) if len(w) else 0.0
 
-    # Economics don't depend on the window, so resolve them once for all pairs.
-    price = float(entry.get("last_price") or 0.0)
+    # Economics don't depend on the (lead, coverage) pair, so resolve them once.
+    #  · Price: today's shelf price when the app sends one. The tier being chosen is for
+    #    selling at today's price; a window's own price used to set its margin, so a
+    #    price rise never reached the recommendation.
+    #  · Cost: today's cost too: the dashboard's, else the latest in the data. Price and
+    #    cost come from the same moment, so the profit per unit is one that exists: a
+    #    window's old cost against today's price made a figure that was true at no time
+    #    and overstated what a stockout costs. The UNITS short and carried still come
+    #    from the window's real sales; only what they're worth is today's.
     econ = (sku_econ or {})
+    price = float(econ.get("price") or entry.get("last_price") or 0.0)
     cost = econ.get("cost")
-    if cost is None:
-        cost = _cost_as_of(sku_df, cutoff)        # fallback: a cost column in the sheet
+    if cost in (None, ""):
+        cost = _cost_latest(sku_df)
     fees = float(econ.get("fees") or 0.0)
     cost_known = cost is not None
     unit_cost = float(cost) if cost_known else 0.0
@@ -356,6 +476,7 @@ def _run_cutoff(df, sku, sku_df, cutoff, horizon, combos, service_pct,
                "orderErrPct": order_err_pct, "price": round(price, 2),
                "unitCost": round(unit_cost, 4), "marginUnit": round(margin_unit, 4),
                "costKnown": bool(cost_known),
+               "fees": round(fees, 4),
                "trainDays": train_days, "leadDaysScored": n_lt,
                "bufferTestable": bool(buffer_testable),
                # model coefficients behind the buffer (averaged across cutoffs for display)
@@ -468,6 +589,7 @@ def run_backtest(df, horizon=44, n_cutoffs=AUTO_CUTOFFS, step=28, lead=14, cover
     produces exactly the rows a full run would for those products — at a fraction of the
     cost when one item's settings change."""
     combos = _normalise_combos(combos, lead, coverage)
+    horizon = effective_horizon(horizon, combos)
     want = {str(s) for s in only_skus} if only_skus else None
     rows = []
     pool_cache = {}   # cutoff → (catalog, groups, clusters); shared across SKUs
@@ -912,8 +1034,16 @@ def _tier_summary(frame, coverage=30, holding_annual=0.25):
                for sku, g in frame.groupby("sku") if bool(g["costKnown"].any())}
     profit_skus  = {s for s, m in margins.items() if m > 0}
     loss_making  = sorted(s for s, m in margins.items() if m <= 0)
-    costed = frame[frame["sku"].astype(str).isin(profit_skus)]
-    costed_skus = len(profit_skus)
+    # Windows whose buffer could actually be judged (enough in-stock days over the lead
+    # time). A product with NONE was being scored as zero shortfall AND zero buffer at
+    # every tier (the mean of nothing came back as 0), so its cheapest tier was always
+    # the lowest one, reported as "measured". It has no measurement: it's left out of the
+    # money and gets no best tier.
+    testable = _testable_windows(frame)
+    untestable = sorted(s for s, n in testable.items() if n == 0)
+    costed_ids = {s for s in profit_skus if testable.get(s, 0) > 0}
+    costed = frame[frame["sku"].astype(str).isin(costed_ids)]
+    costed_skus = len(costed_ids)
     priced = costed_skus > 0
     # "partial" must mean COSTS ARE MISSING — nothing else. It used to key off
     # profit-positive products, so a catalog where every cost was present but one item
@@ -933,7 +1063,7 @@ def _tier_summary(frame, coverage=30, holding_annual=0.25):
         # Calibration, averaged PER SKU FIRST then across SKUs. Pooling raw windows let a
         # long-history SKU (8 cutoffs) outvote a short one (1 cutoff) eight to one — and
         # adaptive cutoff spacing makes those counts differ more, not less.
-        per_sku_cov = frame.groupby("sku")[cov_c].mean().dropna()
+        per_sku_cov = frame.groupby("sku")[cov_c].mean().dropna()   # (mean skips NaN windows)
         achieved = round(float(per_sku_cov.mean()) * 100, 1) if len(per_sku_cov) else None
         # Avg units short per reorder cycle, totalled across ALL tested SKUs (no cost needed) —
         # the plain-units quantity the lost-profit dollars are built from.
@@ -984,13 +1114,18 @@ def _tier_summary(frame, coverage=30, holding_annual=0.25):
         ck = bool(g["costKnown"].any())
         margin = float(g["marginUnit"].mean()) if ck else None
         loss = bool(ck and margin is not None and margin <= 0)   # priced at/below cost
-        profitable = bool(ck and not loss)
+        n_test = testable.get(str(sku), 0)
+        profitable = bool(ck and not loss and n_test > 0)
         uc = float(g["unitCost"].mean()) if ck else None
         st = {}
         for pct in sorted(Z.keys()):
             # Guard on presence: a frame from an older run (or a partial one) may not
             # carry every tier, and a missing column shouldn't take down the whole report.
             if f"lost_{pct}" not in g.columns or f"safety_{pct}" not in g.columns:
+                continue
+            if n_test == 0:
+                st[str(pct)] = {"unitsYr": None, "safetyUnits": None, "profitYr": None,
+                                "holdingCostYr": None, "totalCostYr": None, "bufferCash": None}
                 continue
             lost_mean = _nanmean(g[f"lost_{pct}"])
             safety_mean = _nanmean(g[f"safety_{pct}"])
@@ -1009,8 +1144,13 @@ def _tier_summary(frame, coverage=30, holding_annual=0.25):
             best_sku_tier = min((pct for pct in sorted(Z.keys())
                                  if str(pct) in st and st[str(pct)]["totalCostYr"] is not None),
                                 key=lambda pct: st[str(pct)]["totalCostYr"], default=None)
+        # `windows` counts the windows that could judge the buffer: that's what the app's
+        # "measured on N windows" gate reads. All windows scored for accuracy are
+        # `windowsTotal`.
         by_sku.append({"sku": str(sku), "costKnown": ck, "lossMaking": loss,
-                       "windows": int(len(g)), "bestTier": best_sku_tier, "tiers": st})
+                       "windows": int(n_test), "windowsTotal": int(len(g)),
+                       "untestable": n_test == 0,
+                       "bestTier": best_sku_tier, "tiers": st})
     _lo = str(min(Z.keys()))
     by_sku.sort(key=lambda r: (r["tiers"].get(_lo) or {}).get("unitsYr") or 0.0, reverse=True)
 
@@ -1046,11 +1186,43 @@ def _tier_summary(frame, coverage=30, holding_annual=0.25):
         "uncostedSkus": sorted(str(sku) for sku, g in frame.groupby("sku")
                                if not bool(g["costKnown"].any())),
         "lossMakingSkus": loss_making,
+        # Tested for accuracy, but no window could judge the buffer: no tier is measured.
+        "untestableSkus": untestable,
         "criticalRatio": crit, "nearestTier": nearest, "ranking": ranking,
         "mixedPolicy": (_mixed_policy(costed, out, cycles_per_year, holding_annual)
                         if priced else None),
         "tiers": out, "bySku": by_sku, "bestTier": best,
     }
+
+
+def _testable_windows(frame) -> dict:
+    """{sku: number of windows whose buffer could be judged}. A window is testable when
+    its coverage flag is a number, not NaN (see bufferTestable in _run_cutoff)."""
+    cols = [f"cov_{p}" for p in sorted(Z.keys()) if f"cov_{p}" in frame.columns]
+    out = {}
+    for sku, g in frame.groupby("sku"):
+        if "bufferTestable" in g.columns:
+            n = int(g["bufferTestable"].fillna(False).astype(bool).sum())
+        elif cols:
+            n = int(g[cols[0]].notna().sum())
+        else:
+            n = 0
+        out[str(sku)] = n
+    return out
+
+
+def effective_horizon(horizon, combos=None, lead=None, coverage=None) -> int:
+    """The test window has to hold the whole decision: the lead time AND the coverage
+    after delivery. A fixed 44 days is 14 + 30; a product on a 21-day lead with 45 days
+    of cover had its coverage window cut off at day 44 and its order error measured on a
+    fraction of the days. Never shorter than asked for."""
+    need = [int(horizon or 0)]
+    for L, C in list(combos or []) + ([(lead, coverage)] if lead is not None and coverage is not None else []):
+        try:
+            need.append(int(L) + int(C))
+        except (TypeError, ValueError):
+            continue
+    return max(need)
 
 
 def _json_safe(o):
@@ -1117,29 +1289,44 @@ def rebuild_from_rows(result: dict, rows: pd.DataFrame, *, combos, holding_pct=2
 
 
 def _apply_costs(rows: pd.DataFrame, sku_costs: dict | None) -> pd.DataFrame:
-    """Rewrite per-row economics from a costs map, keeping the original where none given."""
+    """Rewrite per-row economics from a costs map {sku: {cost, fees, price}}, keeping the
+    original where none is given.
+
+      price  today's shelf price, when given: every window is re-priced with it.
+      cost   today's unit cost, when given: every window is re-costed with it.
+      fees   the new per-unit fees.
+    """
     df = rows.copy()
     costs = {str(k): v for k, v in (sku_costs or {}).items()}
-    if not costs:
+    if not costs or df.empty:
         return df
-    new_cost, new_margin, new_known = [], [], []
+    new_cost, new_margin, new_known, new_price, new_fees = [], [], [], [], []
     for _, r in df.iterrows():
         econ = costs.get(str(r["sku"])) or {}
+        old_price = float(r.get("price") or 0.0)
+        known0 = bool(r.get("costKnown"))
+        uc0 = float(r.get("unitCost") or 0.0)
+        if "fees" in r and r.get("fees") == r.get("fees") and r.get("fees") is not None:
+            f0 = float(r.get("fees"))
+        else:   # rows from before fees were stored: back them out of the margin
+            f0 = (old_price - uc0 - float(r.get("marginUnit") or 0.0)) if known0 else 0.0
+        price = float(econ["price"]) if econ.get("price") not in (None, "") else old_price
         c = econ.get("cost")
-        if c in (None, ""):
-            known = bool(r.get("costKnown")); uc = float(r.get("unitCost") or 0.0)
-            f = (float(r.get("price") or 0.0) - uc - float(r.get("marginUnit") or 0.0)) if known else 0.0
+        if c not in (None, ""):
+            known, uc = True, float(c)
+            f = float(econ.get("fees") or 0.0)
         else:
-            known, uc, f = True, float(c), float(econ.get("fees") or 0.0)
-        price = float(r.get("price") or 0.0)
+            known, uc, f = known0, uc0, f0
         new_known.append(known); new_cost.append(uc if known else 0.0)
+        new_price.append(round(price, 2)); new_fees.append(f)
         new_margin.append((price - uc - f) if known else 0.0)
     df["costKnown"], df["unitCost"], df["marginUnit"] = new_known, new_cost, new_margin
+    df["price"], df["fees"] = new_price, new_fees
     return df
 
 
 def recost(result: dict, rows: pd.DataFrame, sku_costs: dict | None,
-           holding_pct=25, coverage=30, combos=None) -> dict:
+           holding_pct=25, coverage=30, combos=None, rows_sink=None) -> dict:
     """Re-price an existing backtest with new costs — WITHOUT refitting anything.
 
     Unit cost and fees never touch a forecast. They don't change which model was chosen,
@@ -1151,28 +1338,10 @@ def recost(result: dict, rows: pd.DataFrame, sku_costs: dict | None,
     Accuracy sections are returned untouched; only the money is recomputed."""
     if rows is None or rows.empty:
         return result
-    df = rows.copy()
-    costs = {str(k): v for k, v in (sku_costs or {}).items()}
-    # Rewrite the per-row economics. Price came from the fitted entry and is unchanged;
-    # only cost, fees and therefore margin move.
-    new_cost, new_margin, new_known = [], [], []
-    for _, r in df.iterrows():
-        econ = costs.get(str(r["sku"])) or {}
-        c = econ.get("cost")
-        if c in (None, ""):
-            # No new cost supplied → keep whatever the original run used (e.g. a Cost
-            # column in the sheet), so recosting never silently discards known economics.
-            known = bool(r.get("costKnown"))
-            uc = float(r.get("unitCost") or 0.0)
-            f = float(r.get("price") or 0.0) - uc - float(r.get("marginUnit") or 0.0) if known else 0.0
-        else:
-            known, uc, f = True, float(c), float(econ.get("fees") or 0.0)
-        price = float(r.get("price") or 0.0)
-        new_known.append(known)
-        new_cost.append(uc if known else 0.0)
-        new_margin.append((price - uc - f) if known else 0.0)
-    df["costKnown"], df["unitCost"], df["marginUnit"] = new_known, new_cost, new_margin
-
+    # Price came from the fitted entry; cost, fees, and (when given) today's price move.
+    df = _apply_costs(rows, sku_costs)
+    if rows_sink is not None:
+        rows_sink.append(df)
     holding_annual = max(0.0, float(holding_pct) / 100.0)
     combos = combos or [(int(df["leadDays"].iloc[0]), int(df["coverageDays"].iloc[0]))]
     primary = df[(df["leadDays"] == combos[0][0]) & (df["coverageDays"] == combos[0][1])]
@@ -1197,6 +1366,7 @@ def run_for_api(df, horizon=44, n_cutoffs=AUTO_CUTOFFS, step=28, lead=14, covera
     skipped = []
     holding_annual = max(0.0, float(holding_pct) / 100.0)
     combos = _normalise_combos(combos, lead, coverage)
+    horizon = effective_horizon(horizon, combos)
     results = run_backtest(df, horizon, n_cutoffs, step, lead, coverage, service_pct,
                            min_train, verbose=False, skipped=skipped, sku_costs=sku_costs,
                            combos=combos)

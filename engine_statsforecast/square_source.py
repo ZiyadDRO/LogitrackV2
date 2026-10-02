@@ -537,7 +537,10 @@ def fetch_sales(access_token=None, environment=None, api_version=None, days=None
                     - datetime.timedelta(days=lookback)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
     stats = {"orders": 0, "lineItems": 0, "adHocLineItems": 0, "unmappedCatalogObjects": 0,
-             "skusWithoutSkuField": set(), "locations": [loc_name.get(i, i) for i in loc_ids]}
+             "skusWithoutSkuField": set(), "locations": [loc_name.get(i, i) for i in loc_ids],
+             # The store's time zone for the app's clock (main.py store zone): the first
+             # location pulled. Sales are already dated per location in its own zone.
+             "timezone": next((loc_tz.get(i) for i in loc_ids if loc_tz.get(i) and loc_tz.get(i) != "UTC"), None)}
     records = []
 
     for chunk in _chunks(loc_ids, MAX_LOCATIONS_PER_QUERY):

@@ -65,7 +65,13 @@ export const GROQ_MODEL = "openai/gpt-oss-120b";
 // The small structured calls (the natural-language event parser) stay on GROQ_MODEL:
 // they are a few hundred tokens, have no throughput problem, and strict JSON extraction
 // is not something to hand to an agent that might decide to search the web mid-parse.
-export const GROQ_MODEL_CHAT = "groq/compound-mini";
+// ── Update, after the free tier stopped being enough (see GROQ_CHAT_CHAIN) ──
+// compound-mini is no longer used. It routes to gpt-oss-120b anyway, so its 70,000
+// tokens a minute were never reachable (the sub-model's 8,000 applied); it added ~450
+// tokens of scaffold to every request; and it capped the account at 250 requests a day
+// against the plain models' 1,000. The chat now calls the models directly, in a chain.
+export const GROQ_CHAT_CHAIN = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"];
+export const GROQ_MODEL_CHAT = GROQ_CHAT_CHAIN[0];
 
 // Spread into the request body for GROQ_MODEL_CHAT. Harmless for a plain model, which
 // ignores unknown fields, so it does not need removing if the model changes back.
@@ -120,14 +126,14 @@ let _healthPromise = null;
  *   checked — false when there's no key, or the request failed
  *   missing — configured model ids Groq did not list. THIS is the deprecation signal.
  */
-export function checkGroqModels({ force = false } = {}) {
+export function checkGroqModels({ force = false, apiKey = GROQ_API_KEY } = {}) {
   if (_healthPromise && !force) return _healthPromise;
   _healthPromise = (async () => {
-    if (!GROQ_API_KEY) {
+    if (!apiKey) {
       return { ok: true, checked: false, available: [], missing: [], error: "no API key set" };
     }
     try {
-      const res = await fetch(GROQ_MODELS_URL, { headers: { Authorization: `Bearer ${GROQ_API_KEY}` } });
+      const res = await fetch(GROQ_MODELS_URL, { headers: { Authorization: `Bearer ${apiKey}` } });
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
         return { ok: true, checked: false, available: [], missing: [],
@@ -137,7 +143,7 @@ export function checkGroqModels({ force = false } = {}) {
       const available = (data?.data || []).map(m => m?.id).filter(Boolean);
       // A compound SYSTEM may not be listed the way a plain model is, so treat an id
       // we can't find as missing only when the listing looks complete enough to trust.
-      const want = [GROQ_MODEL, GROQ_MODEL_CHAT];
+      const want = [GROQ_MODEL];
       const missing = available.length ? want.filter(m => !available.includes(m)) : [];
       return { ok: missing.length === 0, checked: available.length > 0, available, missing, error: null };
     } catch (e) {
@@ -207,4 +213,125 @@ export function usageSummary() {
     tight: charged > GROQ_REQUEST_CEILING * 0.85,
     text: `${charged.toLocaleString()} / ${GROQ_REQUEST_CEILING.toLocaleString()} tokens`,
   };
+}
+
+
+// ── Chat on the free tier: a chain of models, each with its own allowance ─────
+//
+// Groq's free limits are PER MODEL: gpt-oss-120b, gpt-oss-20b and the Qwen model each
+// get their own 8,000 tokens a minute and 200,000 a day. A question costs ~5,000-7,000,
+// so one model alone manages about one question a minute and ~30 a day. Moving to the
+// next model when one is at its limit roughly triples that, and when all of them are
+// momentarily full, waiting the few seconds Groq asks for beats showing an error.
+//
+// Order is quality first: gpt-oss-120b, then gpt-oss-20b, then whichever Qwen model the
+// key can reach (looked up from the models list, since Groq renames them often).
+const _cooling = {};                       // model id -> ms timestamp it frees up again
+const _sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function _chatModels(apiKey) {
+  const h = await checkGroqModels({ apiKey });
+  const avail = h?.available || [];
+  if (!avail.length) return [...GROQ_CHAT_CHAIN];            // couldn't list: try the known ones
+  const chain = GROQ_CHAT_CHAIN.filter(m => avail.includes(m));
+  const qwen = avail.filter(id => /qwen/i.test(id) && !/guard|whisper|tts|vl|vision/i.test(id)).sort().reverse();
+  if (qwen.length) chain.push(qwen[0]);
+  return chain.length ? chain : [...GROQ_CHAT_CHAIN];
+}
+
+function _bodyFor(model, base) {
+  // gpt-oss is a reasoning model: without "low" it spends max_tokens thinking (see
+  // GROQ_LOW_REASONING). Qwen's reasoning is kept out of the reply text.
+  if (/gpt-oss/i.test(model)) return { ...base, model, ...GROQ_LOW_REASONING };
+  if (/qwen/i.test(model)) return { ...base, model, reasoning_format: "hidden" };
+  return { ...base, model };
+}
+
+/** Seconds Groq asks us to wait: the Retry-After header, else "try again in 12.5s". */
+function _retryAfter(res, msg) {
+  const h = Number(res.headers.get("retry-after"));
+  if (Number.isFinite(h) && h > 0) return h;
+  const m = /try again in\s*(?:(\d+)m)?\s*([\d.]+)s/i.exec(msg || "");
+  if (m) return (Number(m[1] || 0) * 60) + Number(m[2]);
+  return 20;
+}
+
+export class GroqChatError extends Error {
+  constructor(kind, message) { super(message); this.kind = kind; }
+}
+
+/**
+ * One chat completion across the model chain. Resolves { text, data, model, fallback }.
+ *   onWait(seconds, model) — called before waiting out a per-minute limit
+ * Throws GroqChatError with kind "daily" (every model's day is used up), "minute"
+ * (still full after one wait), "too_large", or "api".
+ */
+export async function groqChat({ messages, max_tokens = 700, temperature = 0.3,
+                                  apiKey = GROQ_API_KEY, onWait } = {}) {
+  const models = await _chatModels(apiKey);
+  const base = { messages, max_tokens, temperature };
+  let lastMsg = "";
+  for (let round = 0; round < 2; round++) {
+    let soonest = null;
+    let dailyOnly = true;
+    for (const model of models) {
+      const until = _cooling[model] || 0;
+      if (until > Date.now()) {
+        soonest = soonest == null ? until : Math.min(soonest, until);
+        if (until - Date.now() < 3600e3) dailyOnly = false;
+        continue;
+      }
+      let res;
+      try {
+        res = await fetch(GROQ_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+          body: JSON.stringify(_bodyFor(model, base)),
+        });
+      } catch (e) {
+        throw new GroqChatError("api", `Couldn't reach Groq (${e?.message || "network error"}).`);
+      }
+      if (res.ok) {
+        const data = await res.json();
+        recordGroqUsage(data, max_tokens);
+        let text = data?.choices?.[0]?.message?.content || "";
+        text = text.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();     // some Qwen builds inline it
+        return { text, data, model, fallback: model !== models[0] };
+      }
+      const err = await res.json().catch(() => ({}));
+      const msg = err?.error?.message || `API error ${res.status}`;
+      lastMsg = msg;
+      if (res.status === 413 || /too large|context length|reduce your message|maximum context/i.test(msg)) {
+        throw new GroqChatError("too_large", msg);
+      }
+      if (res.status === 429 || /rate limit/i.test(msg)) {
+        const daily = /per day|\(TPD\)|\(RPD\)/i.test(msg);
+        const secs = _retryAfter(res, msg);
+        _cooling[model] = Date.now() + secs * 1000;
+        soonest = soonest == null ? _cooling[model] : Math.min(soonest, _cooling[model]);
+        if (!daily && secs < 3600) dailyOnly = false;
+        continue;                                                  // next model
+      }
+      if (res.status === 404 || /does not exist|decommissioned|not found|not supported|unknown/i.test(msg)) {
+        continue;                                                  // this model is gone: skip it
+      }
+      throw new GroqChatError("api", msg);
+    }
+    // Every model is at a limit. Wait once for the soonest per-minute one, up to ~70s.
+    const waitMs = soonest != null ? soonest - Date.now() : null;
+    if (round === 0 && waitMs != null && waitMs <= 70e3 && !dailyOnly) {
+      const secs = Math.max(1, Math.ceil(waitMs / 1000));
+      onWait?.(secs);
+      await _sleep(secs * 1000 + 300);
+      continue;
+    }
+    if (dailyOnly && soonest != null) {
+      throw new GroqChatError("daily",
+        "Today's free AI allowance is used up on every model. It resets within 24 hours.");
+    }
+    throw new GroqChatError("minute",
+      "The free AI allowance is still busy after waiting. Try again in a minute."
+      + (lastMsg ? ` (${lastMsg.slice(0, 120)})` : ""));
+  }
+  throw new GroqChatError("api", lastMsg || "No model answered.");
 }

@@ -12,6 +12,44 @@ export const API = `${API_PROTO}//${API_HOST}:8000`;
 // Report the browser's timezone so the backend's "today" matches the user's local date.
 export const TZ = encodeURIComponent(Intl.DateTimeFormat().resolvedOptions().timeZone || "");
 
+/**
+ * The ONE way the app asks for a product's forecast.
+ *
+ * There used to be three hand-built copies of this URL (the Fleet's page load, the Fleet's
+ * per-product refresh, the product page) and each sent a different subset of the settings.
+ * The product page left out where the stock figure came from, so a count typed on a store
+ * with no stock column read as "not counted" there (no reorder date, order 0) while the
+ * Fleet showed the same product overdue. The page load left out cost, fees and the chosen
+ * protection level, so its order quantities differed from the product page until
+ * something else refreshed them. Every caller now goes through here, so every view asks
+ * the same question.
+ *
+ * `p`         the product's settings (DEFAULT_PARAMS merged in by the caller)
+ * `leadTime`  the PLANNED lead time (planningLeadTime(...).days), never p.leadTime: the
+ *             typed field is only one input to it
+ */
+export function forecastUrl(skuId, p, { leadTime, months = 3, onOrderQty = 0, onOrderEta = null,
+                                        strategy = "balanced" } = {}) {
+  const has = (v) => v != null && v !== "";
+  const q = [
+    `sku_id=${encodeURIComponent(skuId)}`,
+    `stock=${p.stock}`,
+    `lead_time_days=${leadTime ?? p.leadTime}`,
+    `coverage_days=${p.coverage}`,
+    `strategy=${strategy}`,
+    `forecast_months=${months}`,
+    `units_on_order=${onOrderQty || 0}`,
+    onOrderEta != null ? `on_order_eta_days=${onOrderEta}` : null,
+    has(p.unitCost) ? `unit_cost=${p.unitCost}` : null,
+    has(p.fees) ? `fees=${p.fees}` : null,
+    p.protection ? `protection=${p.protection}` : null,
+    `stock_source=${encodeURIComponent(p.stockSource || "unknown")}`,
+    p.stockCountedAt ? `stock_counted_at=${encodeURIComponent(p.stockCountedAt)}` : null,
+    `tz=${TZ}`,
+  ].filter(Boolean);
+  return `${API}/api/forecast?${q.join("&")}`;
+}
+
 // ── error toast plumbing ──────────────────────────────────────────────────────
 const listeners = new Set();
 let nextId = 1;

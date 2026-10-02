@@ -350,7 +350,8 @@ class DailySync:
             return {
                 "enabled": bool(self.enabled),
                 "at": self._at,
-                "timezone": str(_dt.datetime.now().astimezone().tzinfo),
+                "timezone": (self.zone_name() if callable(getattr(self, "zone_name", None))
+                             else str(_dt.datetime.now().astimezone().tzinfo)),
                 "nextRunAt": self.next_run_at().isoformat() if self.enabled else None,
                 "lastRunDate": self.last_run_date.isoformat() if self.last_run_date else None,
                 "lastRun": self.last_run,

@@ -30,6 +30,11 @@ import types
 _TMP = tempfile.mkdtemp()
 os.environ["LOGITRACK_CONNECTIONS"] = os.path.join(_TMP, "connections.json")
 os.environ["LOGITRACK_PERSIST"] = "0"
+# The scheduler's day ledger and the workspace record, in this run's own folder: the test
+# drives real sync runs, which otherwise wrote into the LIVE sync_state.json (and failed
+# whenever the real nightly sync had already completed today).
+os.environ["LOGITRACK_SYNC_STATE"] = os.path.join(_TMP, "sync_state.json")
+os.environ["LOGITRACK_WORKSPACES"] = os.path.join(_TMP, "workspaces")
 for _k in ("SHOPIFY_SHOP", "SHOPIFY_TOKEN", "SQUARE_ACCESS_TOKEN", "SQUARE_ENVIRONMENT"):
     os.environ.pop(_k, None)
 
@@ -185,7 +190,7 @@ _stub("stock_log", StockLog=_FakeLog, sample_from_shopify=_fake_sample_from_shop
 
 # live_actuals is genuinely generic already — this stub preserves the contract that
 # matters: it takes a `fetch` callable and only reaches for Shopify when given none.
-def _fake_actuals_provider(entries, now=None, fetch=None, shop=None, token=None):
+def _fake_actuals_provider(entries, now=None, fetch=None, shop=None, token=None, known_skus=None):
     if fetch is None:
         raise AssertionError("actuals_provider fell back to importing Shopify")
     frame = fetch(days=30)
@@ -556,7 +561,15 @@ def test_nightly_sync_end_to_end():
     main.save_connection({"source": "square", "label": "Kiosk",
                           "creds": {"accessToken": SECRET}})
     _install_fake_square()
-    res = main._run_daily_sync()
+    # _ingest is stubbed here, so nothing is loaded for a backtest to run on. On the
+    # weekly backtest day the sync would (rightly) report that, and this test failed
+    # every Monday. The backtest stage has its own tests below.
+    _wd = main.SYNC_BACKTEST_WEEKDAY
+    main.SYNC_BACKTEST_WEEKDAY = (main.today().weekday() + 3) % 7
+    try:
+        res = main._run_daily_sync()
+    finally:
+        main.SYNC_BACKTEST_WEEKDAY = _wd
     check("with a saved connection it syncs", res["ok"] is True, res)
     check("it names the account", res["label"] == "Kiosk")
     check("it re-ingested", _ingested and _ingested[-1]["filename"] == "Kiosk")

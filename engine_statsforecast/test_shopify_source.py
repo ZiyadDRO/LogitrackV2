@@ -241,6 +241,31 @@ check("a compare-at BELOW the price is not a sale",
       meta["LAMP-ODD"].get("listPrice") == 50.0 and meta["LAMP-ODD"].get("currentPrice") == 50.0,
       str(meta["LAMP-ODD"]))
 
+# 6) the catalogue queries fit Shopify's 1,000-point single-query limit ---------------
+print("\n6) query cost")
+for name, q in (("catalogue", SH.CATALOG_QUERY), ("more variants", SH.MORE_VARIANTS_QUERY)):
+    cost = SH.estimate_query_cost(q)
+    check(f"{name} query is under {SH.MAX_QUERY_COST} points ({cost})", 0 < cost <= SH.MAX_QUERY_COST, str(cost))
+old_q = ("query($c: String){ products(first: 100, after: $c) { pageInfo { hasNextPage endCursor } "
+         "nodes { productType variants(first: 100) { nodes { sku inventoryQuantity price "
+         "compareAtPrice inventoryItem { unitCost { amount } } } } } } }")
+check("the estimator flags the old 100 x 100 query", SH.estimate_query_cost(old_q) > SH.MAX_QUERY_COST,
+      str(SH.estimate_query_cost(old_q)))
+
+print("\n7) a product with more variants than one page")
+vpage = lambda nodes, has_next, cursor: {"data": {"product": {"variants": {
+    "pageInfo": {"hasNextPage": has_next, "endCursor": cursor}, "nodes": nodes}}}}
+fake_requests.queue = [
+    FakeResponse(200, gpage([{"id": "gid://shopify/Product/1", "productType": "Tees", "variants": {
+        "pageInfo": {"hasNextPage": True, "endCursor": "v1"},
+        "nodes": [{"sku": "TEE-S", "inventoryQuantity": 3, "inventoryItem": None}]}}], False, None)),
+    FakeResponse(200, vpage([{"sku": "TEE-M", "inventoryQuantity": 4, "inventoryItem": None}], True, "v2")),
+    FakeResponse(200, vpage([{"sku": "TEE-L", "inventoryQuantity": 5, "inventoryItem": None}], False, None)),
+]
+meta = SH.fetch_catalog_meta(shop="test-store", token="shpat_fake")
+check("every variant is read, across pages", set(meta) == {"TEE-S", "TEE-M", "TEE-L"}, str(set(meta)))
+check("with the product's category", meta.get("TEE-L", {}).get("category") == "Tees", str(meta.get("TEE-L")))
+
 print(f"\n=== {len(PASS)} passed, {len(FAIL)} failed ===")
 if FAIL:
     print("FAILED:", FAIL); sys.exit(1)

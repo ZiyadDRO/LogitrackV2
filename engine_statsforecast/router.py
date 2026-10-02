@@ -30,6 +30,7 @@ attribute names are hard-coded, so it works for any catalog.
 from __future__ import annotations
 import pandas as pd
 import numpy as np
+import trend as _TR
 
 # ── Thresholds (all tunable; sensible universal defaults) ────────────────────
 ESTABLISHED_DAYS   = 180   # "enough regular history" for Prophet
@@ -231,6 +232,12 @@ def adaptive_group_catalog(catalog: dict, base_cols: list[str] | None = None) ->
     base_cols = base_cols if base_cols is not None else detect_group_columns(catalog)
     base_groups = group_catalog(catalog, base_cols)
     split_cols = _adaptive_attr_columns(catalog, base_cols)
+    # The ABSOLUTE bar a subgroup must clear is judged on the specific score (the store's
+    # shared rhythm taken out), the same scale as the clustering threshold and the pooling
+    # gate. Raw, a subgroup of products that only share the weekend rhythm passed 0.35
+    # easily. The GAIN over the parent stays raw: the shared rhythm inflates both sides
+    # of that difference and largely cancels.
+    _bl = catalog_baseline(catalog) if split_cols else None
     meta = {}
     if not split_cols:
         return base_groups, {sid: {"level": "base", "groupCols": base_cols, "baseGroup": g,
@@ -263,7 +270,8 @@ def adaptive_group_catalog(catalog: dict, base_cols: list[str] | None = None) ->
         base, combo, vals = key
         usable = _usable_member_ids(d["members"], catalog)
         coh = _cohesion_for_ids(usable, catalog)
-        d.update({"usable": usable, "cohesion": coh})
+        spec = _cohesion_for_ids(usable, catalog, _bl) if _bl is not None else coh
+        d.update({"usable": usable, "cohesion": coh, "specific": spec})
 
     for key, d in list(candidate_scores.items()):
         base, combo, vals = key
@@ -283,7 +291,7 @@ def adaptive_group_catalog(catalog: dict, base_cols: list[str] | None = None) ->
             min_gain = max(min_gain, 0.18)
         d.update({
             "gain": d["cohesion"] - parent_coh,
-            "passes": len(d["usable"]) >= MIN_RELATIVES and d["cohesion"] >= MIN_GROUP_COHESION and (d["cohesion"] - parent_coh) >= min_gain,
+            "passes": len(d["usable"]) >= MIN_RELATIVES and d["specific"] >= MIN_GROUP_COHESION and (d["cohesion"] - parent_coh) >= min_gain,
             "groupKey": " | ".join([base] + [f"{c}:{v}" for c, v in zip(combo, vals)]),
             "groupCols": list(base_cols or []) + list(combo),
             "values": vals,
@@ -322,7 +330,7 @@ def adaptive_group_catalog(catalog: dict, base_cols: list[str] | None = None) ->
                 "level": "subgroup", "baseGroup": base, "groupCols": d["groupCols"],
                 "splitCols": list(d["groupCols"][len(base_cols or []):]),
                 "usableMembers": len(d["usable"]), "cohesion": round(d["cohesion"], 3),
-                "gain": round(d["gain"], 3),
+                "specific": round(d["specific"], 3), "gain": round(d["gain"], 3),
                 "reason": (f"Used the most specific reliable subgroup: {len(d['usable'])} established "
                            f"matches and stronger behaviour than the broad group."),
             }
@@ -410,7 +418,29 @@ other, which is plainly wrong. 0.35 keeps every genuine family intact.
 """
 
 
+_SIG_MEMO: dict = {}
+
+
 def _seasonal_signature(df, min_days: int = SHAPE_MIN_DAYS):
+    """Cached _signature_of: clustering and pool matching ask for the same product's
+    fingerprint many times over. Keyed on the frame's content, not its identity."""
+    if df is None or not len(df) or "y" not in getattr(df, "columns", []):
+        return _signature_of(df, min_days)
+    try:
+        yv = df["y"].to_numpy(float)
+        key = (len(df), str(df["ds"].iloc[0]), str(df["ds"].iloc[-1]),
+               float(np.nansum(yv)), float(np.nansum(yv * np.arange(len(yv)))), int(min_days))
+    except Exception:                                   # noqa: BLE001
+        return _signature_of(df, min_days)
+    if key not in _SIG_MEMO:
+        if len(_SIG_MEMO) > 20000:
+            _SIG_MEMO.clear()
+        _SIG_MEMO[key] = _signature_of(df, min_days)
+    out = _SIG_MEMO[key]
+    return None if out is None else out.copy()
+
+
+def _signature_of(df, min_days: int = SHAPE_MIN_DAYS):
     """Scale-free seasonal fingerprint: the normalized weekly(7) + monthly(12) profile.
     Each entry is the average of (day ÷ overall mean) for that weekday / month, so the
     fingerprint is independent of volume — a 5/day and a 500/day item with the same
@@ -418,6 +448,9 @@ def _seasonal_signature(df, min_days: int = SHAPE_MIN_DAYS):
     d = df.dropna(subset=["y"]) if "y" in getattr(df, "columns", []) else df
     if d is None or len(d) < min_days:
         return None
+    # Growth out first (trend.py): a product selling more each month otherwise has
+    # "busier" late months, and any two growing products look like a family.
+    d = _TR.detrend(d)
     y = d["y"].to_numpy(dtype=float)
     mu = float(y.mean()) or 1.0
     norm = y / mu
@@ -518,22 +551,68 @@ def _cluster_by_shape(items, threshold: float = DISTINCT_THRESHOLD, baseline=Non
     return out
 
 
+def family_map(groups: dict, meta: dict | None) -> dict:
+    """{sku: its broad category}, from adaptive_group_catalog's meta (baseGroup). A product
+    in a subgroup still belongs to the category the subgroup was carved out of."""
+    out = {}
+    for sid, g in groups.items():
+        m = (meta or {}).get(sid) or {}
+        out[sid] = m.get("baseGroup", g) if m.get("level") != "none" else None
+    return out
+
+
+def _family_index(groups: dict, family: dict | None):
+    """(members by exact group key, members by broad category, keys that ARE a broad
+    category), built once so each lookup is a dict read rather than a pass over every
+    product (which ran on every single-product refit)."""
+    by_key, by_fam = {}, {}
+    for m, g in groups.items():
+        by_key.setdefault(g, []).append(m)
+    for m, f in (family or {}).items():
+        by_fam.setdefault(f, []).append(m)
+    is_base = {g for g, ms in by_key.items()
+               if family and all(family.get(m) == g for m in ms)}
+    return by_key, by_fam, is_base
+
+
+def _family_members(group_key, groups: dict, family: dict | None, index=None) -> list:
+    """Who a product in `group_key` borrows from. A subgroup is its own members. The broad
+    category is EVERY product in it, including those that earned a subgroup of their own:
+    a product left at category level used to see only the other leftovers, which in a
+    category where most products had split off meant one or two donors, or none."""
+    if group_key is None:
+        return []
+    by_key, by_fam, is_base = index or _family_index(groups, family)
+    exact = list(by_key.get(group_key, []))
+    if not family or group_key not in is_base:
+        return exact
+    return list(by_fam.get(group_key, []))
+
+
 def cluster_catalog(groups: dict, catalog: dict, min_days: int = RELATIVE_MIN_DAYS,
-                    threshold: float = DISTINCT_THRESHOLD, baseline=None) -> dict:
+                    threshold: float = DISTINCT_THRESHOLD, baseline=None, family=None) -> dict:
     """For every category, cluster its usable members (≥ min_days history) by seasonal
-    shape. Returns {group_key: [[sku_id, ...], ...]}."""
+    shape. Returns {group_key: [[sku_id, ...], ...]}.
+
+    With `family` (see family_map), a broad category's clusters are drawn from the whole
+    category, subgrouped products included, since those are the products a category-level
+    product borrows from."""
     # One baseline for the whole catalog, not per category: the rhythm being removed is
     # the BUSINESS's, and computing it per group would subtract part of what makes a
     # group distinctive in the first place.
     if baseline is None:
         baseline = catalog_baseline(catalog)
     by_group: dict = {}
-    for sid, g in groups.items():
-        if g is None:
-            continue
-        df = catalog[sid].get("df")
-        if df is not None and len(df) > 1 and _days(df) >= min_days:
-            by_group.setdefault(g, []).append(sid)
+
+    def _ok(sid):
+        df = (catalog.get(sid) or {}).get("df")
+        return df is not None and len(df) > 1 and _days(df) >= min_days
+
+    _idx = _family_index(groups, family)
+    for g in {g for g in groups.values() if g is not None}:
+        mem = [m for m in _family_members(g, groups, family, _idx) if m in catalog and _ok(m)]
+        if mem:
+            by_group[g] = mem
     out: dict = {}
     for g, members in by_group.items():
         sigs = [(m, _seasonal_signature(catalog[m]["df"])) for m in members]
@@ -582,16 +661,38 @@ _MONTHS = ["January", "February", "March", "April", "May", "June", "July", "Augu
            "September", "October", "November", "December"]
 
 
-def category_peers(sku_id: str, groups: dict, catalog: dict, limit: int = 25):
+def category_peers(sku_id: str, groups: dict, catalog: dict, limit: int = 25, family=None,
+                   baseline=None, store_gate: bool = True, with_ids: bool = False):
     """Frames of the products a holiday lift or a price response can be borrowed from:
     the same category group, or the whole store when there are no categories. Broader
     than the behavioural cluster on purpose. A cluster is picked for a distinctive
     seasonal SHAPE and is often one or two products; how shoppers react to Black Friday
     or to 20% off is shared much more widely than that. Closest in sales volume first."""
     g = groups.get(sku_id)
-    ids = [m for m, gg in groups.items() if m != sku_id and m in catalog and (g is None or gg == g)]
+    if family is not None and family.get(sku_id) is not None:
+        # The WHOLE category, whatever subgroup each product landed in. How shoppers
+        # treat Black Friday is a category-wide habit; a subgroup of three is too thin a
+        # base to learn it from (see _family_members).
+        f = family.get(sku_id)
+        ids = [m for m, ff in family.items() if m != sku_id and m in catalog and ff == f]
+    elif g is not None:
+        ids = [m for m, gg in groups.items() if m != sku_id and m in catalog and gg == g]
+    else:
+        ids = []                      # no category: the store stands in, gated below
     if not ids:
         ids = [m for m in catalog if m != sku_id]
+        if store_gate and groups:
+            # ALONE IN ITS CATEGORY. The whole store is only a stand-in for a family, so
+            # only the products in it that demonstrably move with this one count: the
+            # same bar a family is held to (DISTINCT_THRESHOLD on the distinctive score,
+            # with MIN_JOINT_MONTHS of the year seen by both). A product too new to have a
+            # shape, or matching no one, borrows nothing and uses its own history alone,
+            # rather than the store's average Black Friday.
+            ts = _seasonal_signature((catalog.get(sku_id) or {}).get("df"))
+            if ts is None:
+                return ([], []) if with_ids else []
+            ids = [m for m in ids
+                   if distinct_corr(ts, _seasonal_signature(catalog[m].get("df")), baseline) >= DISTINCT_THRESHOLD]
     tgt = catalog.get(sku_id, {}).get("df")
     tmean = float(tgt["y"].mean()) if tgt is not None and len(tgt) else 0.0
 
@@ -601,7 +702,9 @@ def category_peers(sku_id: str, groups: dict, catalog: dict, limit: int = 25):
         return abs(np.log((v + 0.1) / (tmean + 0.1)))
 
     ids = sorted(ids, key=dist)[:limit]
-    return [catalog[m]["df"] for m in ids if catalog[m].get("df") is not None and len(catalog[m]["df"])]
+    ids = [m for m in ids if catalog[m].get("df") is not None and len(catalog[m]["df"])]
+    frames = [catalog[m]["df"] for m in ids]
+    return (frames, ids) if with_ids else frames
 
 
 def behavioral_relatives(sku_id: str, groups: dict, catalog: dict,
@@ -624,11 +727,6 @@ def behavioral_relatives(sku_id: str, groups: dict, catalog: dict,
     cls = [cl for cl in cls if cl]
     if not cls:
         return [], 0, None
-    if len(cls) == 1:
-        chosen = cls[0]
-        return ([catalog[m]["df"] for m in chosen], len(chosen),
-                {"clusters": [list(c) for c in cls], "chosen": list(chosen), "basis": "category is behaviourally coherent"})
-
     # For genuinely new/thin products, do NOT let a tiny amount of own behavior
     # steer them into a one-SKU veteran cluster. The point of the global model is
     # to borrow seasonality from multiple established siblings; a singleton match
@@ -645,12 +743,38 @@ def behavioral_relatives(sku_id: str, groups: dict, catalog: dict,
     tgt_df = catalog[sku_id].get("df")
     tgt_days = _days(tgt_df) if tgt_df is not None and len(tgt_df) > 1 else 0
     tgt_sig = _seasonal_signature(tgt_df, min_days=28)
-    if tgt_sig is not None and tgt_days >= NEW_DAYS:
+    # Can its own shape be judged at all? Only with MIN_JOINT_MONTHS of the year in common
+    # with a family; below that every score is 0 ("cannot judge") and the choice falls to
+    # sales volume as before.
+    def _judgeable(cl):
+        c = centroid(cl)
+        if tgt_sig is None or c is None:
+            return False
+        m = np.isfinite(np.asarray(tgt_sig, float)[7:]) & np.isfinite(np.asarray(c, float)[7:])
+        return int(m.sum()) >= MIN_JOINT_MONTHS
+    if tgt_sig is not None and tgt_days >= NEW_DAYS and any(_judgeable(cl) for cl in candidate_cls):
         # distinct_corr, not _shape_corr: the clusters were formed on distinctive
         # agreement, so picking between them on the raw score would let the shared
         # weekend rhythm decide which pool a newcomer joins.
-        chosen = max(candidate_cls, key=lambda cl: distinct_corr(tgt_sig, centroid(cl), baseline))
-        basis = "matched by its own seasonal shape"
+        scored = [(distinct_corr(tgt_sig, centroid(cl), baseline), cl) for cl in candidate_cls]
+        best_score, chosen = max(scored, key=lambda x: x[0])
+        if best_score < DISTINCT_THRESHOLD:
+            # ITS OWN SALES MATCH NO FAMILY. Picking the best of several weak matches is a
+            # coin flip: a young winter hoodie whose first seven months read 0.16 against
+            # the tees and 0.07 against the hoodies was handed the tees' summer. Held to the
+            # same bar a family is: no family clears it, so it borrows none and forecasts
+            # from its own sales.
+            return [], 0, {"clusters": [list(c) for c in cls], "chosen": [],
+                           "basis": (f"its own sales match no family closely enough "
+                                     f"(best {round(best_score * 100)}%, needs "
+                                     f"{round(DISTINCT_THRESHOLD * 100)}%)"),
+                           "bestScore": round(float(best_score), 3),
+                           "bestCluster": list(chosen)}
+        basis = ("category is behaviourally coherent, and its own sales match it" if len(cls) == 1
+                 else "matched by its own seasonal shape")
+    elif len(cls) == 1:
+        chosen = cls[0]
+        basis = "category is behaviourally coherent"
     else:
         own = tgt_df.dropna(subset=["y"])["y"] if tgt_df is not None else []
         tgt_mean = float(own.mean()) if len(own) else None
@@ -733,8 +857,9 @@ def route(days_history: int, total_sales: int, demand_class: str,
                           "to trust its own seasonal pattern yet") if days_history >= ESTABLISHED_DAYS
                     else "its own history is still thin")
         return "global", (
-            f"Because {why_thin}, it borrows the seasonal shape and typical volume from "
-            f"{n_relatives} related products with established history (pooled / global model).")
+            f"Because {why_thin}, it borrows the seasonal shape from {n_relatives} related products "
+            f"with established history (pooled / global model). How much it sells comes from its "
+            f"own sales only.")
 
     # 4) Intermittent demand we couldn't route above (thin history AND no relatives) → Croston anyway.
     if intermittent:

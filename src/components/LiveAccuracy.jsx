@@ -109,6 +109,29 @@ export default function LiveAccuracy({ api, lm = false, onPickSku = null }) {
     );
   }
 
+  /* Spreadsheets loaded while a store is paused: nothing here is about them. The store's
+     record used to show anyway, reading as though it described the spreadsheet. */
+  if (data.tracked === false) {
+    const ps = data.pausedStore;
+    return (
+      <div style={{ ...panel, padding: 20, fontFamily: SANS, color: T.ink }}>
+        <div style={{ fontSize: 17, fontWeight: 600 }}>Live accuracy</div>
+        <div style={{ fontSize: fs.body, color: T.soft, marginTop: 8, lineHeight: 1.6, maxWidth: 720 }}>
+          Live accuracy grades a connected store's forecasts against the sales that come in
+          afterwards, so it only runs while a store is in use. Your spreadsheets are loaded
+          now, and there are no new sales to grade them against.
+          {ps && (
+            <>
+              {" "}<span style={{ color: T.ink, fontWeight: 600 }}>{ps.label}</span> is paused. Its
+              record ({ps.weeks} week{ps.weeks === 1 ? "" : "s"}) is kept, its open weeks are still
+              graded against its own sales, and it shows here again when you switch the store back on.
+            </>
+          )}
+        </div>
+      </div>
+    );
+  }
+
   const s = data.summary || {};
   const cal = s.calibration || {};
   const acc = s.accuracy || {};
@@ -238,7 +261,7 @@ export default function LiveAccuracy({ api, lm = false, onPickSku = null }) {
         <Head label="Bias" value={acc.bias != null ? `${acc.bias > 0 ? "+" : ""}${acc.bias}%` : "-"}
           sub={acc.bias == null ? "nothing graded yet"
             : acc.bias > 2 ? "forecasting high" : acc.bias < -2 ? "forecasting low" : "balanced"} />
-        <Head label="Weeks graded" value={`${s.scored ?? 0}`}
+        <Head label="SKU-weeks graded" value={`${s.scored ?? 0}`}
           sub={s.nextDueAt ? `next in ${s.nextDueInDays}d` : `${s.waiting ?? 0} still running`} />
       </div>
 
@@ -284,8 +307,13 @@ export default function LiveAccuracy({ api, lm = false, onPickSku = null }) {
                       <span style={{ ...mono, fontSize: fs.row, fontWeight: 600, color: T.ink }}>
                         {fmtDay(w.week)} to {fmtDay(w.endsOn)}
                       </span>
+                      {w.countedFrom && (
+                        <span title={`This week's forecast was locked on ${fmtDay(w.countedFrom)} because the app wasn't running at the start of the week. Only ${fmtDay(w.countedFrom)} to ${fmtDay(w.endsOn)} is forecast and graded.`}
+                          style={{ ...mono, fontSize: fs.tick, padding: "2px 6px", background: T.sunken,
+                            border: `2px solid ${T.line}`, color: T.soft }}>from {fmtDay(w.countedFrom)}</span>
+                      )}
                       {w.amended > 0 && (
-                        <span title="A forecast in this week was revised mid-week after a promotion was declared. Both figures are kept."
+                        <span title={`Revised mid-week because a price changed after the week was locked. Only the affected days moved; both figures are kept.${(w.revisions || []).length ? "\n\n" + w.revisions.join("\n") : ""}`}
                           style={{ ...mono, fontSize: fs.tick, padding: "2px 6px", background: T.sunken,
                             border: `2px solid ${T.line}`, color: T.soft }}>revised</span>
                       )}
@@ -306,7 +334,8 @@ export default function LiveAccuracy({ api, lm = false, onPickSku = null }) {
                         </div>
                         <Tally inBand={w.inBand} total={w.scored} tone={t} />
                         <div style={{ ...mono, fontSize: fs.small, marginTop: 9, color: T.soft }}>
-                          said {Math.round(w.predicted)} · sold {Math.round(w.actual ?? 0)} units
+                          said {Math.round(w.predictedScored ?? w.predicted)} · sold {Math.round(w.actual ?? 0)} units
+                          {w.scored < w.products && ` (${w.scored} of ${w.products} products graded so far)`}
                         </div>
                       </>
                     ) : (
@@ -333,14 +362,16 @@ export default function LiveAccuracy({ api, lm = false, onPickSku = null }) {
                       </div>
                       {entries.map((e) => (
                         <div key={e.id} className="la-row"
-                          onClick={() => onPickSku && onPickSku(e.sku)}
+                          onClick={() => onPickSku && !e.gone && onPickSku(e.sku)}
+                          title={e.gone ? `${e.sku} is no longer in your store (removed, or its SKU changed), so this week can't be graded.` : undefined}
                           style={{ display: "grid", gridTemplateColumns: "1fr 150px 90px 130px", gap: "0 16px",
                             alignItems: "baseline", padding: "8px 16px", fontSize: fs.row,
-                            borderTop: `2px solid ${T.line}`, cursor: onPickSku ? "pointer" : "default" }}>
+                            borderTop: `2px solid ${T.line}`, cursor: onPickSku && !e.gone ? "pointer" : "default",
+                            opacity: e.gone ? 0.55 : 1 }}>
                           <span title={e.skuName} style={{ color: T.ink, whiteSpace: "nowrap",
                             overflow: "hidden", textOverflow: "ellipsis" }}>
                             {e.skuName}
-                            {e.amended && <span style={{ ...mono, fontSize: fs.small, color: T.faint }}> revised from {e.originalPredicted}</span>}
+                            {e.amended && <span title={e.amendReason || ""} style={{ ...mono, fontSize: fs.small, color: T.faint }}> revised from {Math.round(e.originalPredicted)}</span>}
                           </span>
                           <span style={{ ...mono, textAlign: "right", color: T.soft }}>
                             {Math.round(e.predicted)}
@@ -354,15 +385,17 @@ export default function LiveAccuracy({ api, lm = false, onPickSku = null }) {
                               too narrow — and widening it is literally the fix. */}
                           <span style={{ ...mono, textAlign: "right", fontSize: fs.small, fontWeight: 600,
                             color: !e.scoredAt ? T.faint : e.inBand === false ? T.over : T.green }}>
-                            {!e.scoredAt ? (e.isDue ? "ready" : `${e.dueInDays}d`)
+                            {e.gone ? "not in store"
+                              : !e.scoredAt ? (e.isDue ? "grading soon" : `grades in ${e.dueInDays}d`)
                               : e.inBand === false ? "band too narrow" : "in band"}
                           </span>
                         </div>
                       ))}
                       <div style={{ padding: "10px 16px", fontSize: fs.small, color: T.soft,
                         borderTop: `2px solid ${T.line}`, lineHeight: 1.6 }}>
-                        Expected shows the forecast and its {w.band}% range. A week counts as accurate when what
-                        actually sold lands inside that range.
+                        Expected is the forecast for the week and its {w.band}% range, not sales. Sold fills in once
+                        the week has ended and been graded. A forecast counts as accurate when what actually sold lands
+                        inside its range. Products no longer in your store are shown faded and left out of the figures.
                       </div>
                     </div>
                   )}

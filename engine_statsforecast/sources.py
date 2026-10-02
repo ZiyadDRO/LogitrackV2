@@ -240,7 +240,7 @@ def error_class(source_key: str):
     return get(source_key)["error_class"]()
 
 
-def actuals_provider(source_key: str, entries, creds: dict, now=None):
+def actuals_provider(source_key: str, entries, creds: dict, now=None, known_skus=None):
     """Build the actuals_fn that ForecastLog.score_due wants, for any source.
 
     live_actuals.shopify_actuals_provider is named for Shopify but is already generic: it
@@ -254,4 +254,4 @@ def actuals_provider(source_key: str, entries, creds: dict, now=None):
     def _fetch(days=None, **_ignored):
         return src["fetch_sales"](creds, days=days)
 
-    return _LA.shopify_actuals_provider(entries, now=now, fetch=_fetch)
+    return _LA.shopify_actuals_provider(entries, now=now, fetch=_fetch, known_skus=known_skus)

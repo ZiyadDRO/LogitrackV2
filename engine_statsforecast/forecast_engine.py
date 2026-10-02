@@ -67,6 +67,48 @@ def trailing_zero_run(y: np.ndarray) -> int:
     return n
 
 
+def is_off_season(ds, y, as_of=None) -> bool:
+    """Quiet now the way it was quiet this time last year, and not fading: its season is
+    simply somewhere else in the year.
+
+    A Christmas line in September, or a pool float at the end of summer, has sold little
+    lately, which reads as dormant or as dead stock (and used to be labelled so, and left
+    out of every family). Neither is: last year it was just as quiet in these same weeks,
+    and it sold as much over the year. All of:
+      · the last 30 days sold under a quarter of its usual 30 days (over the past year),
+      · the same 30 days a year ago were just as quiet against that year's pace,
+      · the past year sold at least half what the year before did (a fad fading out,
+        or a line being run down, is not seasonal).
+    """
+    try:
+        d = pd.to_datetime(pd.Series(ds)).reset_index(drop=True)
+        v = pd.Series(np.asarray(y, dtype=float)).reset_index(drop=True)
+    except Exception:                                   # noqa: BLE001
+        return False
+    if len(d) < 400:
+        return False
+    t = pd.Timestamp(as_of) if as_of is not None else d.max() + pd.Timedelta(days=1)
+
+    def tot(a_days, b_days):
+        a, b = t - pd.Timedelta(days=a_days), t - pd.Timedelta(days=b_days)
+        m = ((d > a) & (d <= b)).to_numpy()
+        return float(v[m].sum()), int(m.sum())
+
+    yr, n_yr = tot(365, 0)
+    prev, n_prev = tot(730, 365)
+    now, _ = tot(30, 0)
+    ly, n_ly = tot(395, 365)
+    if n_yr < 300 or n_ly < 20 or yr < 6:
+        return False
+    pace = yr / n_yr * 30.0
+    pace_ly = (prev / n_prev * 30.0) if n_prev >= 300 else pace
+    if now > 0.25 * pace or ly > 0.25 * max(pace_ly, 1e-9):
+        return False
+    if n_prev >= 300 and yr < 0.5 * prev:
+        return False
+    return True
+
+
 def is_dormant(y: np.ndarray, *, min_days: int = DORMANT_MIN_DAYS,
                gap_multiple: float = DORMANT_GAP_MULTIPLE) -> bool:
     """Has this product simply stopped selling?
@@ -482,7 +524,12 @@ def extrapolation_distance(price, lo, hi) -> float:
 # has sold at, the response is measured but still an estimate (PRICE_EFFECT_UNC). Borrowed
 # from similar products it is less certain (BORROWED_EFFECT_UNC). Past the known prices
 # it grows with the distance (EXTRAP_UNC_SLOPE per range-width), up to 100%.
-PRICE_EFFECT_UNC = 0.15
+# 0.25, not the 0.15 it was: on 256 simulated products with known responses, the measured
+# response was within 0.15 of the truth only 6 times in 10, not the 8 in 10 a margin is
+# meant to cover; 0.21 to 0.35 was needed. A margin sized from each product's own readings
+# was tried and didn't track its real error (their scatter is mostly season and traffic,
+# not sampling noise), so it is one honest figure for all.
+PRICE_EFFECT_UNC = 0.25
 BORROWED_EFFECT_UNC = 0.35
 # ...and from the whole store, when too few in its category have a price history, less
 # certain again: a store's typical response is a looser match than its category's.

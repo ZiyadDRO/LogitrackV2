@@ -220,22 +220,10 @@ const whenRan = (ts) => {
 // the honest read is "not enough windows to tell", not "the buffer is mis-sized".
 const ciCovers = (ci, target) => Array.isArray(ci) && ci.length === 2 && target >= ci[0] && target <= ci[1];
 
-export default function BacktestTab({ api = "http://localhost:8000", lm = false, skuParams = {},
+export default function BacktestTab({ api = "http://localhost:8000", lm = false,
                                      holdingPct = 25, setHoldingPct = null,
                                      res = null, setRes = () => {}, setDiag = () => {},
-                                     waiting = [], waitingIds = [], onPickSku = null }) {
-  // Per-SKU economics from each product's page: only SKUs with a real unit cost are
-  // sent; the backtest costs those and skips the rest (no blanket margin guess).
-  const buildCosts = () => {
-    const out = {};
-    for (const [sku, p] of Object.entries(skuParams || {})) {
-      const c = Number(p?.unitCost);
-      if (p?.unitCost != null && p.unitCost !== "" && Number.isFinite(c)) {
-        out[sku] = { cost: c, fees: Number(p?.fees) || 0 };
-      }
-    }
-    return out;
-  };
+                                     waiting = [], waitingIds = [], onPickSku = null, onRetest = null }) {
   // `res` and `diag` are lifted to the parent so results persist across tab switches.
   const [viewMode, setView]   = useState("client");        // "client" | "analyst"
   // Which tab of the analyst grid is showing. "summary" is the calibration & annual
@@ -249,7 +237,6 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
   // comes from the Products page, lead/coverage come from each product.
   const [p, setP]             = useState({ horizon: 44, minTrain: 120 });
   const [advanced, setAdv]    = useState(false);
-  const [loading, setLoading] = useState(false);
   const [error, setError]     = useState(null);
 
   const card  = "bg-[var(--t-panel)] border-[var(--t-line)]";
@@ -362,21 +349,40 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
     return () => { cancelled = true; clearTimeout(timer); };
   }, [api, jobRunning]);   // re-check when a run starts or finishes, not just on mount
 
-  // One data path in: the Products page. This just re-tests whatever's loaded.
+  // One data path in: the Products page. This just re-tests whatever's loaded, through
+  // the same request the dashboard makes: every lead/coverage pair your products use,
+  // their costs and your holding rate. It used to call the fleet endpoint with none of
+  // those, so the server tested 14/30 at 25% and the result replaced every product's
+  // measured tier with ones measured for the wrong settings.
+  const [requested, setRequested] = useState(false);
+  const sawJob = useRef(false);
+  useEffect(() => {
+    if (!requested) return;
+    if (jobRunning) { sawJob.current = true; return; }
+    if (sawJob.current) { setRequested(false); sawJob.current = false; }
+  }, [jobRunning, requested]);
+  useEffect(() => {
+    if (!requested) return;
+    // A run that finished before the status poll ever saw it still ends the wait.
+    const t = setTimeout(() => { if (!sawJob.current) setRequested(false); }, 20000);
+    return () => clearTimeout(t);
+  }, [requested]);
+  // Busy while this tab's request is starting or any test is running (the dashboard's
+  // own runs included), so a second request isn't queued on top of one in progress.
+  const loading = requested || jobRunning;
   const run = async () => {
-    setError(null); setDiag(null); setLoading(true);
+    setError(null); setDiag(null);
+    if (!onRetest) { setError("Re-testing isn't available here."); return; }
+    setRequested(true); sawJob.current = false;
     try {
-      const r = await fetch(`${api}/api/backtest/catalog`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ horizon: p.horizon, minTrain: p.minTrain, costs: buildCosts() }),
-      });
-      const out = await r.json();
-      if (!r.ok) throw new Error(out?.detail || `Backtest failed (${r.status})`);
-      setRes(out);
+      const started = await onRetest({ horizon: Number(p.horizon) || 44, minTrain: Number(p.minTrain) || 120 });
+      if (started === false) {
+        setRequested(false);
+        setError("Nothing to test yet: no product has a confirmed lead time.");
+      }
     } catch (e) {
+      setRequested(false);
       setError(e?.message || "Something went wrong.");
-    } finally {
-      setLoading(false);
     }
   };
 

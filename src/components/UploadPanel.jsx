@@ -13,7 +13,7 @@ import { API } from '../lib/api';
 
 export default function UploadPanel({ onUploadSuccess, onUploadError, isUploading, setIsUploading, lm,
                                      holdingPct = 25, setHoldingPct = null,
-                                     uplift = null, availCounts = null }) {
+                                     uplift = null, availCounts = null, onWorkspaceSwitch = null }) {
   const fileRef = useRef(null);
   const [mode, setMode] = useState("file");          // file | store
   const [days, setDays] = useState("");   // blank = pull all available history
@@ -39,6 +39,7 @@ export default function UploadPanel({ onUploadSuccess, onUploadError, isUploadin
   const [notice, setNotice] = useState(null);
   const [sync, setSync] = useState(null);             // nightly sync status
   const [syncing, setSyncing] = useState(false);
+  const [switching, setSwitching] = useState(null);   // connection id being paused/resumed
 
   const loadSync = useCallback(async () => {
     try {
@@ -145,6 +146,30 @@ export default function UploadPanel({ onUploadSuccess, onUploadError, isUploadin
     });
   };
 
+  // ── Use / pause a store ──────────────────────────────────────────────────
+  // Pausing sets the store's products aside (not deleted) and brings back whatever
+  // spreadsheets were loaded before; the saved login is untouched and nothing syncs from
+  // it until it's back in use. Using it again does the reverse. The server swaps the
+  // products and re-fits them in the background; onWorkspaceSwitch tells the page to wait
+  // for that and reload the product list.
+  const handleUse = async (c, active) => {
+    setSwitching(c.id); onUploadError(null); setNotice(null);
+    try {
+      const res = await fetch(`${API}/api/connections/${c.id}/use`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ active }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "Couldn't switch.");
+      setConnections(data.connections || []);
+      loadSync();
+      if (onWorkspaceSwitch) onWorkspaceSwitch(active ? `Showing ${c.label}.` : "Showing your spreadsheets.");
+      if (active && data.needsImport) await runImport({ connectionId: c.id });
+    } catch (err) {
+      onUploadError(err.message || "Network error. Is the server running?");
+    } finally { setSwitching(null); }
+  };
+
   const handleDeleteConnection = async (id) => {
     try {
       await fetch(`${API}/api/connections/${id}`, { method: "DELETE" });
@@ -166,6 +191,8 @@ export default function UploadPanel({ onUploadSuccess, onUploadError, isUploadin
         { method: "POST", body: form });
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || "Upload failed.");
+      // A store that was in use has been paused so the file loads on its own.
+      if (data.storePaused) { await loadConnections(); loadSync(); }
       onUploadSuccess(data);
     } catch (err) {
       onUploadError(err.message || "Network error. Is the server running?");
@@ -206,26 +233,36 @@ export default function UploadPanel({ onUploadSuccess, onUploadError, isUploadin
   );
 
   // ── One saved account row ───────────────────────────────────────────────
-  const connectionRow = (c) => (
+  const connectionRow = (c) => {
+    const on = c.active !== false;
+    const busy = switching === c.id;
+    return (
     <div key={c.id}
-      className={`rounded-lg border px-2.5 py-2 ${"bg-[var(--t-panel)] border-[var(--t-line)]"}`}>
+      className={`rounded-lg border px-2.5 py-2 ${"bg-[var(--t-panel)] border-[var(--t-line)]"} ${on ? "" : "opacity-80"}`}>
       <div className="flex items-center gap-2">
+        {/* In use / paused. A switch rather than a checkbox: it changes what's loaded. */}
+        <button role="switch" aria-checked={on} disabled={busy || isUploading}
+          onClick={() => handleUse(c, !on)}
+          title={on ? "In use: synced nightly and shown. Click to pause." : "Paused: login kept, products set aside. Click to use."}
+          className={`relative h-5 w-9 rounded-full shrink-0 transition-colors disabled:opacity-60 ${on ? "bg-[var(--t-good)]" : "bg-[var(--t-line2)]"}`}>
+          <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-[var(--t-panel)] shadow transition-all ${on ? "left-[18px]" : "left-0.5"}`} />
+        </button>
         <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-1.5">
-            <span className={`text-[15px] font-semibold truncate ${"text-[var(--t-soft)]"}`}>{c.label}</span>
-            <span className={`text-[12px] px-1.5 py-0.5 rounded font-semibold shrink-0 ${"bg-[var(--t-sunken)] text-[var(--t-dim)]"}`}>
-              {sourceLabel(c.source)}
+          <div className={`text-[15px] font-semibold truncate ${"text-[var(--t-soft)]"}`}>{c.label}</div>
+          <div className={`text-[13px] truncate ${muted}`}>
+            <span className={`font-semibold ${on ? "text-[var(--t-good)]" : ""}`}>
+              {busy ? (on ? "pausing…" : "switching…") : (on ? "In use" : "Paused")}
             </span>
-          </div>
-          <div className={`text-[13px] font-mono ${muted}`}>
-            {c.secretHint || "saved"}
+            {" · "}{sourceLabel(c.source)}{" · "}
+            <span className="font-mono">{c.secretHint || "saved"}</span>
             {c.creds?.environment === "sandbox" ? " · sandbox" : ""}
             {c.creds?.locationIds?.length
               ? ` · ${c.creds.locationIds.length} location${c.creds.locationIds.length === 1 ? "" : "s"}`
               : ""}
           </div>
         </div>
-        <button onClick={() => runImport({ connectionId: c.id })} disabled={isUploading}
+        <button onClick={() => runImport({ connectionId: c.id })} disabled={isUploading || busy}
+          title="Pull everything from the store now (also puts it in use)"
           className={`text-[14px] font-bold px-2.5 py-1 rounded-lg shrink-0 disabled:opacity-60 ${"bg-[var(--t-accent-soft)] text-[var(--t-ink)]"}`}>
           {isUploading ? "…" : "Import"}
         </button>
@@ -238,7 +275,9 @@ export default function UploadPanel({ onUploadSuccess, onUploadError, isUploadin
         )}
       </div>
     </div>
-  );
+    );
+  };
+  const storeInUse = connections.find(c => c.active !== false) || null;
 
   // ── One credential field, rendered from the server's own spec ───────────
   const credField = (f) => {
@@ -303,6 +342,13 @@ export default function UploadPanel({ onUploadSuccess, onUploadError, isUploadin
               {connections.length > 0 && (
                 <div className="space-y-1.5">{connections.map(connectionRow)}</div>
               )}
+              {connections.length > 0 && (
+                <p className={`text-[13px] leading-relaxed ${muted}`}>
+                  Pause a store to look at a spreadsheet on its own. Its login stays saved and its
+                  products (with your events and categories) are set aside, not deleted. Switch it
+                  back on and they return; if they&apos;ve fallen behind, the sync catches them up.
+                </p>
+              )}
               {historyRow}
               {/* Whether the tool is keeping itself current, in one line. Without this the
                   nightly sync is invisible: the page looks live either way, and the only
@@ -311,11 +357,13 @@ export default function UploadPanel({ onUploadSuccess, onUploadError, isUploadin
                 <div className={`rounded-lg border px-2.5 py-2 space-y-1 ${"bg-[var(--t-panel)] border-[var(--t-line)]"}`}>
                   <div className="flex items-center gap-2">
                     <span className={`text-[14px] font-semibold ${"text-[var(--t-soft)]"}`}>
-                      {sync.enabled
+                      {sync.paused
+                        ? "Store paused: not syncing"
+                        : sync.enabled
                         ? `Syncs nightly at ${sync.at}${sync.nextRunAt ? ` · next ${new Date(sync.nextRunAt).toLocaleString([], { weekday: "short", hour: "numeric", minute: "2-digit" })}` : ""}`
                         : "Nightly sync is off"}
                     </span>
-                    <button onClick={async () => {
+                    {!sync.paused && <button onClick={async () => {
                         setSyncing(true); onUploadError(null);
                         try {
                           const r = await fetch(`${API}/api/sync/now`, { method: "POST" });
@@ -326,7 +374,7 @@ export default function UploadPanel({ onUploadSuccess, onUploadError, isUploadin
                         finally { setSyncing(false); }
                       }} disabled={syncing || isUploading} className={`ml-auto ${ghostBtn} disabled:opacity-60`}>
                       {syncing ? "syncing…" : "sync now"}
-                    </button>
+                    </button>}
                   </div>
                   <div className={`text-[13px] ${muted}`}>
                     {sync.lastRun
@@ -335,9 +383,15 @@ export default function UploadPanel({ onUploadSuccess, onUploadError, isUploadin
                           : `Last sync failed: ${sync.lastRun.error || sync.lastRun.result?.detail || "unknown reason"}`)
                       : "Hasn't run yet."}
                   </div>
-                  {sync.enabled && !sync.connection && (
+                  {sync.enabled && !sync.connection && !sync.paused && (
                     <div className={`text-[13px] ${"text-[var(--t-warn)]"}`}>
                       Nothing to sync from. Tick &quot;Remember this account&quot; when you connect.
+                    </div>
+                  )}
+                  {sync.paused && (
+                    <div className={`text-[13px] ${muted}`}>
+                      Nothing syncs into the dashboard until you switch the store back on. Its stock is
+                      still checked every hour, because a missed hour can&apos;t be filled in later.
                     </div>
                   )}
                   {/* THE SECOND CLOCK. Stock is read hourly, and unlike the nightly sync a
@@ -358,10 +412,10 @@ export default function UploadPanel({ onUploadSuccess, onUploadError, isUploadin
                         }`} />
                         <span className={`text-[13px] ${muted}`}>
                           {!sync.sampler.enabled
-                            ? "Hourly stock readings are off"
+                            ? "Hourly stock checks are off"
                             : sync.sampler.lastFiledAt
-                              ? `Stock & today's sales read hourly · last ${new Date(sync.sampler.lastFiledAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`
-                              : "Stock & today's sales read hourly · nothing filed yet"}
+                              ? `Stock checked every hour · last ${new Date(sync.sampler.lastFiledAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`
+                              : "Stock checked every hour · no check yet"}
                           {/* The schedule itself, so it can be seen rather than trusted. A
                               manual "read now" never moves this time. */}
                           {sync.sampler.enabled && sync.sampler.nextScheduledAt && (
@@ -372,21 +426,21 @@ export default function UploadPanel({ onUploadSuccess, onUploadError, isUploadin
                             try { await fetch(`${API}/api/sync/sample-now`, { method: "POST" }); await loadSync(); }
                             catch { onUploadError("Network error. Is the server running?"); }
                           }} disabled={isUploading} className={`ml-auto ${ghostBtn} disabled:opacity-60`}>
-                          read now
+                          check now
                         </button>
                       </div>
                       {sync.sampler.consecutiveFailures > 0 && (
                         <div className={`text-[13px] mt-0.5 ${"text-[var(--t-bad)]"}`}>
-                          {sync.sampler.consecutiveFailures} reading{sync.sampler.consecutiveFailures === 1 ? "" : "s"} failed in a row
+                          {sync.sampler.consecutiveFailures} check{sync.sampler.consecutiveFailures === 1 ? "" : "s"} failed in a row
                           {sync.sampler.lastAttempt?.result?.reason ? `: ${sync.sampler.lastAttempt.result.reason}` : ""}.
                           {" "}Hours missed while this is broken cannot be recovered.
                         </div>
                       )}
                       {sync.sampler.coverage?.samples > 0 && (
                         <div className={`text-[13px] mt-0.5 ${muted}`}>
-                          {sync.sampler.coverage.samples.toLocaleString()} readings over {sync.sampler.coverage.daysCovered} day
-                          {sync.sampler.coverage.daysCovered === 1 ? "" : "s"}
-                          {availCounts?.unsampled > 0 && ` · ${availCounts.unsampled} product${availCounts.unsampled === 1 ? "" : "s"} not yet covered`}
+                          Checked {sync.sampler.coverage.samples.toLocaleString()} times over the last {sync.sampler.coverage.daysCovered} day
+                          {sync.sampler.coverage.daysCovered === 1 ? "" : "s"}.
+                          {availCounts?.unsampled > 0 && ` ${availCounts.unsampled} product${availCounts.unsampled === 1 ? " has" : "s have"} no stock count from the store today, so ${availCounts.unsampled === 1 ? "it isn't" : "they aren't"} checked.`}
                         </div>
                       )}
                       {/* What the readings BOUGHT. Hourly sampling exists to catch the days a
@@ -397,10 +451,10 @@ export default function UploadPanel({ onUploadSuccess, onUploadError, isUploadin
                       {uplift && (
                         <div className={`text-[13px] mt-0.5 ${uplift.productDays > 0 ? "text-[var(--t-good)]" : muted}`}>
                           {uplift.productDays > 0
-                            ? `Corrected ${uplift.productDays} sold-out day${uplift.productDays === 1 ? "" : "s"} across `
-                              + `${uplift.skus} product${uplift.skus === 1 ? "" : "s"}, adding ${uplift.unitsAdded} units of demand `
-                              + "that would have looked like a slowdown."
-                            : "No mid-day sellouts corrected yet. Either nothing sold out partway through a day, or there aren't enough readings to tell."}
+                            ? `${uplift.skus} product${uplift.skus === 1 ? "" : "s"} ran out partway through a day `
+                              + `(${uplift.productDays} day${uplift.productDays === 1 ? "" : "s"} in all). The forecast adds back the `
+                              + `~${Math.round(uplift.unitsAdded)} sales missed while ${uplift.skus === 1 ? "it was" : "they were"} empty, so a sellout isn't read as a slowdown.`
+                            : "Nothing has run out partway through a day yet. When something does, the forecast adds back the sales missed while it was empty, so a sellout isn't read as a slowdown."}
                         </div>
                       )}
                     </div>
@@ -411,9 +465,9 @@ export default function UploadPanel({ onUploadSuccess, onUploadError, isUploadin
                 + Connect another store
               </button>
               <p className={`text-[14px] leading-relaxed ${muted}`}>
-                Importing replaces the catalog with what the store reports. Saved tokens stay
-                on the server; this page only sees the masked hint above. Nightly sync only
-                runs while the backend is running.
+                Importing loads what the store reports (anything else loaded is set aside, not
+                lost). Saved tokens stay on the server; this page only sees the masked hint
+                above. Nightly sync only runs while the backend is running.
               </p>
             </>
           ) : (
@@ -473,6 +527,18 @@ export default function UploadPanel({ onUploadSuccess, onUploadError, isUploadin
         </div>
       ) : (
       <>
+      {storeInUse && (
+        <div className={`rounded-lg border px-2.5 py-2 text-[14px] leading-relaxed ${"bg-[var(--t-panel)] border-[var(--t-line)] text-[var(--t-soft)]"}`}>
+          <span className="font-semibold">{storeInUse.label}</span> is in use, so its products are loaded.
+          {" "}Uploading a file pauses it and sets its products aside, so the file loads on its own
+          (you can also{" "}
+          <button onClick={() => handleUse(storeInUse, false)} disabled={!!switching || isUploading}
+            className={`${ghostBtn} disabled:opacity-60`}>
+            {switching === storeInUse.id ? "pausing…" : "pause the store"}
+          </button>
+          {" "}now). Its login and products are kept.
+        </div>
+      )}
       <div onDrop={e => { e.preventDefault(); handleFile(e.dataTransfer.files[0]); }} onDragOver={e => e.preventDefault()} onClick={() => fileRef.current?.click()} className={dropzone}>
         <div className={iconBox}>
           <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">

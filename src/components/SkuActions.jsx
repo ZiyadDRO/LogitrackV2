@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { TIER_STYLES } from './common';
-import { isoToDisplay } from '../lib/helpers';
+import { isoToDisplay, todayStr } from '../lib/helpers';
 import { API, fetchJson } from '../lib/api';
 
 /* ─── SKU ACTION BAR ────────────────────────────────────────────────────────
@@ -91,14 +91,10 @@ export function SkuActionBar({ mlData, statusCfg, statusReason, hasOpenPO, openP
   const livePromo = (mlData.posEvents || []).some(e => e.type === "promotion");
   const eventSub = livePromo ? `Live discount${nEvents ? ` · ${nEvents} scheduled` : ""}`
     : nEvents ? `${nEvents} scheduled` : "None scheduled";
-  const hol = (mlData.holidays?.effects || []).filter(e => e.status === "applied");
-  const pctTxt = (p) => `${p > 0 ? "+" : ""}${p}%`;
+  const hol = (mlData.holidays?.effects || []).filter(e => e.status === "moves");
   const holSub = !mlData.holidays ? "Checked once there's history"
-    : hol.length ? (() => {
-        const top = [...hol].sort((a, b) => Math.abs(b.pct) - Math.abs(a.pct))[0];
-        return `${top.name.replace(" weekend", "")} ${pctTxt(top.pct)}${hol.length > 1 ? ` · +${hol.length - 1} more` : ""}`;
-      })()
-    : "No clear holiday effect";
+    : hol.length ? `${hol[0].name}${hol.length > 1 ? ` · +${hol.length - 1} more` : ""}`
+    : "No holiday changes its days";
 
   return (
     <div className="grid gap-3" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(165px, 1fr))" }}>
@@ -109,7 +105,7 @@ export function SkuActionBar({ mlData, statusCfg, statusReason, hasOpenPO, openP
         title="Every price this product has sold at, how long at each, and whether price moves the forecast"
         sub={priceSub} subTone={onSale ? "warn" : undefined} />
       <Tile onClick={onHolidays} icon={I.holiday} label="Holidays" count={mlData.holidays ? hol.length : null}
-        title="Which holidays and sales periods move this product, year by year, from its own sales history"
+        title="How this product's sales spread over the days around each holiday, from past years"
         sub={holSub} />
       <Tile onClick={onEvents} icon={I.events} label="Events" count={nEvents || null}
         title="Planned price changes and promotions" sub={eventSub} subTone={livePromo ? "warn" : undefined} />
@@ -294,18 +290,19 @@ export function PriceHistoryDrawer({ open, onClose, mlData }) {
 
 
 /* ─── HOLIDAYS ──────────────────────────────────────────────────────────────
- * Every holiday and sales period is checked automatically in this product's own sales
- * history; nobody has to remember which ones matter. This shows what each past year
- * actually did, the lift the forecast uses (day by day where the days differ), where it
- * came from, and when it next applies. A period can be switched off for this product
- * (a one-off you know about); upcoming Prime Day dates are added here too and apply to
- * every product. Periods this product hasn't been through yet aren't listed. */
+ * The forecast already knows how much this product sells in the weeks around each
+ * holiday. What a smooth forecast can't see is WHERE in those weeks the units land, so
+ * each holiday's stretch keeps the forecast's own total and splits it over its days the
+ * way past years did, lined up on the holiday itself (Thanksgiving to Thanksgiving).
+ * This shows that split, day by day, beside the same days in past years. Everything
+ * here is read off the current forecast, so it moves whenever the forecast does. */
 const fmtD = (iso, opts = { month: "short", day: "numeric" }) => {
   const d = new Date(`${iso}T12:00:00Z`);
   return Number.isNaN(d.getTime()) ? iso : d.toLocaleDateString("en-US", { ...opts, timeZone: "UTC" });
 };
 const fmtRange = (a, b) => (a === b ? fmtD(a) : `${fmtD(a)} to ${fmtD(b)}`);
 const wd = (iso) => fmtD(iso, { weekday: "short" });
+const n1 = (v) => (v == null ? "–" : v >= 100 ? Math.round(v).toLocaleString() : (Math.round(v * 10) / 10).toString());
 const signed = (p) => `${p > 0 ? "+" : ""}${p}%`;
 
 /* Defined out here, not inside the drawer: a component declared inside another is a new
@@ -323,23 +320,202 @@ function HSection({ title, children, right }) {
   );
 }
 
-function HYears({ r }) {
-  if (!(r.years || []).length) return null;
+/* One bar per day of the stretch: units already sold in ink, this forecast's units in
+   amber, the holiday's own days marked underneath, closed days hatched. */
+function HBars({ r }) {
+  const days = r.days || [];
+  if (!days.length) return null;
+  const max = Math.max(1e-9, ...days.map(d => d.units || 0));
+  const H = 64;
+  const coreFirst = days.findIndex(d => d.core);
+  const coreLast = days.length - 1 - [...days].reverse().findIndex(d => d.core);
   return (
-    <div className="mt-2 flex flex-wrap gap-1.5">
-      {r.years.map((y, i) => (
-        <span key={i} className="font-mono text-[12.5px] px-1.5 py-0.5 rounded"
-          style={{ background: "var(--t-panel)", border: "1px solid var(--t-line)", color: "var(--t-soft)" }}
-          title={`${y.units} sold vs about ${y.ordinary} on ordinary days`}>
-          {y.start.slice(0, 4)}: {signed(y.pct)} <span style={{ color: "var(--t-dim)" }}>({y.units} vs {y.ordinary})</span>
-        </span>
+    <div className="mt-3">
+      <div className="flex items-end gap-[2px]" style={{ height: H }}>
+        {days.map(d => {
+          const h = d.units == null ? 0 : Math.max(2, (d.units / max) * H);
+          return (
+            <div key={d.date} className="flex-1 min-w-0 relative" style={{ height: H }}
+              title={`${wd(d.date)} ${fmtD(d.date)}: ${d.closed ? "closed" : d.units == null ? "past the end of the forecast"
+                : `${n1(d.units)} ${d.sold ? "sold" : "forecast"}`}${!d.closed ? ` · ${d.x}× a typical day here` : ""}`}>
+              <div className="absolute bottom-0 left-0 right-0" style={{
+                height: d.closed ? H * 0.35 : h,
+                background: d.closed ? "repeating-linear-gradient(135deg, var(--t-line2) 0 3px, transparent 3px 6px)"
+                  : d.units == null ? "transparent" : d.sold ? "var(--t-ink)" : "var(--t-accent)",
+                border: d.units == null && !d.closed ? "1px dashed var(--t-line2)" : "none",
+                opacity: d.core || d.closed ? 1 : 0.62 }} />
+            </div>
+          );
+        })}
+      </div>
+      <div className="relative h-5 mt-1 text-[12.5px] font-mono" style={{ color: "var(--t-dim)" }}>
+        <span className="absolute left-0">{fmtD(days[0].date)}</span>
+        {coreFirst >= 0 && (
+          <span className="absolute whitespace-nowrap" style={{ left: `${((coreFirst + coreLast + 1) / 2 / days.length) * 100}%`,
+            transform: "translateX(-50%)", color: "var(--t-ink)" }}>
+            ▲ {r.coreLabel}
+          </span>
+        )}
+        <span className="absolute right-0">{fmtD(days[days.length - 1].date)}</span>
+      </div>
+    </div>
+  );
+}
+
+/* One figure in a card's stats row: a small label over a number. */
+function HStat({ label, value, sub, tone }) {
+  return (
+    <div className="min-w-0">
+      <div className="text-[12px] uppercase tracking-wider font-semibold" style={{ color: "var(--t-dim)" }}>{label}</div>
+      <div className="text-[17px] font-semibold font-mono mt-0.5" style={{ color: tone || "var(--t-ink)" }}>{value}</div>
+      {sub && <div className="text-[12.5px] mt-0.5" style={{ color: "var(--t-dim)" }}>{sub}</div>}
+    </div>
+  );
+}
+
+const pctTone = (p) => (p == null ? undefined : p >= 0 ? "var(--t-good)" : "var(--t-warn)");
+
+/* Every past year of the holiday, newest first: its dates, units, change from the year
+   before, and its own busiest day (each year has its own). */
+function HYears({ r }) {
+  const ys = r.allYears || [];
+  if (!ys.length) return <div className="text-[13.5px] px-1 py-2" style={{ color: "var(--t-dim)" }}>No past year of this holiday in the sales history yet.</div>;
+  return (
+    <div className="mt-3 rounded-lg overflow-y-auto" style={{ maxHeight: 260, border: "1px solid var(--t-line)", background: "var(--t-panel)" }}>
+      <div className="grid px-3 py-2 text-[12px] uppercase tracking-wider font-semibold sticky top-0"
+        style={{ gridTemplateColumns: "56px 1fr 70px 80px", gap: "0 10px", color: "var(--t-dim)", background: "var(--t-panel)", borderBottom: "1px solid var(--t-line)" }}>
+        <span>Year</span><span>Busiest day</span><span className="text-right">Units</span><span className="text-right">vs prior</span>
+      </div>
+      {ys.map(y => (
+        <div key={y.anchor} className="grid px-3 py-2 text-[14px] items-baseline"
+          style={{ gridTemplateColumns: "56px 1fr 70px 80px", gap: "0 10px", borderTop: "1px solid var(--t-line)" }}
+          title={`${fmtRange(y.start, y.end)}${y.complete ? "" : " · only part of this stretch is in the sales history"}`}>
+          <span className="font-mono font-semibold">{y.year}</span>
+          <span className="truncate" style={{ color: "var(--t-soft)" }}>
+            {y.peak ? <>{wd(y.peak.date)} {fmtD(y.peak.date)} <span className="font-mono" style={{ color: "var(--t-dim)" }}>{y.peak.x}×</span></> : "–"}
+          </span>
+          <span className="font-mono text-right">{n1(y.units)}{!y.complete && <span style={{ color: "var(--t-dim)" }}>*</span>}</span>
+          <span className="font-mono text-right" style={{ color: pctTone(y.pctVsPrior) || "var(--t-dim)" }}>
+            {y.pctVsPrior == null ? "–" : signed(y.pctVsPrior)}
+          </span>
+        </div>
       ))}
+      {ys.some(y => !y.complete) && (
+        <div className="px-3 py-2 text-[12.5px]" style={{ color: "var(--t-dim)", borderTop: "1px solid var(--t-line)" }}>
+          * Only part of that year's stretch is in the sales history, so it isn't compared as a percentage.
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* Where the day-by-day pattern comes from: this product's own years and the similar
+   products that steady it, with how much each part weighs. */
+function HBasis({ r }) {
+  const b = r.basis;
+  if (!b || (!b.ownYears && !b.peerCount)) return null;
+  return (
+    <div className="mt-3 rounded-lg px-3 py-2.5 text-[13px] leading-relaxed" style={{ background: "var(--t-panel)", border: "1px solid var(--t-line)", color: "var(--t-soft)" }}>
+      <div className="font-semibold mb-1" style={{ color: "var(--t-ink)", cursor: "help" }}
+        title="Each day's level is this product's own, pulled toward the same day across these products by how few units it rests on: the more this product sold around the holiday, the more its own pattern counts. No one product counts for more than a typical one among them. Only the day-by-day split comes from here; the total is always this forecast's own.">
+        Where this pattern comes from <span style={{ color: "var(--t-dim)" }}>ⓘ</span>
+      </div>
+      {b.ownYears > 0 && <div>This product's own sales, {b.ownYears} past year{b.ownYears === 1 ? "" : "s"}: <b className="font-mono">{b.ownPct}%</b></div>}
+      {b.peerCount > 0 && (
+        <div>
+          {b.scope === "category" && b.category ? `Other ${b.category} products` : "Similar products in the store"} ({b.peerCount}):{" "}
+          <b className="font-mono">{b.peerPct}%</b>
+          {(b.peers || []).length > 0 && (
+            <span style={{ color: "var(--t-dim)" }}>
+              {" "}· {b.peers.map(p => `${p.name} ${p.pct}%`).join(", ")}
+            </span>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function HStretch({ r, busy, onSwitch }) {
+  const [showYears, setShowYears] = useState(false);
+  const muted = { color: "var(--t-dim)" };
+  const isNext = r.view !== "last";
+  const f = r.forecast || {};
+  const L = r.last || {};
+  const barsFor = isNext ? r : { ...r, days: L.days || [] };
+  const peak = isNext ? (r.peak?.date && r.peak.x >= 1.1 ? r.peak : null) : (L.peak && L.peak.x >= 1.1 ? L.peak : null);
+  const range = isNext ? fmtRange(r.next.start, r.next.end) : fmtRange(L.start, L.end);
+  const ly = r.lastYear;
+  return (
+    <div className="px-4 py-4">
+      {/* Title: name, dates, and which occurrence this is. */}
+      <div className="flex items-start gap-2">
+        <div className="min-w-0">
+          <div className="text-[15.5px] font-semibold">{r.name}</div>
+          <div className="text-[13.5px] font-mono mt-0.5" style={muted}>{range}</div>
+        </div>
+        <span className="ml-auto shrink-0 text-[12px] font-semibold px-2 py-0.5 rounded-full"
+          style={isNext ? { background: "var(--t-accent-soft)", color: "var(--t-accent)" }
+                        : { background: "var(--t-panel)", color: "var(--t-soft)", border: "1px solid var(--t-line)" }}>
+          {isNext ? (f.underway ? "Under way" : "In this forecast") : `Last time · ${String(L.start || "").slice(0, 4)}`}
+        </span>
+      </div>
+
+      <HBars r={barsFor} />
+
+      {/* Figures. */}
+      <div className="grid grid-cols-3 gap-3 mt-3 pt-3" style={{ borderTop: "1px solid var(--t-line)" }}>
+        {isNext ? (<>
+          <HStat label={f.underway ? "This time" : "Forecast"} value={`${n1(f.units)} units`}
+            sub={f.underway ? `${n1(f.sold)} sold so far` : null} />
+          <HStat label={`On ${r.coreLabel}`} value={n1(f.coreUnits)} />
+          <HStat label="vs last year" value={ly?.pct != null ? signed(ly.pct) : "–"} tone={pctTone(ly?.pct)}
+            sub={ly ? `${n1(ly.units)} units then` : "not on file"} />
+        </>) : (<>
+          <HStat label="Sold" value={`${n1(L.units)} units`} />
+          <HStat label={`On ${r.coreLabel}`} value={n1(L.coreUnits)} />
+          <HStat label="vs year before" value={L.pctVsPrior != null ? signed(L.pctVsPrior) : "–"} tone={pctTone(L.pctVsPrior)} />
+        </>)}
+      </div>
+
+      {peak && (
+        <div className="text-[13.5px] mt-2.5" style={{ color: "var(--t-soft)" }}>
+          Busiest{isNext ? "" : ` in ${String(L.start || "").slice(0, 4)}`}: <b style={{ color: "var(--t-ink)" }}>{wd(peak.date)} {fmtD(peak.date)}</b>,
+          about {peak.x}× a typical day of the stretch.
+        </div>
+      )}
+      {!isNext && (
+        <div className="text-[13px] mt-1.5" style={muted}>
+          The next one ({fmtRange(r.next.start, r.next.end)}) is past the end of this forecast, so it's shown as it
+          sold last time. It appears here with its forecast once it's inside the forecast horizon.
+        </div>
+      )}
+      {isNext && f.partial && (
+        <div className="text-[13px] mt-1.5" style={muted}>
+          The forecast reaches only part of this stretch; its days are split as part of the whole stretch.
+        </div>
+      )}
+
+      <HBasis r={r} />
+
+      <div className="flex items-center gap-4 mt-3">
+        <button className="text-[13.5px] font-semibold rounded-lg px-3 py-1.5 border"
+          style={{ borderColor: "var(--t-line2)", color: "var(--t-soft)" }}
+          onClick={() => setShowYears(v => !v)}>
+          {showYears ? "Hide past years" : `View all years for this holiday${(r.allYears || []).length ? ` (${r.allYears.length})` : ""}`}
+        </button>
+        <button className="ml-auto text-[13.5px] font-semibold underline underline-offset-2 disabled:opacity-50 whitespace-nowrap"
+          style={muted} disabled={!!busy} onClick={() => onSwitch(r.key, false)}>
+          {busy === r.key ? "Switching off…" : "Switch off"}
+        </button>
+      </div>
+      {showYears && <HYears r={r} />}
     </div>
   );
 }
 
 export function HolidaysDrawer({ open, onClose, mlData, onChanged }) {
-  const [cal, setCal] = useState(null);           // GET /api/holidays
+  const [cal, setCal] = useState(null);           // GET /api/holidays (Prime Day dates)
   const [busy, setBusy] = useState(null);         // key being switched, or "store"
   const [showQuiet, setShowQuiet] = useState(false);
   const [prime, setPrime] = useState({ start: "", end: "" });
@@ -351,10 +527,11 @@ export function HolidaysDrawer({ open, onClose, mlData, onChanged }) {
   if (!open) return null;
 
   const rep = mlData.holidays;
-  const rows = rep?.effects || [];
+  const shape = rep?.method === "shape";
+  const rows = shape ? (rep?.effects || []) : [];
   const by = (st) => rows.filter(r => r.status === st);
-  const applied = by("applied"), quiet = [...by("none"), ...by("discounted")], off = by("off");
-  const ignored = rows.filter(r => r.status === "off").map(r => r.key);
+  const moves = by("moves"), flat = [...by("flat"), ...by("new")], off = by("off");
+  const ignored = off.map(r => r.key);
   const refitting = cal?.refit?.status === "running";
   const muted = { color: "var(--t-dim)" };
   const card = { background: "var(--t-sunken)", border: "1px solid var(--t-line)" };
@@ -398,26 +575,27 @@ export function HolidaysDrawer({ open, onClose, mlData, onChanged }) {
     saveStore({ dates });
   };
 
+  const shift = rep?.shiftDays || 0;
+
   const download = async () => {
-    setDownloading(true);
+    setDownloading(true); setErr(null);
     try {
       const r = await fetch(`${API}/api/holidays/report`);
       if (!r.ok) throw new Error();
       const blob = await r.blob();
       const a = document.createElement("a");
       a.href = URL.createObjectURL(blob);
-      a.download = `logitrack_holidays_${new Date().toISOString().slice(0, 10)}.xlsx`;
+      a.download = `logitrack_holidays_${todayStr()}.xlsx`;
       document.body.appendChild(a); a.click(); a.remove();
       setTimeout(() => URL.revokeObjectURL(a.href), 2000);
     } catch { setErr("The report couldn't be downloaded. Is the backend running?"); }
     setDownloading(false);
   };
 
-
   return (
     <div className="fixed inset-0 z-50">
       <div className="absolute inset-0 bg-black/40 backdrop-blur-[1px]" onClick={onClose} />
-      <aside className="absolute right-0 top-0 h-full w-full max-w-lg overflow-y-auto border-l shadow-2xl"
+      <aside className="absolute right-0 top-0 h-full w-full max-w-xl overflow-y-auto border-l shadow-2xl"
         style={{ background: "var(--t-panel)", borderColor: "var(--t-line)", color: "var(--t-ink)" }}>
         <div className="sticky top-0 z-10 flex items-center justify-between px-6 py-4 border-b"
           style={{ background: "var(--t-panel)", borderColor: "var(--t-line)" }}>
@@ -429,7 +607,7 @@ export function HolidaysDrawer({ open, onClose, mlData, onChanged }) {
             <button onClick={download} disabled={downloading}
               className="rounded-lg px-3 py-1.5 text-[13.5px] font-semibold border disabled:opacity-60"
               style={{ borderColor: "var(--t-line2)", color: "var(--t-soft)" }}
-              title="Every product against every holiday, year by year, as Excel">
+              title="Every product against every holiday: this year's stretch, its busiest days and the same days in past years, as Excel">
               {downloading ? "Preparing…" : "Download report"}
             </button>
             <button onClick={onClose} className="rounded-lg px-2 py-1 text-lg leading-none" style={muted}>×</button>
@@ -437,82 +615,41 @@ export function HolidaysDrawer({ open, onClose, mlData, onChanged }) {
         </div>
 
         <div className="px-6 py-6">
-          <p className="text-[14.5px] leading-relaxed mb-5" style={{ color: "var(--t-soft)" }}>
-            {rep ? `${rep.checked} holidays and sales periods are checked automatically in this product's sales history. Only clear effects move the forecast.`
-                 : "Holidays are checked once this product has sales history."}
+          <p className="text-[14.5px] leading-relaxed mb-4" style={{ color: "var(--t-soft)" }}>
+            {shape
+              ? "How this product's sales spread over the days around each holiday, the way past years did. A holiday inside this forecast shows its forecast units (always this forecast's own total); one further out shows how it sold last time."
+              : "Holidays are looked at once this product has sales history."}
           </p>
+          {shape && shift > 30 && (
+            <div className="rounded-xl px-4 py-2.5 mb-5 text-[13.5px] leading-relaxed border"
+              style={{ background: "var(--t-sunken)", borderColor: "var(--t-line)", color: "var(--t-soft)" }}>
+              This history was moved {shift} days forward so its last sale lands on yesterday, and its seasons moved
+              with it. The day-by-day pattern below uses the real dates of past sales, but this year's totals around
+              each holiday come from the moved seasons, so compare them with past years loosely.
+            </div>
+          )}
           {(err || refitting || busy === "store") && (
             <div className="rounded-xl px-4 py-2.5 mb-5 text-[14px] border"
               style={err ? { background: "var(--t-bad-soft)", borderColor: "var(--t-bad-line)", color: "var(--t-bad)" }
                          : { background: "var(--t-sunken)", borderColor: "var(--t-line)", color: "var(--t-soft)" }}>
-              {err || "Updating every product's forecast. This takes a minute or two."}
+              {err || "Updating every product's forecast. This can take a few minutes."}
             </div>
           )}
 
-          <HSection title={`Moves this product · ${applied.length}`}>
-            {applied.length === 0 ? (
-              <div className="rounded-xl p-4 text-[14.5px]" style={{ ...card, color: "var(--t-soft)" }}>
-                No holiday shows a clear effect yet. Its dates are forecast like any other day.
-              </div>
-            ) : (
-              <div className="rounded-xl overflow-hidden" style={card}>
-                {applied.map((r, i) => (
-                  <div key={r.key} className="px-4 py-3" style={{ borderTop: i ? "1px solid var(--t-line)" : "none" }}>
-                    <div className="flex items-baseline gap-2">
-                      <span className="text-[15.5px] font-semibold">{r.name}</span>
-                      <span className="ml-auto font-mono text-[16px] font-semibold"
-                        style={{ color: r.pct >= 0 ? "var(--t-good)" : "var(--t-warn)" }}>{signed(r.pct)}</span>
-                    </div>
-                    <div className="text-[13.5px] mt-0.5 leading-relaxed" style={muted}>
-                      {r.text}{r.next ? ` Next: ${fmtRange(r.next.start, r.next.end)}.` : ""}
-                    </div>
-                    <HYears r={r} />
-                    {(r.days || []).length > 1 && (
-                      <div className="mt-2 flex flex-wrap gap-1.5">
-                        {r.days.map(d => (
-                          <span key={d.date} className="text-[12.5px] px-1.5 py-0.5 rounded"
-                            style={{ background: "var(--t-good-soft)", color: "var(--t-good)" }}>
-                            {wd(d.date)} {fmtD(d.date)} <span className="font-mono">{signed(d.pct)}</span>
-                          </span>
-                        ))}
-                      </div>
-                    )}
-                    <button className={`${linkBtn} mt-2`} style={muted} disabled={!!busy}
-                      onClick={() => setSwitch(r.key, false)}>
-                      {busy === r.key ? "Switching off…" : "Switch off for this product"}
-                    </button>
-                  </div>
-                ))}
-              </div>
-            )}
-          </HSection>
-
-          {quiet.length > 0 && (
-            <HSection title={`Checked, no clear effect · ${quiet.length}`}
-              right={<button className={linkBtn} style={muted} onClick={() => setShowQuiet(v => !v)}>{showQuiet ? "Hide" : "Show"}</button>}>
-              {showQuiet ? (<>
-                <p className="text-[13.5px] leading-relaxed mb-2.5" style={muted}>
-                  On these dates its past years stay within what chance explains on this many sales, so they're
-                  forecast as ordinary days. Any sizeable past swing is covered by extra safety stock instead.
-                </p>
+          {shape && (
+            <HSection title={`Shapes this product's forecast · ${moves.length}`}>
+              {moves.length === 0 ? (
+                <div className="rounded-xl p-4 text-[14.5px]" style={{ ...card, color: "var(--t-soft)" }}>
+                  No holiday changes how this product's sales fall across the days around it, so those weeks are
+                  forecast like any others.
+                </div>
+              ) : (
                 <div className="rounded-xl overflow-hidden" style={card}>
-                  {quiet.map((r, i) => (
-                    <div key={r.key} className="px-4 py-2.5" style={{ borderTop: i ? "1px solid var(--t-line)" : "none" }}>
-                      <div className="flex items-baseline gap-2">
-                        <span className="text-[14.5px] font-semibold">{r.name}</span>
-                        <button className={`${linkBtn} ml-auto`} style={muted} disabled={!!busy}
-                          onClick={() => setSwitch(r.key, false)}>{busy === r.key ? "…" : "Switch off"}</button>
-                      </div>
-                      {r.status === "discounted" && (
-                        <div className="text-[13px] mt-0.5 leading-relaxed" style={muted}>{r.text}</div>
-                      )}
-                      <HYears r={r} />
+                  {moves.map((r, i) => (
+                    <div key={r.key} style={{ borderTop: i ? "1px solid var(--t-line)" : "none" }}>
+                      <HStretch r={r} busy={busy} onSwitch={setSwitch} />
                     </div>
                   ))}
-                </div>
-              </>) : (
-                <div className="text-[14px] leading-relaxed" style={{ color: "var(--t-soft)" }}>
-                  {quiet.map(r => r.name).join(", ")}.
                 </div>
               )}
             </HSection>
@@ -536,7 +673,7 @@ export function HolidaysDrawer({ open, onClose, mlData, onChanged }) {
             <HSection title="Prime Day dates">
               <div className="text-[13.5px] leading-relaxed mb-2.5" style={{ color: primeRow.needsDate ? "var(--t-warn)" : "var(--t-soft)" }}>
                 {primeRow.needsDate
-                  ? "The next Prime Day hasn't been announced yet, so it isn't in the forecast. Add it when Amazon does."
+                  ? "The next Prime Day hasn't been announced yet. Add it when Amazon does, so its days get their shape."
                   : `Next: ${fmtRange(primeRow.next.start, primeRow.next.end)}.`}
               </div>
               <div className="grid gap-2" style={{ gridTemplateColumns: "1fr 1fr auto" }}>
@@ -551,9 +688,50 @@ export function HolidaysDrawer({ open, onClose, mlData, onChanged }) {
             </HSection>
           )}
 
-          {(rep?.notes || []).map((n, i) => (
-            <p key={i} className="text-[13px] leading-relaxed mt-2" style={muted}>{n}</p>
-          ))}
+          {flat.length > 0 && (
+            <HSection title={`No significant change detected, or not yet seen · ${flat.length}`}
+              right={<button className={linkBtn} style={muted} onClick={() => setShowQuiet(v => !v)}>{showQuiet ? "Hide" : "Show"}</button>}>
+              {showQuiet ? (<>
+                <p className="text-[13.5px] leading-relaxed mb-2.5" style={muted}>
+                  Around these, this product's days come out about even, or the holiday hasn't come round in its
+                  sales history yet, so the forecast spreads those weeks as usual.
+                </p>
+                <div className="rounded-xl overflow-hidden" style={card}>
+                  {flat.map((r, i) => (
+                    <div key={r.key} className="px-4 py-2.5" style={{ borderTop: i ? "1px solid var(--t-line)" : "none" }}>
+                      <div className="flex items-baseline gap-2">
+                        <span className="text-[14.5px] font-semibold">{r.name}</span>
+                        <span className="text-[13px] font-mono" style={muted}>
+                          {r.view === "last" && r.last ? `last time ${fmtRange(r.last.start, r.last.end)}` : fmtRange(r.next.start, r.next.end)}
+                        </span>
+                        <button className={`${linkBtn} ml-auto`} style={muted} disabled={!!busy}
+                          onClick={() => setSwitch(r.key, false)}>{busy === r.key ? "…" : "Switch off"}</button>
+                      </div>
+                      <div className="text-[13px] mt-0.5" style={muted}>
+                        {r.status === "new" ? "Not in its history yet, and similar products don't show one either."
+                          : r.view === "last" && r.last ? `${n1(r.last.units)} units sold last time`
+                          : `${n1(r.forecast?.units)} units forecast`}
+                        {(r.allYears || []).length > 1 && ` · ${r.allYears.map(y => `${y.year}: ${n1(y.units)}`).join(", ")}`}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </>) : (
+                <div className="text-[14px] leading-relaxed" style={{ color: "var(--t-soft)" }}>
+                  {flat.map(r => r.name).join(", ")}.
+                </div>
+              )}
+            </HSection>
+          )}
+
+
+          {shape && (
+            <p className="text-[13px] leading-relaxed" style={muted}>
+              Your own sales and promotions go in Events: they lift their days on top of this, and past promotion days
+              are left out of these patterns so a sale is never counted twice. Days the store is closed are set in
+              Closed days on the Fleet overview.
+            </p>
+          )}
         </div>
       </aside>
     </div>

@@ -164,6 +164,12 @@ export default function ForecastDetailsDrawer({ data, lm = false, open = false, 
                           <span>{d.recentCheck.text}</span>
                         </li>
                       )}
+                      {d.oneOff?.text && (
+                        <li className={`text-[15px] ${textBody} leading-relaxed flex gap-2`}>
+                          <span className="text-[var(--t-info)]">•</span>
+                          <span>{d.oneOff.text}</span>
+                        </li>
+                      )}
                       {d.holidays?.text && (
                         <li className={`text-[15px] ${textBody} leading-relaxed flex gap-2`}>
                           <span className={d.holidays.count ? 'text-[var(--t-good)]' : 'text-[var(--t-dim)]'}>•</span>

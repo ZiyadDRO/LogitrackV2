@@ -63,6 +63,8 @@ backtest_last_result.json
 # Data, not code: it is rebuilt from an upload or a sync, and must never be committed.
 engine_statsforecast/catalog_store/
 engine_statsforecast/backtest_store/
+# Stores or spreadsheets set aside while another is showing (can hold real sales)
+engine_statsforecast/workspaces/
 # Hourly inventory readings. Runtime state like the forecast log above, not code.
 engine_statsforecast/stock_log.json
 
@@ -70,3 +72,6 @@ engine_statsforecast/stock_log.json
 # redundant sync, committing it would make every clone think it synced on your machine.
 engine_statsforecast/sync_state.json
 engine_statsforecast/sync_state.json.tmp
+# Which days this install's store is closed. Runtime settings, like the sync ledger.
+engine_statsforecast/closed_days.json
+engine_statsforecast/closed_days.json.tmp

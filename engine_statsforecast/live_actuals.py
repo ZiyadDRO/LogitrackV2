@@ -47,7 +47,8 @@ def lookback_days_for(entries, now=None, *, pad: int = 7) -> int:
     Fetching a fixed 90 days would silently fail to grade anything older, which is
     exactly the entry you most want graded after a gap in usage.
     """
-    today = (now or _dt.datetime.now(_dt.timezone.utc)).date()
+    import store_clock as _CLOCK
+    today = _CLOCK.local_date(now or _dt.datetime.now(_dt.timezone.utc))
     starts = [_d(e["windowStart"]) for e in entries if e.get("windowStart")]
     if not starts:
         return pad
@@ -55,7 +56,8 @@ def lookback_days_for(entries, now=None, *, pad: int = 7) -> int:
     return max(pad, (today - oldest).days + pad)
 
 
-def shopify_actuals_provider(entries, *, now=None, fetch=None, shop=None, token=None):
+def shopify_actuals_provider(entries, *, now=None, fetch=None, shop=None, token=None,
+                             known_skus=None):
     """Build the `actuals_fn(sku, start, end)` that ForecastLog.score_due wants.
 
     Shopify is queried ONCE for a window wide enough to cover every pending entry, then
@@ -78,6 +80,13 @@ def shopify_actuals_provider(entries, *, now=None, fetch=None, shop=None, token=
     known = set()
     if not failed and frame is not None and len(frame):
         known = set(frame["sku"].astype(str).unique())
+    # The store's own product list. A sales report only names products that SOLD in the
+    # window it covers, so a product that sold nothing all week was "never reported",
+    # returned None and stayed ungraded for ever: the tab graded only the products that
+    # sold, and every week's worst misses (forecast 25, sold 0) were missing from it. A
+    # product the store lists and that sold nothing did sell zero.
+    if not failed and known_skus:
+        known |= {str(k) for k in known_skus}
 
     def actuals_fn(sku, start, end):
         if failed:

@@ -38,6 +38,10 @@ import numpy as np
 import pandas as pd
 
 import main as M
+# These tests stand in for a connected store's products with an uploaded sheet. Live POS
+# readings apply only while a store's products are loaded (test_store_switching covers
+# that rule), so say they are here.
+M._live_readings_apply = lambda sku_id=None: True
 
 FAILURES: list[str] = []
 

@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { computeSupplierStats, computeSkuLeadTimeStats, makeSupId, makeOrdId, isoToDisplay, todayStr, FREIGHT_MODES, LEAD_TIME_MIN_DELIVERIES,
          supplierStatsByLane, allSuppliersByLane, leadTimeTracks, leadTimeBasis, latestChangeAt, readLeadTimeChanges, describeLeadTimeChange,
-         namedSuppliers, adoptParkedOrders } from '../lib/helpers';
+         namedSuppliers, adoptParkedOrders, arrivalAddsToStock, poIsOrder } from '../lib/helpers';
 import { saveStorage } from '../lib/storage';
 import { Tip } from './common';
 import { terminal, MONO, SANS } from '../lib/theme';
@@ -149,6 +149,10 @@ export default function SupplierPanel({ suppliers, setSuppliers, skuList, lm, op
     return Number.isFinite(supBase) && supBase > 0 ? at(supBase) : "";
   };
 
+  // Whether logging this arrived delivery adds to stock: the tick box if touched, else
+  // yes for one arriving today (or after the last count), no for an old one.
+  const formAddsToStock = (form) => form.addToStock ??
+    arrivalAddsToStock(skuParams?.[form.skuId], form.receivedDate || todayStr());
   const addOrder = (supId) => {
     if (!orderForm.orderedDate) return;
     const id = makeOrdId();
@@ -156,6 +160,7 @@ export default function SupplierPanel({ suppliers, setSuppliers, skuList, lm, op
     const qty = parseInt(orderForm.qty) || 0;
     const skuId = orderForm.skuId || null;
     const receivedDate = arrived ? (orderForm.receivedDate || todayStr()) : null;
+    const addStock = arrived && formAddsToStock(orderForm);
     const order = {
       id, orderedDate: orderForm.orderedDate, receivedDate,
       /* SAVE the date the box was showing. It used to save only what you typed, so an
@@ -167,8 +172,9 @@ export default function SupplierPanel({ suppliers, setSuppliers, skuList, lm, op
       freightMode: orderForm.freightMode || Object.keys(FREIGHT_MODES)[0],
     };
     setSuppliers(prev => ({ ...prev, [supId]: { ...prev[supId], orders: [...(prev[supId].orders || []), order] } }));
-    // If logged as already arrived and tied to a product, add the units to stock now.
-    if (receivedDate && skuId && qty > 0 && receiveStock) receiveStock(skuId, qty);
+    // Logged as already arrived and tied to a product: add the units to stock, unless it
+    // arrived before the last stock count (or is an old delivery logged for the record).
+    if (receivedDate && addStock && skuId && qty > 0 && receiveStock) receiveStock(skuId, qty);
     setAddingOrder(null); setOrderForm({});
   };
   /* Baselines live on the SUPPLIER, inherited by every product under it. Editing here
@@ -186,12 +192,20 @@ export default function SupplierPanel({ suppliers, setSuppliers, skuList, lm, op
     });
   };
   const markReceived = (supId, ordId, date) => {
+    // An arrival needs its date. Without one the stock went up while the order stayed
+    // in transit, so marking it again added the same units twice.
+    if (!date) return;
     const sup = suppliers[supId];
     const ord = (sup?.orders || []).find(o => o.id === ordId);
-    // Add the received units to stock (only on the transition into "received").
-    if (ord && !ord.receivedDate && ord.skuId && ord.qty > 0 && receiveStock) receiveStock(ord.skuId, ord.qty);
-    // Clear the linked openPO if present
-    if (ord?.skuId && openPOs?.[ord.skuId] && setOpenPOs) {
+    // Add the received units to stock (only on the transition into "received"), unless
+    // the stock was counted after it arrived and already includes it.
+    if (ord && !ord.receivedDate && ord.skuId && ord.qty > 0 && receiveStock &&
+        arrivalAddsToStock(skuParams?.[ord.skuId], date, { pastDefault: true })) {
+      receiveStock(ord.skuId, ord.qty);
+    }
+    // Clear the product's open PO only when it IS this order. It used to clear whatever
+    // PO the product had, so one order arriving cancelled another still on the water.
+    if (ord?.skuId && setOpenPOs && poIsOrder(openPOs, suppliers, ord.skuId, ordId)) {
       const nextPOs = { ...openPOs }; delete nextPOs[ord.skuId];
       setOpenPOs(nextPOs); saveStorage("logitrack_pos", nextPOs);
     }
@@ -988,7 +1002,7 @@ export default function SupplierPanel({ suppliers, setSuppliers, skuList, lm, op
                         <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
                           {inTransit.map(ord => {
                             const daysLeft = ord.expectedDate
-                              ? Math.round((new Date(ord.expectedDate) - new Date(todayStr())) / 86400000)
+                              ? Math.round((new Date(ord.expectedDate) - new Date(todayStr())) / 86400000)   // both UTC midnights
                               : null;
                             const skuName = ord.skuId ? skuList.find(s => s.id === ord.skuId)?.name || ord.skuId : null;
                             const isMarking = markingOrd?.supId === sup.id && markingOrd?.ordId === ord.id;
@@ -1023,8 +1037,9 @@ export default function SupplierPanel({ suppliers, setSuppliers, skuList, lm, op
                                     <div style={{ display:"flex", alignItems:"center", gap:6, flexWrap:"wrap" }}>
                                       <input type="date" value={markDate} onChange={e => setMarkDate(e.target.value)}
                                         style={{ ...inp, width:"auto", padding:"3px 6px", fontSize:14 }} />
-                                      <button onClick={() => markReceived(sup.id, ord.id, markDate)}
-                                        style={{ ...btnMini, background:T.green, color:T.onFill, border:"2px solid transparent" }}>✓ Confirm</button>
+                                      <button onClick={() => markReceived(sup.id, ord.id, markDate)} disabled={!markDate}
+                                        title={markDate ? undefined : "Pick the date it arrived"}
+                                        style={{ ...btnMini, background:T.green, color:T.onFill, border:"2px solid transparent", opacity: markDate ? 1 : 0.5 }}>✓ Confirm</button>
                                       <button onClick={() => setMarkingOrd(null)} style={{ ...btnMini, border:"none", color:T.faint }}>Cancel</button>
                                     </div>
                                   )}
@@ -1113,9 +1128,14 @@ export default function SupplierPanel({ suppliers, setSuppliers, skuList, lm, op
                             <div style={{ gridColumn:"span 2" }}><label style={lbl}>Notes (optional)</label><input type="text" value={orderForm.notes || ""} onChange={e => setOrderForm(p => ({ ...p, notes: e.target.value }))} style={inp} /></div>
                           </div>
                           {orderForm.skuId && !orderForm.notArrived && (parseInt(orderForm.qty) || 0) > 0 && (
-                            <p style={{ ...mono, fontSize:14, color:T.green, marginTop:10 }}>
-                              ✓ Adds {(parseInt(orderForm.qty) || 0).toLocaleString()} unit{(parseInt(orderForm.qty) || 0) !== 1 ? "s" : ""} to {skuList.find(s => s.id === orderForm.skuId)?.name || orderForm.skuId} stock.
-                            </p>
+                            <label style={{ display:"flex", alignItems:"center", gap:8, cursor:"pointer", userSelect:"none", marginTop:10 }}>
+                              <input type="checkbox" checked={formAddsToStock(orderForm)}
+                                onChange={e => setOrderForm(p => ({ ...p, addToStock: e.target.checked }))} />
+                              <span style={{ ...mono, fontSize:14, color: formAddsToStock(orderForm) ? T.green : T.dim }}>
+                                Add {(parseInt(orderForm.qty) || 0).toLocaleString()} unit{(parseInt(orderForm.qty) || 0) !== 1 ? "s" : ""} to {skuList.find(s => s.id === orderForm.skuId)?.name || orderForm.skuId} stock
+                                {!formAddsToStock(orderForm) && " (off: it arrived before your last stock count, or it's an old delivery logged for the record)"}
+                              </span>
+                            </label>
                           )}
                           <div style={{ display:"flex", gap:8, marginTop:12 }}>
                             <button onClick={() => addOrder(sup.id)} style={{ ...btnSolid, flex:1, textAlign:"center" }}>Save</button>

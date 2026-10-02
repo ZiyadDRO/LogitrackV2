@@ -198,5 +198,57 @@ check("no base price means no path", U.future_price_path(FD, perm, base_price=No
 check("an explicit override wins over events",
       U.future_price_path(FD, perm, base_price=20.0, price_override=12.0)["2026-09-08"] == 12.0)
 
+print("\n— the price reading: two methods, cross-checked —")
+import numpy as _np
+_rng = _np.random.default_rng(7)
+
+
+def _sim(n, rate_fn, price_fn, seed=0):
+    r = _np.random.default_rng(seed)
+    ds = pd.date_range("2024-01-01", periods=n, freq="D")
+    p = _np.array([price_fn(i) for i in range(n)], float)
+    lam = _np.array([rate_fn(i, d) for i, d in enumerate(ds)]) * (p / p[0]) ** -1.8
+    return pd.DataFrame({"ds": ds, "y": r.poisson(lam).astype(float), "price": p})
+
+
+_season = lambda i, d: 6.0 * (1 + 0.6 * _np.sin(2 * _np.pi * (d.dayofyear - 80) / 365.25))
+_yard = [_sim(900, _season, lambda i: 20.0, seed=s) for s in (11, 12, 13, 14)]
+# A peer that launched mid-way sells from 0: it must not become the yardstick.
+_launch = _sim(900, lambda i, d: 0.0 if i < 400 else 40.0, lambda i: 30.0, seed=15)
+
+# Short promotions only: the same-months method can't read it (no 30-day second level).
+_promo = _sim(900, _season, lambda i: 40.0 if (i % 120) < 14 and i > 100 else 50.0, seed=21)
+r = U.price_reading(_promo, gate_ok=False, others=_yard + [_launch])
+check("short promotions alone are read from the weeks before and after them",
+      r["basis"] == "before-after" and -2.6 < r["elasticity"] < -1.0, str({k: r[k] for k in ("basis", "elasticity")}))
+
+# Two long levels in a seasonal product: both methods can read, and they agree.
+_two = _sim(900, _season, lambda i: 50.0 if (i // 150) % 2 == 0 else 42.0, seed=22)
+r = U.price_reading(_two, gate_ok=True, others=_yard + [_launch])
+check("when both can read and agree, the average is used",
+      r["basis"] == "both" and -2.6 < r["elasticity"] < -1.0,
+      str({k: r[k] for k in ("basis", "elasticity", "sameMonths", "beforeAfter")}))
+
+# A handful of sales around one change is not a reading.
+_sp = _sim(300, lambda i, d: 0.08, lambda i: 50.0 if i < 150 else 40.0, seed=23)
+r = U.price_reading(_sp, gate_ok=False, others=_yard)
+check("a few sales around a change aren't a reading", r["elasticity"] is None, str(r["basis"]))
+
+# The launch inside the window can't swing the yardstick.
+ba_a = U.before_after_elasticity(_promo, others=_yard)
+ba_b = U.before_after_elasticity(_promo, others=_yard + [_launch])
+check("one peer launching doesn't move the yardstick much",
+      abs(ba_a["elasticity"] - ba_b["elasticity"]) < 0.3, f"{ba_a['elasticity']:.2f} vs {ba_b['elasticity']:.2f}")
+
+# When the two readings clearly disagree, price isn't used at all.
+_orig = U.before_after_elasticity
+U.before_after_elasticity = lambda *a, **k: {"elasticity": -3.9, "se": 0.2, "changes": 3, "lo": 42.0, "hi": 50.0, "detail": []}
+try:
+    r = U.price_reading(_two, gate_ok=True)
+finally:
+    U.before_after_elasticity = _orig
+check("clearly different readings mean price isn't used",
+      r["basis"] == "readings-disagree" and r["elasticity"] is None, str(r["basis"]))
+
 print(f"\n=== {_pass} passed, {_fail} failed ===")
 sys.exit(1 if _fail else 0)

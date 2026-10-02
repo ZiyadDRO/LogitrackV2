@@ -63,27 +63,36 @@ export const INDUSTRY = {
 };
 
 // Keyword matcher — tried BEFORE any AI call, so most inputs never need one.
+// Matched as WHOLE words (a plural "s"/"es" allowed): substring matching read "parts" as
+// "art" (home decor) and "Tealight" as "tea". A word ending in "*" is a stem and matches
+// any word it starts ("furnitur*" → furniture, furnishings don't).
 const KEYWORDS = [
-  ["furniture", ["vanit", "furnitur", "sofa", "couch", "cabinet", "mattress", "table", "chair", "desk", "dresser", "wardrobe"]],
-  ["home_decor", ["decor", "mirror", "rug", "cushion", "candle", "lamp", "lighting", "art", "frame", "vase"]],
-  ["building", ["tile", "faucet", "plumb", "lumber", "hardware", "fixture", "sink", "tap", "paint", "floor", "door", "window"]],
-  ["apparel", ["cloth", "apparel", "shoe", "footwear", "shirt", "dress", "fashion", "garment", "jacket", "sock"]],
-  ["electronics", ["electronic", "laptop", "phone", "computer", "gadget", "camera", "headphone", "console", "tv "]],
-  ["food", ["food", "drink", "beverage", "coffee", "tea", "snack", "grocer", "bakery", "produce", "wine", "beer"]],
+  ["furniture", ["vanit*", "furnitur*", "sofa", "couch", "cabinet", "mattress", "table", "chair", "desk", "dresser", "wardrobe"]],
+  ["home_decor", ["decor*", "mirror", "rug", "cushion", "candle", "lamp", "lighting", "art", "artwork", "frame", "vase"]],
+  ["building", ["tile", "faucet", "plumb*", "lumber", "hardware", "fixture", "sink", "tap", "paint", "floor*", "door", "window"]],
+  ["apparel", ["cloth*", "apparel", "shoe", "footwear", "shirt", "t-shirt", "dress", "fashion", "garment", "jacket", "sock"]],
+  ["electronics", ["electronic*", "laptop", "phone", "computer", "gadget", "camera", "headphone", "console", "tv"]],
+  ["food", ["food", "drink", "beverage", "coffee", "tea", "snack", "grocer*", "bakery", "produce", "wine", "beer"]],
   ["beauty", ["beauty", "cosmetic", "skincare", "makeup", "fragrance", "perfume", "shampoo", "supplement"]],
-  ["jewellery", ["jewel", "jewellery", "jewelry", "watch", "ring", "necklace", "diamond", "gold"]],
-  ["auto_parts", ["auto", "car part", "vehicle", "tyre", "tire", "engine", "industrial", "machinery", "tool"]],
-  ["toys", ["toy", "game", "puzzle", "hobby", "lego", "board game", "model kit"]],
-  ["sports", ["sport", "outdoor", "camping", "fitness", "bike", "bicycle", "gym", "ski", "golf"]],
-  ["pet", ["pet ", "dog", "cat ", "animal feed", "aquarium"]],
-  ["books_media", ["book", "magazine", "vinyl", "media", "stationery", "print"]],
+  ["jewellery", ["jewel*", "watch", "ring", "necklace", "diamond", "gold"]],
+  ["auto_parts", ["auto", "automotive", "car part", "vehicle", "tyre", "tire", "engine", "industrial", "machinery", "tool"]],
+  ["toys", ["toy", "game", "puzzle", "hobby", "hobbies", "lego", "board game", "model kit"]],
+  ["sports", ["sport*", "outdoor", "camping", "fitness", "bike", "bicycle", "gym", "ski", "golf"]],
+  ["pet", ["pet", "dog", "cat", "animal feed", "aquarium"]],
+  ["books_media", ["book", "magazine", "vinyl", "media", "stationery", "print*"]],
 ];
+
+const _esc = (w) => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const _KW_RE = KEYWORDS.map(([key, words]) => [key, words.map((w) => (
+  w.endsWith("*")
+    ? new RegExp(`(^|[^a-z0-9])${_esc(w.slice(0, -1))}`)
+    : new RegExp(`(^|[^a-z0-9])${_esc(w)}(s|es)?($|[^a-z0-9])`)))]);
 
 export function classifyIndustryLocally(text) {
   const t = String(text || "").toLowerCase();
   if (!t.trim()) return null;
-  for (const [key, words] of KEYWORDS) {
-    if (words.some((w) => t.includes(w))) return key;
+  for (const [key, res] of _KW_RE) {
+    if (res.some((re) => re.test(t))) return key;
   }
   return null;
 }

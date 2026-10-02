@@ -77,7 +77,10 @@ def find_jumps(samples: list, *, min_units: int = MIN_JUMP_UNITS) -> list:
     for (t0, v0), (t1, v1) in zip(pts, pts[1:]):
         jump = v1 - v0
         if jump >= max(1, min_units):
-            out.append({"at": t1.isoformat(), "date": t1.date().isoformat(),
+            # The STORE's day (store_clock): t1 is UTC, and a delivery counted at 9pm
+            # Eastern belongs to that day, not the next.
+            import store_clock as _CLOCK
+            out.append({"at": t1.isoformat(), "date": _CLOCK.local_date(t1).isoformat(),
                         "before": v0, "after": v1, "jump": jump})
     return out
 

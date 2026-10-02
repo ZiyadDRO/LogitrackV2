@@ -77,6 +77,18 @@ def monthly_index(df, *, date_col="ds", value_col="y", shrink=True):
     except AttributeError:
         out["basis"] = "no-dates"
         return out
+    if len(df) >= MIN_DAYS_FOR_OWN:
+        # Growth out first (trend.py): measured across two Decembers, growth is year-on-
+        # year change; left in, a growing product's later months read as its busy season.
+        try:
+            import trend as _TR
+            # short_mode "none": only growth measured across repeated months is taken
+            # out. Within a single year a straight line would tilt a real season.
+            df = _TR.detrend(df.assign(**{value_col: df[value_col].fillna(0)}),
+                             date_col=date_col, value_col=value_col, short_mode="none")
+            months = df[date_col].dt.month.tolist()
+        except Exception:                               # noqa: BLE001 — keep the raw index
+            pass
     vals = [float(v or 0) for v in df[value_col].fillna(0).tolist()]
     out["days"] = len(vals)
     out["years"] = round(len(vals) / 365.0, 2)
@@ -223,6 +235,154 @@ def future_multipliers(future_dates, idx, *, coverage=1.0, min_strength=MIN_STRE
             continue
         out.append(round(idx[m - 1] / cov, 4))
     return out
+
+
+def daily_index(dates, idx, *, min_strength=MIN_STRENGTH):
+    """The monthly index as a smooth daily curve: each month's value sits mid-month and the
+    days between move in a straight line from one to the next (December runs into January).
+    A step at every 1st of the month would jump a slow seller's rate overnight. All 1.0 when
+    the index is too flat to act on."""
+    if not idx or strength(idx) < min_strength:
+        return [1.0] * len(dates)
+    out = []
+    for d in dates:
+        try:
+            t = _dt.date.fromisoformat(str(d)[:10])
+        except ValueError:
+            out.append(1.0)
+            continue
+        m = t.month - 1
+        mid = _dt.date(t.year, t.month, 15)
+        if t >= mid:
+            nxt = (m + 1) % 12
+            nd = _dt.date(t.year + (1 if m == 11 else 0), nxt + 1, 15)
+            f = (t - mid).days / max((nd - mid).days, 1)
+            v = idx[m] * (1 - f) + idx[nxt] * f
+        else:
+            prv = (m - 1) % 12
+            pdm = _dt.date(t.year - (1 if m == 0 else 0), prv + 1, 15)
+            f = (t - pdm).days / max((mid - pdm).days, 1)
+            v = idx[prv] * (1 - f) + idx[m] * f
+        out.append(round(max(v, 1e-6), 4))
+    return out
+
+
+# SAME WEEKS IN PAST YEARS. For a slow seller with enough of its own history, the coming
+# weeks are forecast from the same weeks in past years (each day the average of the 4 weeks
+# around it, so one lucky sale doesn't set the order), each year scaled by how the last 6
+# months compare with the same 6 months that year. Up to 3 past years are averaged, so one
+# year's luck (a blizzard week, a lucky bulk order) counts for a third, not all of it. That
+# growth is pulled toward "no change" when the units behind it are few, and kept between a
+# third and 3x. Not used:
+#   - until the product has sold for a year and a half (the 6 months a year ago must be real
+#     selling months, not its launch);
+#   - when nothing sold in the last 13 weeks (a product going quiet is left to the rate), or
+#     it was out of stock most of the last 4 weeks (its pace now can't be seen);
+#   - when the last 4 weeks and the last 6 months tell different stories (more than 2x
+#     apart): something changed lately, and the recent rate follows it better.
+# Tested on 837 slow-seller forecasts from three simulated stores: 68% total miss with the
+# month-by-month scaling it replaces, 36% with the season taken out of the rate alone,
+# 23% with one past year.
+YOY_GROWTH_DAYS = 182
+YOY_SMOOTH_DAYS = 14        # each side of the day a year ago
+YOY_SHRINK_UNITS = 30.0
+YOY_MIN_GROWTH, YOY_MAX_GROWTH = 1 / 3, 3.0
+YOY_MAX_YEARS = 3
+YOY_RECENT_DAYS = 28
+YOY_RECENT_AGREE = 2.0
+# With a strong season (strength >= this) past years' weeks carry the forecast alone; with
+# a mild one they are averaged half and half with the rate (the seasonal detail matters less
+# and a year of one slow seller's sales is noisy).
+YOY_STRONG = 0.5
+
+
+def _growth(s, end, days, years_back):
+    """This product's pace over `days` ending at `end`, against the same days `years_back`
+    years earlier, pulled toward 1 when the units are few. None when either side is thin."""
+    import pandas as _pd
+    import numpy as _np
+    w, off = _pd.Timedelta(days=days), _pd.Timedelta(days=364 * years_back)
+    ty = s[(s.index > end - w) & (s.index <= end)]
+    ly = s[(s.index > end - w - off) & (s.index <= end - off)]
+    if len(ty) < min(20, days // 2) or len(ly) < min(20, days // 2):
+        return None
+    tr, lr = float(ty.mean()), float(ly.mean())
+    if lr <= 0:
+        return 1.0
+    n = min(float(ty.sum()), float(ly.sum()))
+    g = float(_np.exp(_np.log(max(tr / lr, 1e-6)) * n / (n + YOY_SHRINK_UNITS)))
+    return float(_np.clip(g, YOY_MIN_GROWTH, YOY_MAX_GROWTH))
+
+
+def _recent_agrees(s, now, g):
+    """Would last year's same 4 weeks, at this year's pace, have called the last 4 weeks?
+    False when the actual units are less than half or more than double that, by more than
+    chance (a product fading out, or taking off, lately)."""
+    import pandas as _pd
+    import numpy as _np
+    w, off = _pd.Timedelta(days=YOY_RECENT_DAYS), _pd.Timedelta(days=364)
+    got = s[(s.index > now - w) & (s.index <= now)]
+    was = s[(s.index > now - w - off) & (s.index <= now - off)]
+    if len(got) < 7 or len(was) < 7:
+        return True
+    exp_ = float(was.mean()) * g * len(got)
+    act = float(got.sum())
+    sd = _np.sqrt(2.0 * max(exp_, 1.0))
+    if act * YOY_RECENT_AGREE < exp_ and exp_ - act > 2 * sd:
+        return False
+    if act > YOY_RECENT_AGREE * exp_ and act - exp_ > 2 * sd:
+        return False
+    return True
+
+
+def same_weeks_last_year(df, future_dates, *, date_col="ds", value_col="y"):
+    """{"daily": [...], "growth": g (last year's), "years": k, "lastYear": units, "recent":
+    units} or None when not usable (see the note above)."""
+    if df is None or not len(df) or not len(future_dates):
+        return None
+    import pandas as _pd
+    import numpy as _np
+    s = _pd.Series(_pd.to_numeric(df[value_col], errors="coerce").fillna(0.0).to_numpy(float),
+                   index=_pd.to_datetime(df[date_col]).dt.normalize()).groupby(level=0).sum()
+    first, last = s.index.min(), s.index.max()
+    fut = _pd.to_datetime(list(future_dates)).normalize()
+    if first > last - _pd.Timedelta(days=364 + YOY_GROWTH_DAYS):
+        return None
+    if float(s[s.index > last - _pd.Timedelta(days=91)].sum()) <= 0:
+        return None
+    # Its recent pace has to be visible: out of stock most of the last 4 weeks (a product
+    # not being reordered) means last year's weeks can't be checked against now.
+    _now = max(last, fut[0] - _pd.Timedelta(days=1))
+    if int((s.index > _now - _pd.Timedelta(days=YOY_RECENT_DAYS)).sum()) < YOY_RECENT_DAYS // 2:
+        return None
+    years = []
+    for k in range(1, YOY_MAX_YEARS + 1):
+        if first > last - _pd.Timedelta(days=364 * k + YOY_GROWTH_DAYS):
+            break
+        g = _growth(s, last, YOY_GROWTH_DAYS, k)
+        if g is None:
+            break
+        if k == 1 and not _recent_agrees(s, _now, g):
+            return None
+        daily = []
+        for d in fut:
+            a = d - _pd.Timedelta(days=364 * k + YOY_SMOOTH_DAYS)
+            b = d - _pd.Timedelta(days=364 * k - YOY_SMOOTH_DAYS)
+            v = s[(s.index >= a) & (s.index <= b)]
+            daily.append(float(v.mean()) if len(v) >= 7 else _np.nan)
+        daily = _np.asarray(daily, float)
+        if _np.isnan(daily).all():
+            break
+        daily = _np.where(_np.isnan(daily), _np.nanmean(daily), daily)
+        years.append((daily, g))
+    if not years:
+        return None
+    out = _np.mean([d * g for d, g in years], axis=0)
+    ly, g1 = years[0]
+    n30 = min(30, len(out))
+    return {"daily": out.tolist(), "growth": round(g1, 3), "years": len(years),
+            "lastYear": round(float(ly[:n30].sum()), 1), "days": n30,
+            "recent": round(float(s[s.index > last - _pd.Timedelta(days=YOY_GROWTH_DAYS)].sum()), 1)}
 
 
 def resolve(df, peer_frames=None, *, date_col="ds", value_col="y"):

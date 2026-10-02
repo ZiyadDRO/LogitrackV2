@@ -343,8 +343,10 @@ User input: "${nlText.trim()}"`;
     }
   };
 
-  const confirmNlEvent = () => {
-    if (!nlParsed) return;
+  // Build events WITHOUT adding them, so Save can pick up one that's filled in but
+  // wasn't added yet. Returns null when there's nothing complete to build.
+  const buildNlEvent = () => {
+    if (!nlParsed || !nlParsed.date || !nlParsed.type) return null;
     const ev = { type: nlParsed.type, date: nlParsed.date, label: nlParsed.label || "" };
     if (nlParsed.new_price)     ev.new_price    = parseFloat(nlParsed.new_price);
     if (nlParsed.end_date)      ev.end_date     = nlParsed.end_date;
@@ -353,24 +355,19 @@ User input: "${nlText.trim()}"`;
       Object.assign(ev, multibuyFields(nlParsed.buy_qty, nlParsed.get_qty));
       if (!ev.end_date) ev.end_date = ev.date;
     }
-    setLocalEvents(prev => [...prev, ev].sort((a, b) => a.date.localeCompare(b.date)));
-    setNlMode(false); setNlText(""); setNlParsed(null); setNlError(null);
+    return ev;
   };
-
-  const addEvent = () => {
-    if (!form.date) return;
+  const buildFormEvent = () => {
+    if (!adding || !form.date) return null;
     if (adding === "multibuy") {
       const buy = parseInt(form.buy_qty || "1", 10), get = parseInt(form.get_qty || "1", 10);
-      if (!(buy > 0) || !(get > 0)) return;
-      const ev = { type: "promotion", date: form.date, end_date: form.end_date || form.date,
-                   ...multibuyFields(buy, get), ...(form.label ? { label: form.label } : {}) };
-      setLocalEvents(prev => [...prev, ev].sort((a, b) => a.date.localeCompare(b.date)));
-      setAdding(null); setForm({});
-      return;
+      if (!(buy > 0) || !(get > 0)) return null;
+      return { type: "promotion", date: form.date, end_date: form.end_date || form.date,
+               ...multibuyFields(buy, get), ...(form.label ? { label: form.label } : {}) };
     }
     const ev = { type: adding, date: form.date, label: form.label || "" };
     if (adding === "price_change_permanent" || adding === "price_change_temporary") {
-      if (!form.new_price) return;
+      if (!form.new_price) return null;
       ev.new_price = parseFloat(form.new_price);
       if (adding === "price_change_temporary") ev.end_date = form.end_date || form.date;
     }
@@ -378,9 +375,48 @@ User input: "${nlText.trim()}"`;
       ev.end_date = form.end_date || form.date;
       if (form.discount_pct) ev.discount_pct = parseFloat(form.discount_pct);
     }
-    setLocalEvents(prev => [...prev, ev].sort((a, b) => a.date.localeCompare(b.date)));
+    return ev;
+  };
+  const withEvent = (list, ev) => [...list, ev].sort((a, b) => a.date.localeCompare(b.date));
+
+  const confirmNlEvent = () => {
+    const ev = buildNlEvent();
+    if (!ev) return;
+    setLocalEvents(prev => withEvent(prev, ev));
+    setNlMode(false); setNlText(""); setNlParsed(null); setNlError(null);
+  };
+
+  const addEvent = () => {
+    const ev = buildFormEvent();
+    if (!ev) return;
+    setLocalEvents(prev => withEvent(prev, ev));
     setAdding(null);
     setForm({});
+  };
+
+  /* Save used to send only the list, so an event filled in but not yet added, or one the
+     AI parsed and you hadn't confirmed, was silently dropped. Both are saved now; a half
+     filled-in one stops the save and says what's missing. */
+  const [saveNote, setSaveNote] = useState(null);
+  const handleSave = () => {
+    let list = localEvents;
+    if (adding) {
+      const ev = buildFormEvent();
+      const typed = Object.entries(form).some(([k, v]) =>
+        v !== "" && v != null && !(adding === "multibuy" && (k === "buy_qty" || k === "get_qty")));
+      if (ev) list = withEvent(list, ev);
+      else if (typed) {
+        setSaveNote("The event you're adding isn't complete (it needs a date" +
+          (adding.startsWith("price_change") ? " and a new price" : "") + "). Finish it or cancel it, then save.");
+        return;
+      }
+    }
+    if (nlMode && nlParsed) {
+      const ev = buildNlEvent();
+      if (ev) list = withEvent(list, ev);
+    }
+    setSaveNote(null);
+    onSave(list);
   };
 
   const removeEvent = (i) => setLocalEvents(prev => prev.filter((_, idx) => idx !== i));
@@ -454,7 +490,7 @@ User input: "${nlText.trim()}"`;
           <p className={`text-[14px] ${muted} mt-1`}>Declare planned price changes and promotions. These only shape the forecast{lastRecordedDate ? ` for days after ${isoToDisplay(lastRecordedDate)}` : ""}. Recorded sales and prices are never changed.</p>
           {holidays.length > 0 && (
             <p className={`text-[14px] ${muted} mt-1.5`}>
-              Holidays are already counted on their own dates ({holidays.slice(0, 3).map(h => `${h.name} ${h.pct > 0 ? "+" : ""}${h.pct}%`).join(", ")}{holidays.length > 3 ? ", …" : ""}). Enter only the deal you run, not the holiday itself.
+              Holidays already shape how this product's sales spread over their days ({holidays.slice(0, 3).map(h => h.name).join(", ")}{holidays.length > 3 ? ", …" : ""}). Enter only the deal you run, not the holiday itself.
             </p>
           )}
         </div>
@@ -622,8 +658,11 @@ User input: "${nlText.trim()}"`;
         )}
         </div>
 
+        {saveNote && (
+          <p className={`mt-3 text-[14px] leading-relaxed rounded-lg border p-2 ${"text-[var(--t-warn)] bg-[var(--t-warn-soft)] border-[var(--t-warn-line)]"}`}>{saveNote}</p>
+        )}
         <div className={`flex gap-2 pt-4 border-t mt-4 shrink-0 ${"border-[var(--t-line)]"}`}>
-          <button onClick={() => onSave(localEvents)} className="flex-1 bg-[var(--t-accent-soft)] hover:bg-[var(--t-accent-soft)] text-[var(--t-ink)] text-[15px] font-bold py-2.5 rounded-xl transition-colors">Save & Update Forecast</button>
+          <button onClick={handleSave} className="flex-1 bg-[var(--t-accent-soft)] hover:bg-[var(--t-accent-soft)] text-[var(--t-ink)] text-[15px] font-bold py-2.5 rounded-xl transition-colors">Save & Update Forecast</button>
           <button onClick={onClose} className={`px-4 text-[15px] font-bold py-2.5 rounded-xl transition-colors ${"bg-[var(--t-panel)] border border-[var(--t-line2)] hover:bg-[var(--t-sunken)] text-[var(--t-soft)]"}`}>Cancel</button>
         </div>
       </div>

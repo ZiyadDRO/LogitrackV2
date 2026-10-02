@@ -25,6 +25,8 @@ Two consequences worth being honest about:
 from __future__ import annotations
 
 import datetime as _dt
+
+import store_clock as _CLOCK
 import json
 import os
 import threading
@@ -176,7 +178,8 @@ class StockLog:
             total = 0
             for s in skus:
                 for smp in self._samples.get(str(s), []):
-                    ts = str(smp.get("ts", ""))[:10]
+                    _ld = _CLOCK.local_date(smp.get("ts"))      # the store's day
+                    ts = _ld.isoformat() if _ld else ""
                     if not ts:
                         continue
                     total += 1

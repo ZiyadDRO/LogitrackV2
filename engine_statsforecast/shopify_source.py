@@ -114,6 +114,7 @@ ITEMS_PER_ORDER = 25
 
 _ORDERS_QUERY = f"""
 query($cursor: String, $q: String) {{
+  shop {{ ianaTimezone }}
   orders(first: {ORDERS_PER_PAGE}, after: $cursor, query: $q) {{
     pageInfo {{ hasNextPage endCursor }}
     nodes {{
@@ -150,15 +151,22 @@ def fetch_sales(shop=None, token=None, api_version=None, days=None) -> pd.DataFr
         q = f"created_at:>={since}"
 
     records, cursor = [], None
+    # The shop's own time zone, read in the same request as the orders (a separate call
+    # would cost a request for one field). Orders are timestamped in UTC, so taking the
+    # first 10 characters filed every order after 7-8pm US time under the NEXT day:
+    # weekday patterns skewed, and a Christmas Eve evening rush landed on Christmas Day.
+    shop_tz = None
     while True:
         body = _graphql(url, headers, _ORDERS_QUERY, {"cursor": cursor, "q": q})
+        if shop_tz is None:
+            shop_tz = _zone_or_none(((body.get("data") or {}).get("shop") or {}).get("ianaTimezone"))
         conn = (body.get("data") or {}).get("orders") or {}
         for order in conn.get("nodes", []):
             # Cancelled orders never completed — that's not demand. Refunds (returns) are
             # left in: the demand happened and the returned unit goes back to sellable stock.
             if order.get("cancelledAt"):
                 continue
-            day = (order.get("createdAt") or "")[:10]
+            day = _local_day(order.get("createdAt"), shop_tz)
             for li in (order.get("lineItems") or {}).get("nodes", []):
                 sku = li.get("sku") or li.get("title") or "UNKNOWN"
                 qty = li.get("quantity") or 0
@@ -195,12 +203,54 @@ def fetch_sales(shop=None, token=None, api_version=None, days=None) -> pd.DataFr
     # THE WINDOW ENDS AT THE LAST COMPLETE DAY — NOT TODAY. See the long note in
     # square_source.fetch_sales: filling through today asserts a full day of no sales for
     # a day that is still in progress, and the nightly sync runs minutes after midnight.
-    _last_complete = datetime.datetime.now().astimezone().date() - datetime.timedelta(days=1)
+    # "Yesterday" in the SHOP's time zone, not the server's.
+    _last_complete = _today_in(shop_tz) - datetime.timedelta(days=1)
     df = df[pd.to_datetime(df["date"]).dt.date <= _last_complete]
     if df.empty:
         raise ShopifyError(
             "Shopify returned orders, but none from a completed day yet.")
-    return _fill_zero_days(df, window_end=_last_complete)
+    out = _fill_zero_days(df, window_end=_last_complete)
+    out.attrs["shopify"] = {"timezone": shop_tz}
+    return out
+
+
+def _zone_or_none(name):
+    """A valid IANA zone name, or None."""
+    if not name:
+        return None
+    try:
+        from zoneinfo import ZoneInfo
+        ZoneInfo(str(name))
+        return str(name)
+    except Exception:                                   # noqa: BLE001
+        return None
+
+
+def _today_in(tz_name):
+    """Today in the shop's zone; without one, the machine's local date, as before."""
+    if tz_name:
+        from zoneinfo import ZoneInfo
+        return datetime.datetime.now(datetime.timezone.utc).astimezone(ZoneInfo(tz_name)).date()
+    return datetime.datetime.now().astimezone().date()
+
+
+def _local_day(created_at, tz_name) -> str:
+    """The shop's calendar day an order belongs to. createdAt is ISO 8601 in UTC
+    ("2026-12-25T01:30:00Z" is Christmas Eve evening in New York). Without a known zone
+    the UTC day is kept, which is what this did before."""
+    raw = str(created_at or "")
+    if not raw:
+        return ""
+    if not tz_name:
+        return raw[:10]
+    try:
+        from zoneinfo import ZoneInfo
+        t = datetime.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=datetime.timezone.utc)
+        return t.astimezone(ZoneInfo(tz_name)).date().isoformat()
+    except (ValueError, TypeError):
+        return raw[:10]
 
 
 def _fill_zero_days(df: pd.DataFrame, window_end=None) -> pd.DataFrame:
@@ -252,6 +302,117 @@ def _dec(x):
         return None
 
 
+# Shopify refuses any single query whose ESTIMATED cost is over 1,000 points, before
+# running it. The estimate multiplies down the tree: a connection costs 2 plus `first`
+# times what each node costs. products(first: 100) × variants(first: 100) came to about
+# 30,000 points, so the catalogue read failed on every store (and with it the stock,
+# cost and live-price prefill). Pages are sized to stay well under the limit, and a
+# product with more variants than one page holds is finished with its own query.
+MAX_QUERY_COST = 1000
+PRODUCTS_PAGE = 8
+VARIANTS_PAGE = 20
+MORE_VARIANTS_PAGE = 100
+
+_VARIANT_FIELDS = """
+              sku
+              inventoryQuantity
+              price
+              compareAtPrice
+              inventoryItem { unitCost { amount } }"""
+
+CATALOG_QUERY = f"""
+    query($cursor: String) {{
+      products(first: {PRODUCTS_PAGE}, after: $cursor) {{
+        pageInfo {{ hasNextPage endCursor }}
+        nodes {{
+          id
+          productType
+          variants(first: {VARIANTS_PAGE}) {{
+            pageInfo {{ hasNextPage endCursor }}
+            nodes {{{_VARIANT_FIELDS}
+            }}
+          }}
+        }}
+      }}
+    }}"""
+
+MORE_VARIANTS_QUERY = f"""
+    query($id: ID!, $cursor: String) {{
+      product(id: $id) {{
+        variants(first: {MORE_VARIANTS_PAGE}, after: $cursor) {{
+          pageInfo {{ hasNextPage endCursor }}
+          nodes {{{_VARIANT_FIELDS}
+          }}
+        }}
+      }}
+    }}"""
+
+
+def estimate_query_cost(query: str) -> int:
+    """Shopify's requested-cost estimate for a query, the way its docs and engineering
+    notes describe it: scalars and enums 0, every object 1, and a connection 2 plus
+    `first` times the cost of one node (pageInfo counted once, not per node). Lists of
+    objects are counted as one object, so this can only err low on those, never high on
+    connections.
+
+    A small parser over the selection set, good enough for the queries in this module;
+    the test runs the catalogue queries through it so they can't drift over the limit."""
+    import re
+    toks = re.findall(r"[A-Za-z_][A-Za-z0-9_]*|\{|\}|\([^)]*\)", query)
+    pos = 0
+
+    def fields():
+        """[(name, args, cost)] for one selection set; `cost` includes the field itself."""
+        nonlocal pos
+        out = []
+        while pos < len(toks) and toks[pos] != "}":
+            name = toks[pos]; pos += 1
+            args = ""
+            if pos < len(toks) and toks[pos].startswith("("):
+                args = toks[pos]; pos += 1
+            if pos < len(toks) and toks[pos] == "{":
+                pos += 1
+                kids = fields()
+                pos += 1                                  # the closing brace
+                m = re.search(r"\b(?:first|last)\s*:\s*(\d+)", args)
+                if m:                                     # a connection
+                    per_node = sum(c for n, _, c in kids if n in ("nodes", "edges"))
+                    rest = sum(c for n, _, c in kids if n not in ("nodes", "edges"))
+                    out.append((name, args, 2 + int(m.group(1)) * max(per_node, 1) + rest))
+                elif name == "edges":
+                    out.append((name, args, sum(c for _, _, c in kids)))
+                else:                                     # an object (or the node list)
+                    out.append((name, args, 1 + sum(c for _, _, c in kids)))
+            else:
+                out.append((name, args, 0))               # a scalar
+        return out
+
+    while pos < len(toks) and toks[pos] != "{":           # skip "query(...)"
+        pos += 1
+    pos += 1
+    return sum(c for _, _, c in fields())
+
+
+def _variant_meta(meta: dict, cat, v: dict) -> None:
+    sku = v.get("sku")
+    if not sku:
+        return
+    meta[sku] = {"category": cat, "stock": v.get("inventoryQuantity"),
+                 "cost": _money(v, "inventoryItem", "unitCost", "amount")}
+    # Shopify's own sale mechanism: `price` is what the customer pays and
+    # `compareAtPrice`, when higher, is the original the storefront shows
+    # struck through. No end date — Shopify doesn't keep one on the
+    # variant — so a sale is treated as running until a sync sees it stop.
+    price = _dec(v.get("price"))
+    compare = _dec(v.get("compareAtPrice"))
+    if price is not None and price > 0:
+        listed = compare if (compare is not None and compare > price) else price
+        meta[sku].update({"listPrice": round(listed, 2),
+                          "currentPrice": round(price, 2)})
+        if listed > price:
+            meta[sku]["discountName"] = "Sale (compare-at price)"
+
+
 def fetch_catalog_meta(shop=None, token=None, api_version=None) -> dict:
     """Per-SKU category (productType), CURRENT inventory, and per-unit COST via the
     GraphQL Admin API. Returns {sku: {"category": str|None, "stock": int|None,
@@ -264,47 +425,25 @@ def fetch_catalog_meta(shop=None, token=None, api_version=None) -> dict:
     shop, token, ver, _ = _cfg(shop, token, api_version, None)
     url = f"https://{shop}.myshopify.com/admin/api/{ver}/graphql.json"
     headers = {"X-Shopify-Access-Token": token, "Content-Type": "application/json"}
-    query = """
-    query($cursor: String) {
-      products(first: 100, after: $cursor) {
-        pageInfo { hasNextPage endCursor }
-        nodes {
-          productType
-          variants(first: 100) {
-            nodes {
-              sku
-              inventoryQuantity
-              price
-              compareAtPrice
-              inventoryItem { unitCost { amount } }
-            }
-          }
-        }
-      }
-    }"""
     meta, cursor = {}, None
     while True:
-        body = _graphql(url, headers, query, {"cursor": cursor})
+        body = _graphql(url, headers, CATALOG_QUERY, {"cursor": cursor})
         conn = (body.get("data") or {}).get("products") or {}
         for p in conn.get("nodes", []):
             cat = p.get("productType") or None
-            for v in (p.get("variants") or {}).get("nodes", []):
-                sku = v.get("sku")
-                if sku:
-                    meta[sku] = {"category": cat, "stock": v.get("inventoryQuantity"),
-                                 "cost": _money(v, "inventoryItem", "unitCost", "amount")}
-                    # Shopify's own sale mechanism: `price` is what the customer pays and
-                    # `compareAtPrice`, when higher, is the original the storefront shows
-                    # struck through. No end date — Shopify doesn't keep one on the
-                    # variant — so a sale is treated as running until a sync sees it stop.
-                    price = _dec(v.get("price"))
-                    compare = _dec(v.get("compareAtPrice"))
-                    if price is not None and price > 0:
-                        listed = compare if (compare is not None and compare > price) else price
-                        meta[sku].update({"listPrice": round(listed, 2),
-                                          "currentPrice": round(price, 2)})
-                        if listed > price:
-                            meta[sku]["discountName"] = "Sale (compare-at price)"
+            variants = p.get("variants") or {}
+            for v in variants.get("nodes", []):
+                _variant_meta(meta, cat, v)
+            # A product with more variants than one page: finish it on its own.
+            vinfo = variants.get("pageInfo") or {}
+            vcursor = vinfo.get("endCursor")
+            while vinfo.get("hasNextPage") and p.get("id") and vcursor:
+                more = _graphql(url, headers, MORE_VARIANTS_QUERY, {"id": p["id"], "cursor": vcursor})
+                mv = (((more.get("data") or {}).get("product") or {}).get("variants")) or {}
+                for v in mv.get("nodes", []):
+                    _variant_meta(meta, cat, v)
+                vinfo = mv.get("pageInfo") or {}
+                vcursor = vinfo.get("endCursor")
         info = conn.get("pageInfo") or {}
         if info.get("hasNextPage"):
             cursor = info.get("endCursor")

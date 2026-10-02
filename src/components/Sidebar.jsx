@@ -3,9 +3,11 @@ import { urgencyLevel, URGENCY_STYLES, URGENCY_STYLES_LM, availabilityChip,
          statusInfo, SC_STATUS_KEY } from '../lib/helpers';
 
 // ─── SKU LIST ITEM ────────────────────────────
-export function SkuListItem({ sku, isActive, onClick, onDelete, reorderDays, hasOpenPO, indented = false, lm, secondaryAction, provisional, healthStatus, availability, samplerEnabled = true }) {
+export function SkuListItem({ sku, isActive, onClick, onDelete, reorderDays, hasOpenPO, indented = false, lm, secondaryAction, provisional, healthStatus, availability, samplerEnabled = true, leadTimeDays = null }) {
   // Baseline/young SKUs are provisional — never show a hard urgency badge for them.
-  const urgency = provisional ? "none" : urgencyLevel(reorderDays ?? null, hasOpenPO);
+  // The product's planned lead time sets its "due soon" band, as it does in the Fleet;
+  // without it a 3-day air line and a 60-day sea line shared one band and disagreed.
+  const urgency = provisional ? "none" : urgencyLevel(reorderDays ?? null, hasOpenPO, leadTimeDays);
   const us = lm ? URGENCY_STYLES_LM[urgency] : URGENCY_STYLES[urgency];
   const activeClass = lm
     ? "bg-[var(--t-accent-soft)] border-[var(--t-accent-line)] ring-1 ring-[var(--t-accent-line)]"
@@ -130,7 +132,7 @@ export function SkuListItem({ sku, isActive, onClick, onDelete, reorderDays, has
 // ─── FOLDER ROW ───────────────────────────────
 export function FolderRow({ folderId, folder, allFolders = {}, skuList, skuForecasts, openPOs, activeSku, onSelectSku, onDeleteSku,
                      onRename, onDelete, onToggleCollapse, onRemoveSkuFromFolder, onAddSubfolder, lm, scoreBySku = {}, depth = 0,
-                     availability = {}, samplerEnabled = true }) {
+                     availability = {}, samplerEnabled = true, leadTimeOf = null }) {
   const [editingName, setEditingName] = useState(false);
   const [nameVal, setNameVal]         = useState(folder.name);
   const [showMenu, setShowMenu]       = useState(false);
@@ -232,11 +234,13 @@ export function FolderRow({ folderId, folder, allFolders = {}, skuList, skuForec
               openPOs={openPOs} activeSku={activeSku} onSelectSku={onSelectSku} onDeleteSku={onDeleteSku}
               onRename={onRename} onDelete={onDelete} onToggleCollapse={onToggleCollapse}
               onRemoveSkuFromFolder={onRemoveSkuFromFolder} onAddSubfolder={onAddSubfolder} lm={lm} scoreBySku={scoreBySku} depth={depth + 1}
+              leadTimeOf={leadTimeOf}
               availability={availability} samplerEnabled={samplerEnabled} />
           ))}
           {folderSkus.map(({ sku, fc }) => (
             <SkuListItem key={sku.id} sku={sku} isActive={activeSku === sku.id} onClick={() => onSelectSku(sku.id)}
               onDelete={onDeleteSku} reorderDays={fc?.daysUntilReorder} hasOpenPO={!!openPOs[sku.id]} indented lm={lm}
+              leadTimeDays={leadTimeOf ? leadTimeOf(sku.id) : null}
               healthStatus={scoreBySku[sku.id]?.status}
               provisional={fc?.tooNew || fc?.young}
               availability={availability[sku.id]} samplerEnabled={samplerEnabled}

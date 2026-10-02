@@ -108,7 +108,9 @@ if ! "$PY" -c "import uvicorn, fastapi, multipart, pandas, numpy, openpyxl, prop
   fi
 fi
 
-if [ ! -f dist/index.html ] || find src public -type f -newer dist/index.html -print -quit | grep -q . || find package.json vite.config.js -newer dist/index.html -print -quit | grep -q .; then
+if [ ! -f dist/index.html ] || find src public -type f -newer dist/index.html -print -quit | grep -q . || find package.json vite.config.js .env.local -newer dist/index.html -print -quit 2>/dev/null | grep -q .; then
+  # .env.local is checked too: the Groq key is baked into the browser build, so a new
+  # key means nothing until the app is rebuilt with it.
   echo "Updating browser app files..."
   npm run build || { echo "Browser app build failed."; read -r -p "Press Enter to close..."; exit 1; }
 fi

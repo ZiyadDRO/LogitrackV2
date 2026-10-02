@@ -127,7 +127,15 @@ def public(conn: dict) -> dict:
         "secretHint": hint,
         "createdAt": conn.get("created_at"),
         "lastUsedAt": conn.get("last_used_at"),
+        # In use = synced into the catalog nightly and shown. Paused keeps the login and
+        # the store's products (set aside, see workspace.py) but stops the syncing.
+        "active": is_active(conn),
     }
+
+
+def is_active(conn: dict) -> bool:
+    """Connections saved before pausing existed have no flag: they are in use."""
+    return conn.get("active", True) is not False
 
 
 def list_all() -> list:
@@ -179,6 +187,31 @@ def upsert(source: str, label: str, creds: dict, connection_id: str | None = Non
             state["connections"].append(record)
         _save(state)
         return public(record)
+
+
+def list_active() -> list:
+    """The connections in use, browser-safe, most recently used first."""
+    return [c for c in list_all() if c.get("active")]
+
+
+def set_active(connection_id: str, active: bool) -> bool:
+    """Put a store in use or pause it. Only one store is in use at a time (the catalog
+    holds one store's products), so putting one in use pauses the others. Credentials are
+    never touched. Returns False when there is no such connection."""
+    with _lock:
+        state = _load()
+        found = False
+        for c in state["connections"]:
+            if c.get("id") == connection_id:
+                c["active"] = bool(active)
+                if active:
+                    c["last_used_at"] = _now()
+                found = True
+            elif active:
+                c["active"] = False
+        if found:
+            _save(state)
+        return found
 
 
 def touch(connection_id: str) -> None:

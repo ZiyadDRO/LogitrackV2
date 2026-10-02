@@ -169,7 +169,10 @@ def attribute(rows: list, bundle_map: dict) -> tuple:
         sku = str(r.get("sku"))
         day = str(r.get("date"))
         extra = added.get(day, {}).get(sku, 0.0)
-        if extra:
+        # Once per (day, component). The table can hold several rows for one product on
+        # one day (a sheet with a row per sale, before daily totals are made), and the
+        # kit's units used to be added to EVERY one of them.
+        if extra and (day, sku) not in seen:
             r = {**r, "units_sold": float(r.get("units_sold") or 0) + extra,
                  "bundle_units": extra}
             seen.add((day, sku))

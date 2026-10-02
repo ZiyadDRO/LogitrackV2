@@ -42,7 +42,11 @@ def utcnow() -> _dt.datetime:
 
 
 def today(now=None) -> _dt.date:
-    return (now or utcnow()).date()
+    """The STORE's calendar day (store_clock). This was the UTC date, so for a US store a
+    week was declared finished and graded on Saturday evening, before Saturday's sales
+    were in; Saturday counted as zero and was never re-graded."""
+    import store_clock as _CLOCK
+    return _CLOCK.local_date(now or utcnow())
 
 
 def _d(x) -> _dt.date:
@@ -90,21 +94,33 @@ def next_origin(now=None, cadence: str = WEEKLY) -> _dt.date:
 # ── entries ──────────────────────────────────────────────────────────────────────────
 
 
-def entry_id(sku: str, origin, horizon_days: int) -> str:
+def entry_id(sku: str, origin, horizon_days: int, store=None) -> str:
     """Deterministic, so re-snapshotting the same period is a no-op rather than a
-    duplicate. This is what makes rule 1 enforceable."""
-    return f"{sku}|{_iso(origin)}|{int(horizon_days)}"
+    duplicate. This is what makes rule 1 enforceable. Prefixed with the store it was
+    made for, so two stores selling the same product code keep one record each."""
+    base = f"{sku}|{_iso(origin)}|{int(horizon_days)}"
+    return f"{store}:{base}" if store else base
 
 
 def make_entry(sku: str, origin, horizon_days: int, predicted: float,
                lo=None, hi=None, band: int = 80, *, model=None,
-               lead_days=None, coverage_days=None, sku_name=None, now=None) -> dict:
+               lead_days=None, coverage_days=None, sku_name=None, now=None,
+               count_from=None, daily=None, band_stats=None, store=None) -> dict:
     origin_d = _d(origin)
     h = int(horizon_days)
+    due_d = origin_d + _dt.timedelta(days=h - 1)
+    # The first day actually forecast and graded. Normally the origin. Later only when
+    # the week was sealed late (the app wasn't running on Sunday): by then the forecast
+    # starts after the days already sold, so those days are left out of BOTH sides of
+    # the comparison rather than grading Monday's forecast against Sunday's sales.
+    cf = max(origin_d, min(_d(count_from), due_d)) if count_from else origin_d
     return {
         "week": origin_d.isoformat(),
         "month": month_of_week(origin_d),
-        "id": entry_id(sku, origin_d, h),
+        "id": entry_id(sku, origin_d, h, store),
+        # Whose prediction this is: a saved store's connection id, or "sheets" for one
+        # sealed from spreadsheets with no store. Graded against that store's sales only.
+        "store": store,
         "sku": str(sku),
         "skuName": sku_name or str(sku),
         "origin": origin_d.isoformat(),
@@ -117,10 +133,18 @@ def make_entry(sku: str, origin, horizon_days: int, predicted: float,
         "dueAt": (origin_d + _dt.timedelta(days=h - 1)).isoformat(),
         "scorableFrom": (origin_d + _dt.timedelta(days=h)).isoformat(),
         "horizonDays": h,
+        "countFrom": cf.isoformat(),
+        "daysCounted": (due_d - cf).days + 1,
+        # Per-day expectation behind `predicted`, so a mid-week revision can keep the
+        # days already gone at what was originally expected.
+        "daily": daily or None,
         "predicted": round(float(predicted), 2),
         "lo": None if lo is None else round(float(lo), 2),
         "hi": None if hi is None else round(float(hi), 2),
         "band": int(band),
+        # What the week's range was built from (bands.total_band), kept so a revision
+        # rebuilds it by the same rule. Absent on entries sealed before that rule.
+        "bandStats": band_stats or None,
         "model": model,
         "leadDays": lead_days,
         "coverageDays": coverage_days,
@@ -209,6 +233,67 @@ def amend(entry: dict, new_predicted: float, reason: str, *, now=None,
     out["amended"] = True
     out["amendedAt"] = (now or utcnow()).isoformat()
     out["amendReason"] = str(reason or "").strip() or "revised"
+    return out
+
+
+def revise_days(entry: dict, factors: dict, reason: str, *, now=None) -> dict:
+    """Scale chosen days of a sealed week, keeping every other day as it was sealed.
+
+    `factors`: {date: (factor, new_price)}. Used when the price a day was forecast at
+    stops being the price it will sell at: a promotion saved mid-week, or the shelf price
+    changing without warning. The day keeps its ORIGINAL forecast and takes only the price
+    effect on top, so the week still grades the forecast made at the start of it, not one
+    remade with the days since in view. Days not named are untouched, including every day
+    already sold.
+
+    Returns the entry unchanged when nothing moves; otherwise a revision via `amend`, with
+    the change added to `revisions` so every step stays visible.
+    """
+    daily = [dict(d) for d in (entry.get("daily") or [])]
+    if not daily or not factors:
+        return entry
+    touched, moved = [], False
+    for d in daily:
+        f = factors.get(d["d"])
+        if f is None:
+            continue
+        factor, new_price = f
+        factor = float(factor)
+        if abs(factor - 1.0) > 1e-6:
+            moved = True
+            d["y"] = round(float(d["y"]) * factor, 3)
+            d["lo"] = round(float(d.get("lo") or 0.0) * factor, 3)
+            d["hi"] = round(float(d.get("hi") or 0.0) * factor, 3)
+        if new_price is not None:
+            d["price"] = round(float(new_price), 4)
+        touched.append(d["d"])
+    if not touched:
+        return entry
+    if not moved:
+        # The price moved but this product's forecast doesn't respond to price: remember
+        # the new price so the same change isn't found again, and change nothing else.
+        out = dict(entry)
+        out["daily"] = daily
+        return out
+    point = sum(float(d["y"]) for d in daily)
+    lo = hi = None
+    if entry.get("lo") is not None and entry.get("hi") is not None:
+        bs = entry.get("bandStats")
+        if bs:
+            import bands as _BANDS
+            lo, hi = _BANDS.total_band(point, [float(d.get("lo") or 0) for d in daily],
+                                       [float(d.get("hi") or 0) for d in daily],
+                                       level_sd=bs.get("levelSd") or 0.0, ref_mean=bs.get("refMean"),
+                                       rho=bs.get("rho") or 0.0, band_pct=entry.get("band") or 80)
+        else:
+            # Sealed before bands.py: revised by the rule it was sealed with.
+            lo = max(0.0, point - sum(float(d.get("lo") or 0) ** 2 for d in daily) ** 0.5)
+            hi = point + sum(float(d.get("hi") or 0) ** 2 for d in daily) ** 0.5
+    out = amend(entry, point, reason, now=now, lo=lo, hi=hi)
+    out["daily"] = daily
+    out["revisions"] = list(entry.get("revisions") or []) + [{
+        "at": (now or utcnow()).isoformat(), "reason": reason, "days": touched,
+        "before": entry.get("predicted"), "after": out["predicted"]}]
     return out
 
 
@@ -338,10 +423,21 @@ def by_week(entries: list, now=None) -> list:
             "pending": len(es) - len(scored),
             "due": sum(1 for x in es if not is_scored(x) and is_due(x, now)),
             "amended": sum(1 for x in es if x.get("amended")),
+            "revisions": sorted({r.get("reason") for x in es for r in (x.get("revisions") or [])
+                                 if r.get("reason")} | {x.get("amendReason") for x in es
+                                                        if x.get("amended") and not x.get("revisions")
+                                                        and x.get("amendReason")})[:6],
+            # Set when the week was sealed late: the first day that is actually counted.
+            "countedFrom": max((x.get("countFrom") or k for x in es), default=k) if any(
+                (x.get("countFrom") or k) > k for x in es) else None,
             "wape": acc["wape"], "bias": acc["bias"],
             "hitRate": cal["hitRate"], "band": (es[0].get("band") if es else 80),
             "inBand": sum(1 for x in scored if x.get("inBand")),
             "predicted": round(sum(float(x.get("predicted") or 0) for x in es), 1),
+            # What was forecast for the products GRADED so far, so "said X, sold Y" compares
+            # the same products. It summed every product's forecast against only the graded
+            # products' sales.
+            "predictedScored": round(sum(float(x.get("predicted") or 0) for x in scored), 1) if scored else None,
             "actual": round(sum(float(x.get("actual") or 0) for x in scored), 1) if scored else None,
             "status": ("scored" if scored and len(scored) == len(es)
                        else "partial" if scored
@@ -443,13 +539,19 @@ class ForecastLog:
         org = _d(origin) if origin else period_origin(now, cadence)
         added, skipped = [], []
         with self._lock:
+            # What's already sealed this period, by (store, product, horizon), whatever its
+            # id: weeks sealed before ids carried the store have the old id, and checking
+            # the id alone sealed a second copy of the same week.
+            have = {(e.get("store"), e.get("sku"), int(e.get("horizonDays") or 0))
+                    for e in self._entries.values() if e.get("origin") == org.isoformat()}
             for r in rows:
                 sku = r.get("sku")
                 h = int(r.get("horizonDays") or 0)
                 if not sku or h <= 0 or r.get("predicted") is None:
                     continue
-                eid = entry_id(sku, org, h)
-                if eid in self._entries:
+                eid = entry_id(sku, org, h, r.get("store"))
+                if (eid in self._entries or (r.get("store"), str(sku), h) in have
+                        or (None, str(sku), h) in have):
                     skipped.append(eid)         # already recorded for this period
                     continue
                 self._entries[eid] = make_entry(
@@ -457,14 +559,64 @@ class ForecastLog:
                     lo=r.get("lo"), hi=r.get("hi"), band=int(r.get("band") or 80),
                     model=r.get("model"), lead_days=r.get("leadDays"),
                     coverage_days=r.get("coverageDays"), sku_name=r.get("skuName"),
-                    now=now)
+                    now=now, count_from=r.get("countFrom"), daily=r.get("daily"),
+                    band_stats=r.get("bandStats"), store=r.get("store"))
                 added.append(eid)
             if added:
                 self.save()
         return {"origin": org.isoformat(), "added": len(added), "skipped": len(skipped),
                 "addedIds": added}
 
-    def score_due(self, actuals_fn, *, now=None) -> dict:
+    def for_store(self, store) -> list:
+        """One store's record (or "sheets")."""
+        return [e for e in self.all() if e.get("store") == store]
+
+    def stores(self) -> set:
+        return {e.get("store") for e in self.all()}
+
+    def claim_untagged(self, store) -> int:
+        """Entries sealed before the log recorded whose they were: file them under
+        `store`. Returns how many were claimed."""
+        n = 0
+        with self._lock:
+            for e in self._entries.values():
+                if "store" not in e or e.get("store") is None:
+                    e["store"] = store
+                    n += 1
+            if n:
+                self.save()
+        return n
+
+    def dedupe(self) -> int:
+        """Remove second copies of one week for one product (same store, week and
+        horizon), keeping the graded one, else the one sealed first. Returns how many
+        were removed."""
+        with self._lock:
+            groups = {}
+            for k, e in self._entries.items():
+                groups.setdefault((e.get("store"), e.get("sku"), e.get("origin"),
+                                   int(e.get("horizonDays") or 0)), []).append(k)
+            drop = []
+            for keys in groups.values():
+                if len(keys) < 2:
+                    continue
+                keys.sort(key=lambda k: (not is_scored(self._entries[k]),
+                                         self._entries[k].get("createdAt") or ""))
+                drop += keys[1:]
+            for k in drop:
+                del self._entries[k]
+            if drop:
+                self.save()
+        return len(drop)
+
+    def purge_store(self, store):
+        """Forget one store's record, keeping everyone else's."""
+        with self._lock:
+            self._entries = {k: e for k, e in self._entries.items() if e.get("store") != store}
+            self.save()
+        return self
+
+    def score_due(self, actuals_fn, *, now=None, select=None) -> dict:
         """Grade every entry whose window has closed.
 
         `actuals_fn(sku, window_start, window_end) -> float | None` supplies real units
@@ -476,8 +628,10 @@ class ForecastLog:
         graded, unavailable = [], []
         with self._lock:
             for e in self.due(now):
+                if select is not None and not select(e):
+                    continue
                 try:
-                    a = actuals_fn(e["sku"], e["windowStart"], e["dueAt"])
+                    a = actuals_fn(e["sku"], e.get("countFrom") or e["windowStart"], e["dueAt"])
                 except Exception:
                     a = None
                 if a is None:

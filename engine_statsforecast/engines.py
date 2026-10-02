@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import numpy as np
 import pandas as pd
+import trend as _TR
 
 Z80 = 1.2816
 UID = "series"
@@ -61,6 +62,29 @@ RECENT_CHECK_MIN_TRAIN = 56
 # this). One stretch let a single odd week swing the mix; three average it out, the same
 # way the slow-seller engine picks its model.
 RECENT_CHECK_WINDOWS = int(os.environ.get("LOGITRACK_RECENT_CHECK_WINDOWS", "3"))
+# The recent-sales side of the check reads sales lately AGAINST the season similar products
+# share (when they agree on one), so quiet weeks before a busy season aren't taken as "sales
+# have dropped". LOGITRACK_SEASON_CHECK=0 switches it off.
+# CHECKED AGAINST PAST YEARS. Prophet stores a season as a fixed number of units for each
+# time of year, learned across all its years. When a strongly seasonal product's sales jump
+# for good (a competitor closes, the store gets busier), the season can't grow with it, so
+# Prophet pushes its everyday level up to explain the bigger peak: after the season it stays
+# too high, and at the next peak it's too low. It also can't follow a season as sharp as six
+# weeks of Mother's Day potting mix. "The same weeks in past years, at this year's pace"
+# (seasonality.same_weeks_last_year) has neither problem. For products with a strong season
+# (strength >= seasonality.YOY_STRONG) and a year and a half of history, the last 3 four-week
+# stretches are hidden one at a time and forecast both ways from the history before them;
+# the forecast leans on each in proportion to how well it did, like the 4-week check.
+# LOGITRACK_PAST_YEARS_CHECK=0 switches it off.
+PAST_YEARS_CHECK = os.environ.get("LOGITRACK_PAST_YEARS_CHECK", "1").strip() not in ("0", "false", "no")
+PAST_YEARS_WINDOWS = 3
+PAST_YEARS_DAYS = 28
+PAST_YEARS_REACH = 364     # past years can say something about the next year; past that, Prophet alone
+PAST_YEARS_FADE = 30
+# How the yearly and weekly patterns combine with the level. "additive" adds a fixed number
+# of units per season; "multiplicative" scales with the level (see the note in fit()).
+PROPHET_SEASONALITY_MODE = os.environ.get("LOGITRACK_PROPHET_MODE", "additive")   # multiplicative tested: worse (24% vs 20% on 416 dev forecasts)
+SEASON_AWARE_CHECK = os.environ.get("LOGITRACK_SEASON_CHECK", "1").strip() not in ("0", "false", "no")
 
 
 def _damp_trend(fc, last_date, phi=None):
@@ -92,15 +116,40 @@ RECENT_HALF_LIFE = 10
 RECENT_PROFILE_DAYS = 56   # the weekday pattern comes from the last 8 weeks
 
 
-def _recent_level_forecast(frame, h, half_life=None):
+def _season_factors(dates, mo, strength=1.0):
+    """A smooth daily seasonal level from a 12-month index (mid-month anchors, straight lines
+    between), pulled toward 1 by `strength`. None when there is no index."""
+    if mo is None or strength <= 0:
+        return None
+    import seasonality as _S
+    v = np.asarray(_S.daily_index([str(pd.Timestamp(d).date()) for d in dates], list(map(float, mo)),
+                                  min_strength=0.0), dtype=float)
+    return 1.0 + float(strength) * (v - 1.0)
+
+
+def _recent_level_forecast(frame, h, half_life=None, season=None):
     """What "sales lately" says: a recent level times this product's usual weekday pattern,
     held flat. The level is an average of recent days in which each day's weight halves
     every RECENT_HALF_LIFE days, so a single busy or quiet day moves it a few percent, not
     the whole forecast. The weekday pattern comes from the last 8 weeks and scales with
-    the level (it can't push a quiet day below zero). Clipped at 0, never negative."""
+    the level (it can't push a quiet day below zero). Clipped at 0, never negative.
+
+    `season` = (monthly index, strength): "sales lately" is then read against the season,
+    so a quiet September before a busy winter isn't carried into the winter. Each past day
+    is divided by its seasonal level, the level is worked out from that, and the coming
+    days' seasonal level is put back on."""
     hl = float(half_life or RECENT_HALF_LIFE)
     d = frame[["ds", "y"]].sort_values("ds")
     y = np.clip(d["y"].to_numpy(dtype=float), 0.0, None)
+    _last = pd.to_datetime(d["ds"]).max() if len(d) else None
+    s_hist = s_fut = None
+    if season is not None and len(y):
+        s_hist = _season_factors(d["ds"], *season)
+        s_fut = _season_factors(pd.date_range(_last + pd.Timedelta(days=1), periods=int(h), freq="D"), *season)
+        if s_hist is not None and s_fut is not None and np.all(s_hist > 0) and np.all(s_fut > 0):
+            y = y / s_hist
+        else:
+            s_hist = s_fut = None
     wd = pd.to_datetime(d["ds"]).dt.weekday.to_numpy()
     if not len(y):
         return np.zeros(int(h))
@@ -122,7 +171,10 @@ def _recent_level_forecast(frame, h, half_life=None):
         lvl += a * (v - lvl)
     last = pd.to_datetime(d["ds"]).max()
     fwd = (pd.date_range(last + pd.Timedelta(days=1), periods=int(h), freq="D").weekday).to_numpy()
-    return np.clip(lvl * prof[fwd], 0.0, None)
+    out = lvl * prof[fwd]
+    if s_fut is not None:
+        out = out * s_fut
+    return np.clip(out, 0.0, None)
 
 
 # The recent-sales side of the 4-week check (named for what it does in the details).
@@ -185,7 +237,11 @@ def pooled_seasonal_indices(related):
     if related:
         wk_acc = {i: [] for i in range(7)}; mo_acc = {i: [] for i in range(12)}
         for r in related:
-            rr = r.dropna(subset=["y"])
+            # Each sibling's growth out first (trend.py), or a family of growing products
+            # hands a newcomer "later months are busier" as if it were a season.
+            # "none" under 13 months: the season a newcomer borrows keeps its full size
+            # unless growth can be measured cleanly (the same months in two years).
+            rr = _TR.detrend(r.dropna(subset=["y"]), short_mode="none")
             mu = float(rr["y"].mean()) or 1.0
             wd = rr["ds"].dt.weekday.to_numpy(); mn = rr["ds"].dt.month.to_numpy() - 1
             norm = rr["y"].to_numpy() / mu
@@ -208,7 +264,7 @@ def pooled_seasonal_indices(related):
     return wk, mo, resid_norm
 
 
-def pooled_monthly_cohesion(related, mo=None, min_months=6):
+def pooled_monthly_cohesion(related, mo=None, min_months=6, baseline_mo=None):
     """How much the siblings AGREE on an annual shape, in [0,1]: the mean Pearson
     correlation between each sibling's own monthly profile and the pooled centroid.
     A pool of flat (non-seasonal) or disagreeing siblings scores near 0, so the
@@ -216,7 +272,7 @@ def pooled_monthly_cohesion(related, mo=None, min_months=6):
     each covering ≥`min_months` of the year to return anything above 0."""
     profs = []
     for r in related:
-        rr = r.dropna(subset=["y"])
+        rr = _TR.detrend(r.dropna(subset=["y"]), short_mode="none")
         if not len(rr):
             continue
         mu = float(rr["y"].mean()) or 1.0
@@ -230,17 +286,27 @@ def pooled_monthly_cohesion(related, mo=None, min_months=6):
             profs.append(prof)
     if len(profs) < 2:
         return 0.0
-    centroid = np.asarray(mo, dtype=float) if mo is not None else np.nanmean(np.vstack(profs), axis=0)
+    if baseline_mo is not None and np.all(np.isfinite(np.asarray(baseline_mo, float))):
+        # The SPECIFIC scale, as grouping and routing use (router.distinct_corr): the
+        # store's average yearly shape out first, so siblings that only share what every
+        # product does (a Christmas bump across the whole store) don't count as agreeing.
+        bm = np.asarray(baseline_mo, float)
+        profs = [p - bm for p in profs]
+    # Every PAIR of siblings, as router._cohesion_for_ids does. Each sibling against the
+    # pooled average scored unrelated siblings around 1/sqrt(n) (0.5 for four), because
+    # the average contains the sibling itself: past the 0.35 bar on nothing at all.
     cors = []
-    for prof in profs:
-        m = ~np.isnan(prof) & ~np.isnan(centroid)
-        if m.sum() < min_months:
-            continue
-        a, b = prof[m], centroid[m]
-        if np.std(a) < 1e-9 or np.std(b) < 1e-9:
-            cors.append(0.0)          # a flat sibling contributes no seasonal agreement
-            continue
-        cors.append(float(np.corrcoef(a, b)[0, 1]))
+    for i in range(len(profs)):
+        for k in range(i + 1, len(profs)):
+            a, b = profs[i], profs[k]
+            m = ~np.isnan(a) & ~np.isnan(b)
+            if m.sum() < min_months:
+                continue
+            a, b = a[m], b[m]
+            if np.std(a) < 1e-9 or np.std(b) < 1e-9:
+                cors.append(0.0)      # a flat sibling contributes no seasonal agreement
+                continue
+            cors.append(float(np.corrcoef(a, b)[0, 1]))
     return float(max(0.0, np.mean(cors))) if cors else 0.0
 
 
@@ -299,8 +365,12 @@ class ProphetEngine:
     model_label = "Prophet"
 
     def fit(self, df, today, has_price, has_promo, last_price, events, related=None,
-            price_bounds=None, price_range=None, **_):
+            price_bounds=None, price_range=None, past_years_weight=None, baseline_mo=None, **_):
+        self._baseline_mo = baseline_mo
         from prophet import Prophet  # lazy
+        # A calibration refit passes the live forecast's past-years weight instead of
+        # re-running that check at every holdout (3 more Prophet fits each time).
+        self._py_given = past_years_weight
         self.today = pd.Timestamp(today)
         # (lo, hi): scheduled prices are forecast as if clamped into this range. Outside
         # it the price response was never observed, and the regressor is linear, so it
@@ -329,7 +399,10 @@ class ProphetEngine:
         def _build(with_price):
             mm = Prophet(yearly_seasonality=self._yearly_native, weekly_seasonality=days >= 14,
                          daily_seasonality=False, interval_width=0.80,
-                         changepoint_prior_scale=0.05)
+                         changepoint_prior_scale=0.05, seasonality_mode=PROPHET_SEASONALITY_MODE,
+                         # Prophet's own intervals are never used (the band comes from
+                         # conformal_offsets), and drawing them was most of every predict.
+                         uncertainty_samples=0)
             # Price enters as log(price / today's price), MULTIPLYING the forecast. A 10%
             # price change then moves demand by the same percentage on a quiet Tuesday
             # and a busy Saturday, which is how shoppers respond. As a plain additive
@@ -391,13 +464,22 @@ class ProphetEngine:
 
         # In-sample residuals → conformal band + safety-stock sigma.
         resid = fit_df["y"].to_numpy() - m.predict(fit_df)["yhat"].to_numpy()
+        self._blend_setup(related, days, fit_df)
         try:
             self._recent_check(fit_df, _build, self.has_price)
         except Exception:                                   # noqa: BLE001 — never fail a fit over it
             self._ets_w, self._ets_future, self._recent = 0.0, None, None
+        try:
+            self._past_years_check(fit_df, _build)
+        except Exception:                                   # noqa: BLE001
+            self._py_w, self._py_future, self._pastyears = 0.0, None, None
         self.residual_std = float(np.std(resid))
         self.residual_cv = self.residual_std / max(float(fit_df["y"].mean()), 1.0)
         self._q_lo, self._q_hi = conformal_offsets(resid, self.residual_std)
+        self.forecast_df = self._predict(self.events)
+        return self
+
+    def _blend_setup(self, related, days, fit_df):
 
         # ── Blended pooled yearly seasonality ─────────────────────────────────
         # An "established but under a year" SKU (≈180–450 days) runs on Prophet, but
@@ -411,12 +493,20 @@ class ProphetEngine:
         # seasonality from each other.
         self._blend_w = 0.0; self._blend_mo = None; self._blend_cohesion = None
         self._blend_resid_std = 0.0; self._blend_level = None
+        # The season the 4-week check reads recent sales against (see _recent_check): the
+        # same shape similar products share, at full strength once they agree on it.
+        self._check_season = None
         blend_related = [r for r in (related or []) if _frame_days(r) >= POOLED_YEARLY_DAYS]
         self._n_pool_relatives = len(blend_related)
         if not self._yearly_native and blend_related:
             _wk_p, mo_p, resid_norm = pooled_seasonal_indices(blend_related)
-            cohesion = pooled_monthly_cohesion(blend_related, mo_p)
+            cohesion = pooled_monthly_cohesion(blend_related, mo_p,
+                                               baseline_mo=getattr(self, "_baseline_mo", None))
             w = pooled_blend_weight(days, self._n_pool_relatives, cohesion)
+            if (SEASON_AWARE_CHECK and self._n_pool_relatives >= BLEND_MIN_RELATIVES
+                    and cohesion >= BLEND_MIN_COHESION and float(np.std(mo_p)) > 1e-6):
+                self._check_season = (mo_p, 0.5 + 0.5 * float(np.clip(
+                    (cohesion - BLEND_MIN_COHESION) / (1.0 - BLEND_MIN_COHESION), 0.0, 1.0)))
             if w > 0 and float(np.std(mo_p)) > 1e-6:
                 self._blend_w = w
                 self._blend_mo = mo_p
@@ -424,8 +514,13 @@ class ProphetEngine:
                 self._blend_resid_std = float(np.std(resid_norm)) if resid_norm else 0.0
                 self._blend_level = max(float(fit_df["y"].mean()), 1.0)
 
-        self.forecast_df = self._predict(self.events)
-        return self
+    def _blend_factor(self, dates):
+        """What apply_pooled_yearly multiplies Prophet's forecast by on `dates` (1 = none)."""
+        if getattr(self, "_blend_w", 0.0) <= 0 or getattr(self, "_blend_mo", None) is None:
+            return np.ones(len(dates))
+        mo = np.asarray(self._blend_mo, dtype=float)
+        mn = pd.to_datetime(pd.Series(dates)).dt.month.to_numpy() - 1
+        return 1.0 + self._blend_w * (mo[mn] - 1.0)
 
     def _log_price(self, prices):
         return np.log(np.clip(np.asarray(prices, dtype=float), 0.01, None) / float(getattr(self, "_pref", 1.0) or 1.0))
@@ -488,7 +583,8 @@ class ProphetEngine:
             mh.fit(train)
             frame = pd.concat([train.tail(1), test]).drop(columns=["y"])
             yp = np.clip(_damp_trend(mh.predict(frame), train["ds"].max())[1:], 0.0, None)
-            ye = _ets_forecast(train, H)[:len(test)]
+            yp = yp * self._blend_factor(test["ds"].to_numpy())[:len(yp)]
+            ye = _ets_forecast(train, H, season=getattr(self, "_check_season", None))[:len(test)]
             act = test["y"].to_numpy(dtype=float)
             wk = np.arange(len(act)) // 7
             wa = np.bincount(wk, act)
@@ -507,10 +603,69 @@ class ProphetEngine:
                         "tests": windows, **windows[0]}
         if w < 0.02:
             return
-        self._ets_future = _ets_forecast(fit_df, self.horizon)
+        self._ets_future = _ets_forecast(fit_df, self.horizon, season=getattr(self, "_check_season", None))
         self._ets_w = float(w)
         if w >= 0.5:
             self.model_label = "Prophet, adjusted to recent sales"
+
+    def _past_years_check(self, fit_df, build):
+        """Hide the last 3 four-week stretches one at a time, forecast each with Prophet and
+        with the same weeks in past years (from only the history before it), and weight the
+        past years by how much better they did (see PAST_YEARS_CHECK)."""
+        self._py_w, self._py_future, self._pastyears = 0.0, None, None
+        if not PAST_YEARS_CHECK or not getattr(self, "_yearly_native", False) or not self.horizon:
+            return
+        import seasonality as _S
+        if _S.monthly_index(fit_df)["strength"] < _S.YOY_STRONG:
+            return
+        fut_dates = _future_dates(self.last_date, self.horizon)
+        reach = min(len(fut_dates), PAST_YEARS_REACH)
+        future = _S.same_weeks_last_year(fit_df, fut_dates[:reach])
+        if future is None:
+            return
+        given = getattr(self, "_py_given", None)
+        if given is not None:
+            if given >= 0.02:
+                self._py_future, self._py_w = np.asarray(future["daily"], float), float(given)
+            return
+        H, n = PAST_YEARS_DAYS, len(fit_df)
+        miss_p, miss_y, windows = [], [], []
+        for k in range(1, PAST_YEARS_WINDOWS + 1):
+            cut = n - k * H
+            if cut < H:
+                break
+            train, test = fit_df.iloc[:cut], fit_df.iloc[cut:cut + H]
+            yy = _S.same_weeks_last_year(train, test["ds"].tolist())
+            if yy is None:
+                break
+            mh = build(False)
+            mh.fit(train)
+            frame = pd.concat([train.tail(1), test]).drop(columns=["y"])
+            yp = np.clip(_damp_trend(mh.predict(frame), train["ds"].max())[1:], 0.0, None)
+            ye = np.asarray(yy["daily"], float)[:len(test)]
+            act = test["y"].to_numpy(dtype=float)
+            wk = np.arange(len(act)) // 7
+            wa = np.bincount(wk, act)
+            miss_p += list(np.abs(wa - np.bincount(wk, yp)))
+            miss_y += list(np.abs(wa - np.bincount(wk, ye)))
+            windows.append({"actual": round(float(act.sum()), 1), "prophet": round(float(yp.sum()), 1),
+                            "pastYears": round(float(ye.sum()), 1)})
+        if len(windows) < PAST_YEARS_WINDOWS:
+            return
+        err_p, err_y = float(np.mean(miss_p)) / 7.0, float(np.mean(miss_y)) / 7.0
+        if err_p + err_y <= 0:
+            return
+        w = err_p ** 2 / (err_p ** 2 + err_y ** 2)
+        self._pastyears = {"days": H, "windows": len(windows), "prophetMissPerDay": round(err_p, 2),
+                           "pastYearsMissPerDay": round(err_y, 2), "pastYearsWeight": round(w, 2),
+                           "years": future.get("years"), "growth": future.get("growth"),
+                           "tests": windows, **windows[0]}
+        if w < 0.02:
+            return
+        self._py_future = np.asarray(future["daily"], float)
+        self._py_w = float(w)
+        if w >= 0.5:
+            self.model_label = "Prophet, adjusted to past years"
 
     def _predict(self, events, price_override=None, force_no_promo=False):
         f = self._future_exog(events, price_override, force_no_promo)
@@ -582,10 +737,21 @@ class ProphetEngine:
                 else:
                     _ref = ref
                 ratio = np.where(_ref > 1e-9, np.clip(yhat, 0, None) / np.where(_ref > 1e-9, _ref, 1.0), 1.0)
-            mixed = (1.0 - w_e) * np.clip(yhat, 0, None) + w_e * ets[:len(yhat)] * ratio
+            _e = ets[:len(yhat)] * ratio
+            if getattr(self, "_check_season", None) is not None:
+                _e = _e / self._blend_factor(fc["ds"].values[keep])
+            mixed = (1.0 - w_e) * np.clip(yhat, 0, None) + w_e * _e
             with np.errstate(divide="ignore", invalid="ignore"):
                 x_sd = np.where(np.clip(yhat, 0, None) > 1e-9, x_sd * mixed / np.clip(yhat, 1e-9, None), x_sd)
             yhat = mixed
+        w_y = getattr(self, "_py_w", 0.0)
+        py = getattr(self, "_py_future", None)
+        if w_y > 0 and py is not None and len(yhat):
+            m = min(len(py), len(yhat))
+            fade = np.clip((m - np.arange(m)) / float(PAST_YEARS_FADE), 0.0, 1.0) if m < len(yhat) else np.ones(m)
+            ww = w_y * fade
+            yhat = np.asarray(yhat, dtype=float).copy()
+            yhat[:m] = (1.0 - ww) * np.clip(yhat[:m], 0, None) + ww * py[:m]
         band = _band(fc["ds"].values[keep], yhat, self._q_lo, self._q_hi)
         if getattr(self, "_blend_w", 0.0) > 0 and getattr(self, "_blend_mo", None) is not None:
             band = apply_pooled_yearly(band, self._blend_mo, self._blend_w,
@@ -630,6 +796,17 @@ class ProphetEngine:
                 (f"Tested on its last 4 weeks: Prophet would have forecast {_p}, a model that follows "
                  f"recent sales {_e}, and it sold {_a}. Prophet called {'these tests' if _nw > 1 else 'it'} "
                  f"better, so the forecast is Prophet's."))}
+        py = getattr(self, "_pastyears", None)
+        if py and recent is None:
+            share = round(py["pastYearsWeight"] * 100)
+            _p, _e, _a = round(py["prophet"]), round(py["pastYears"]), round(py["actual"])
+            recent = {**py, "etsWeight": py["pastYearsWeight"], "text": (
+                (f"Tested on its last 4 weeks: Prophet would have forecast {_p}, the same weeks in past years "
+                 f"(at this year's pace) {_e}, and it sold {_a}. Over 3 back-to-back 4-week tests like this one, "
+                 f"the forecast comes out {share}% past years and {100 - share}% Prophet.")
+                if share >= 2 else
+                (f"Tested on its last 4 weeks: Prophet would have forecast {_p}, the same weeks in past years "
+                 f"{_e}, and it sold {_a}. Prophet called these tests better, so the forecast is Prophet's."))}
         return {"seasonality": seasonality, "recentCheck": recent,
                 "price": {"used": bool(self.has_price), "sensitivity": None,
                           "inverted": getattr(self, "_price_inverted", None),
@@ -666,7 +843,7 @@ class GlobalPooledEngine:
         wk, mo, resid_norm = pooled_seasonal_indices(related)
         self._wk, self._mo = wk, mo
 
-        # 2) Level: own recent mean if the SKU has real sales; else peer median level.
+        # 2) Level: own recent mean. Never another product's volume (see below).
         #    The own-sales level is SEASONALLY ADJUSTED before use: a new SKU's
         #    recent history is usually only a few weeks long and may sit entirely
         #    inside a high (or low) season. Averaging it raw and then multiplying by
@@ -705,12 +882,14 @@ class GlobalPooledEngine:
                     self._trend = slope
                     self._trend_anchor = max(float(intercept + slope * (n - 1)), 0.0)
                     self.trend_source = "own recent sales"
-        elif related:
-            self.level = float(np.median([float(r["y"].mean()) for r in related]))
-            self.level_source = "typical volume of related products"
         else:
-            self.level = float(own.mean()) if len(own) else 0.0
-            self.level_source = "own sales"
+            # HOW MUCH IT SELLS ALWAYS COMES FROM ITS OWN SALES. Similar products lend their
+            # seasonal shape, holidays and price response, never their volume: a product
+            # that has sat on the shelf 20 days without a sale, next to peers selling 6 a
+            # day, was forecast 185 units a month and would have been reordered. With no
+            # sales yet the forecast is 0 until it sells.
+            self.level = float(own.mean()) if len(own) and own.sum() > 0 else 0.0
+            self.level_source = "own sales" if self.level > 0 else "no sales yet"
 
         # 3) Band / sigma from pooled normalized residuals, scaled to this level.
         if resid_norm:
@@ -754,7 +933,10 @@ class GlobalPooledEngine:
                 "price": {"used": False, "sensitivity": None,
                           "text": "Forecast by similarity to related products; price isn't an input in this mode."},
                 "level": {"value": round(self.level, 1), "source": self.level_source,
-                          "text": f"Expected volume is set from {self.level_source}."},
+                          "text": ("It hasn't sold yet, so nothing is forecast until it does. Its volume "
+                                   "will come from its own sales, never from other products'."
+                                   if self.level_source == "no sales yet" else
+                                   f"Expected volume is set from {self.level_source}.")},
                 "trend": {"active": bool(self._trend), "perDay": round(self._trend, 3),
                           "text": (f"Recent sales are {'rising' if self._trend > 0 else 'falling'} "
                                    f"(~{abs(self._trend):.2f} units/day, seasonally adjusted); a damped growth "

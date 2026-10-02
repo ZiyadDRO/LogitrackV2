@@ -138,6 +138,21 @@ def run_launch_ramp():
         r._trend, fc[0], fc[60:120].max(), f._trend))
 
 
+def run_no_sales_borrows_no_volume():
+    """A product that hasn't sold yet is forecast 0, never at its peers' volume."""
+    today = pd.Timestamp("2026-09-26")
+    rng = np.random.default_rng(1)
+    rel = [pd.DataFrame({"ds": pd.date_range(end=today - pd.Timedelta(days=1), periods=400),
+                         "y": rng.poisson(6, 400).astype(float)}) for _ in range(4)]
+    new = pd.DataFrame({"ds": pd.date_range(end=today - pd.Timedelta(days=1), periods=20), "y": 0.0})
+    e = GlobalPooledEngine().fit(new, today=today, related=rel)
+    total = float(e.forecast_df["yhat"].to_numpy()[:30].sum())
+    assert total == 0.0, f"forecast {total:.1f} for a product with no sales (peers sell ~6/day)"
+    assert e.level_source == "no sales yet", e.level_source
+    print(f"PASS  no sales yet: 30-day forecast {total:.1f} (its peers sell ~180 a month)")
+
+
 if __name__ == "__main__":
     run()
     run_launch_ramp()
+    run_no_sales_borrows_no_volume()

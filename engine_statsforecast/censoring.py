@@ -73,11 +73,17 @@ def classify_day(units, closing_stock=None, hours_in_stock=None) -> str:
     a day with zero sales and no stock is not a data point at all.
     """
     av = availability(hours_in_stock)
-    if av <= 0.0:
-        return UNAVAILABLE
+    try:
+        sold = float(units or 0) > 0
+    except (TypeError, ValueError):
+        sold = False
     ended_empty = closing_stock is not None and float(closing_stock) <= 0
     if av < MIN_AVAILABILITY:
-        return UNAVAILABLE               # too little of the day to infer anything
+        # A day that SOLD something had stock to sell, whatever hourly polling saw (a
+        # restock and sell-through between two readings shows as 0 hours). Dropping it
+        # threw real sales away. Kept as a floor: demand was at least what sold, and
+        # there's too little of the day to scale it up.
+        return CAPPED if sold else UNAVAILABLE
     if av < FULL_AVAILABILITY:
         return PARTIAL
     if ended_empty:
@@ -201,6 +207,13 @@ def explain(summary: dict) -> str:
 # ── deriving hours-in-stock from inventory samples ───────────────────────────────────
 
 
+# A stock reading vouches for the level this long after it was taken (a day, plus slack
+# for a missed poll). Past that, the product isn't being watched.
+CARRY_HOURS = 26.0
+# A day needs this many watched hours before it says anything about availability.
+MIN_COVERED_HOURS = 12.0
+
+
 def hours_in_stock_from_samples(samples: list, day: str,
                                 day_hours: float = FULL_DAY_HOURS) -> float | None:
     """How long a product was buyable on `day`, from timestamped inventory readings.
@@ -212,8 +225,11 @@ def hours_in_stock_from_samples(samples: list, day: str,
     Returns None when the day isn't covered well enough to say — a gap in polling must not
     masquerade as a stockout, which would silently delete a good day's data.
     """
-    d = _dt.date.fromisoformat(str(day)[:10])
-    start = _dt.datetime.combine(d, _dt.time.min, tzinfo=_dt.timezone.utc)
+    # The STORE's day (store_clock), which is how its sales are dated. Counted over UTC
+    # days, a product that sold out at 11pm Eastern on Saturday and was restocked Monday
+    # showed 3 hours in stock on an empty Sunday.
+    import store_clock as _CLOCK
+    start = _CLOCK.day_start(str(day)[:10])
     end = start + _dt.timedelta(hours=day_hours)
 
     pts = []
@@ -236,25 +252,42 @@ def hours_in_stock_from_samples(samples: list, day: str,
         return None
     level = prior[-1][1] if prior else inday[0][1]
 
+    # How far a reading can be trusted. Identical readings are stored once (stock_log
+    # collapses them and keeps moving the latest one forward), so a level is known until
+    # the NEXT reading; after the last reading there is none, and the level was carried
+    # forward forever: a product last seen at 40 units in March was "in stock all day"
+    # every day since, long after polling stopped. A reading now vouches for the level
+    # for CARRY_HOURS past it (a day, plus slack for a missed poll), no longer.
+    last_ts = pts[-1][0]
+    known_until = min(end, last_ts + _dt.timedelta(hours=CARRY_HOURS))
+    if any(p[0] >= end for p in pts):
+        known_until = end
+    known_from = start if prior else inday[0][0]
+
     covered = 0.0
     in_stock = 0.0
-    cursor = start
+    cursor = known_from
     for ts, on_hand in inday:
-        span = (ts - cursor).total_seconds() / 3600.0
-        covered += span
-        if level > 0:
-            in_stock += span
+        span = (min(ts, known_until) - cursor).total_seconds() / 3600.0
+        if span > 0:
+            covered += span
+            if level > 0:
+                in_stock += span
         level = on_hand
-        cursor = ts
-    tail = (end - cursor).total_seconds() / 3600.0
-    covered += tail
-    if level > 0:
-        in_stock += tail
+        cursor = max(cursor, ts)
+    tail = (known_until - cursor).total_seconds() / 3600.0
+    if tail > 0:
+        covered += tail
+        if level > 0:
+            in_stock += tail
 
-    # Refuse to answer on thin coverage rather than guess. Only samples INSIDE the day
-    # tell us about changes during it; a single reading from days ago proves nothing.
-    if not inday and not prior:
+    # Refuse to answer on thin coverage rather than guess (the check that used to sit
+    # here could never fire). With most of the day watched, the unwatched part is
+    # assumed to look like the watched part.
+    if covered < MIN_COVERED_HOURS:
         return None
+    if covered < day_hours:
+        in_stock = in_stock * day_hours / covered
     return round(min(day_hours, max(0.0, in_stock)), 2)
 
 

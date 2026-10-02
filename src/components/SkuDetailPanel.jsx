@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { useDebouncedCallback } from 'use-debounce';
 import ForecastDetailsDrawer from '../ForecastDetailsDrawer';
 import ForecastChart from './ForecastChart';
@@ -8,11 +8,12 @@ import { Tip, ReliabilityBadge, MetricCard, MonthForecastCard, MonthlySummaryTab
 import { formatDate, isoToDisplay, urgencyLevel, autoStrategy, computeSkuLeadTimeStats,
          makeSupId, makeOrdId, todayMs, todayStr, STATUS_CONFIG, poEtaDays, planningLeadTime, LEAD_TIME_MIN_DELIVERIES, FREIGHT_MODES, leadTimeTracks, supplierOf, resolveLane, readSlowShipment, slowShipmentNote,
          readLeadTimeChanges, latestChangeAt, applyLeadTimeChange, undoLastLeadTimeChange,
-         describeLeadTimeChange, parkOrder, adoptParkedOrders, REASON_LABELS, stockIsCounted} from '../lib/helpers';
+         describeLeadTimeChange, parkOrder, adoptParkedOrders, REASON_LABELS, stockIsCounted,
+         findPoOrder, updateOrder, UNASSIGNED_SUP_ID } from '../lib/helpers';
 import { UnitEconomicsCard } from './UnitEconomics';
 import { SkuActionBar, PriceHistoryDrawer, HolidaysDrawer, forecastHealth } from './SkuActions';
 import { terminal, MONO, SANS } from '../lib/theme';
-import { API, TZ, fetchJson } from '../lib/api';
+import { API, fetchJson, forecastUrl } from '../lib/api';
 import { saveStorage } from '../lib/storage';
 import { GROQ_URL, GROQ_MODEL, GROQ_LOW_REASONING } from '../lib/ai';
 
@@ -77,7 +78,7 @@ export function TodaySoFar({ data, muted }) {
   );
 }
 
-export function OrderMathCard({ data, leadTime, coverageDays, unitsOnOrder, lm, skuSt, demandVolatilityColor }) {
+export function OrderMathCard({ data, leadTime, planSource, planNeeded, coverageDays, unitsOnOrder, lm, skuSt, demandVolatilityColor }) {
   const bg    = "bg-[var(--t-sunken)] border-[var(--t-line)]";
   const label = "text-[var(--t-dim)]";
   const head  = "text-[var(--t-dim)] border-[var(--t-line)]";
@@ -85,10 +86,11 @@ export function OrderMathCard({ data, leadTime, coverageDays, unitsOnOrder, lm, 
   const sub   = "text-[var(--t-soft)] border-[var(--t-line)]";
   const divider = "border-[var(--t-line)]";
 
-  // Detect lead time mode
-  const usingP80 = skuSt?.p80 !== null && leadTime === skuSt?.p80 && skuSt?.p80 !== skuSt?.avg;
-  const usingAvg = skuSt?.avg !== null && leadTime === skuSt?.avg;
-  const daysEarlier = skuSt?.p80 && skuSt?.avg ? skuSt.p80 - skuSt.avg : null;
+  // What planning actually used, from planningLeadTime's `source`. This used to be guessed
+  // by comparing the TYPED lead time with the measured avg/P80, so a product planning on
+  // a measured P80 could still say "Manual lead time... log 3 orders to unlock P80".
+  const usingP80 = planSource === "measured";
+  const daysEarlier = usingP80 && skuSt?.avg != null && leadTime > skuSt.avg ? leadTime - skuSt.avg : null;
 
   // Protection level is the MULTIPLIER on the demand spread: buffer = z x spread, where
   // the spread is how far the forecast misses over a whole lead time, in units. It is
@@ -182,22 +184,23 @@ export function OrderMathCard({ data, leadTime, coverageDays, unitsOnOrder, lm, 
               <>
                 <div className={`text-[14px] font-semibold ${"text-[var(--t-soft)]"}`}>
                   Late deliveries: P80 active
-                  <span className={`ml-1.5 font-mono font-normal text-[14px] ${"text-[var(--t-accent)]"}`}>orders {daysEarlier}d earlier</span>
+                  {daysEarlier ? <span className={`ml-1.5 font-mono font-normal text-[14px] ${"text-[var(--t-accent)]"}`}>orders {daysEarlier}d earlier</span> : null}
                 </div>
                 <div className={`text-[14px] mt-0.5 ${"text-[var(--t-dim)]"}`}>
-                  80% of past deliveries arrive within {leadTime}d, covering up to {daysEarlier}d delay
+                  80% of past deliveries arrive within {leadTime}d{daysEarlier ? `, covering up to ${daysEarlier}d delay` : ""}
                 </div>
               </>
             ) : (
               <>
                 <div className={`text-[14px] font-semibold ${"text-[var(--t-warn)]"}`}>
-                  Late deliveries: no protection
-                  {usingAvg && skuSt?.p80 && <span className={`ml-1.5 font-normal text-[14px] ${"text-[var(--t-dim)]"}`}>using avg · switch to P80 to protect</span>}
+                  {planSource === "next-order" ? "Next shipment: one-off lead time" : "Late deliveries: no protection"}
                 </div>
                 <div className={`text-[14px] mt-0.5 ${"text-[var(--t-dim)]"}`}>
-                  {usingAvg
-                    ? `Using avg lead time (${leadTime}d): only ~50% of deliveries arrive on time`
-                    : `Manual lead time (${leadTime}d). Log ≥ 3 orders to unlock P80`}
+                  {planSource === "manual"
+                    ? `Pinned lead time (${leadTime}d), ignoring delivery history`
+                    : planSource === "next-order"
+                    ? `Planning this order on ${leadTime}d; the normal lead time returns after it`
+                    : `Estimated lead time (${leadTime}d). Log ${planNeeded || LEAD_TIME_MIN_DELIVERIES} more deliver${(planNeeded || LEAD_TIME_MIN_DELIVERIES) === 1 ? "y" : "ies"} to measure it`}
                 </div>
               </>
             )}
@@ -312,8 +315,12 @@ export function SkuSignalStrip({ mlData, statusCfg, apiKey, lm, alwaysOpen = fal
 }
 
 // ─── SKU DETAIL PANEL ─────────────────────────
-export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, openPOs, setOpenPOs, apiKey, lm, suppliers, setSuppliers, receiveStock, refreshNonce, onExport, exporting,
+export default function SkuDetailPanel({ skuId, skuList, params: paramsIn, onParamChange, openPOs, setOpenPOs, apiKey, lm, suppliers, setSuppliers, receiveStock, refreshNonce, onExport, exporting,
                                         arrival = null, onConfirmArrival = null, onIgnoreArrival = null }) {
+  // The page builds a fresh params object on every render; keyed on content so the
+  // forecast isn't re-requested (and the draft re-synced) when nothing changed.
+  const paramsKey = JSON.stringify(paramsIn ?? {});
+  const params = useMemo(() => paramsIn, [paramsKey]);   // eslint-disable-line react-hooks/exhaustive-deps
   const [mlData,      setMlData]      = useState(null);
   const [loading,     setLoading]     = useState(false);
   const [showHistory, setShowHistory] = useState(false);
@@ -349,18 +356,54 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
     document.body.style.cursor = "col-resize"; document.body.style.userSelect = "none";
     window.addEventListener("mousemove", move); window.addEventListener("mouseup", up);
   };
-  useEffect(() => { setDraft(params); }, [skuId]);
-  const debouncedCommit = useDebouncedCallback(p => onParamChange(p), 600);
+  /* Edits are saved as the FIELDS that changed, bound to the product they were made on.
+     The whole draft used to be saved: the draft was copied from params only when the
+     product changed, so after "Mark received" added stock elsewhere, the next edit here
+     saved the old stock back. And the save was addressed by the page to whichever product
+     was open when the 600 ms timer fired, so switching products inside that window wrote
+     A's settings onto B; closing the panel dropped the pending save altogether. */
+  const pendingRef = useRef({ id: null, patch: {} });
+  const onParamChangeRef = useRef(onParamChange);
+  useEffect(() => { onParamChangeRef.current = onParamChange; }, [onParamChange]);
+  const debouncedCommit = useDebouncedCallback(() => {
+    const { id, patch } = pendingRef.current;
+    pendingRef.current = { id: null, patch: {} };
+    if (id && Object.keys(patch).length) onParamChangeRef.current(id, patch);
+  }, 600);
+  // Switching product or closing the panel saves what was typed, to the product it was
+  // typed on, straight away.
+  useEffect(() => () => { debouncedCommit.flush(); }, [skuId]);   // eslint-disable-line react-hooks/exhaustive-deps
+  // Follow changes made elsewhere (stock received, a supplier change, the Fleet), keeping
+  // any edit here that hasn't been saved yet on top.
+  useEffect(() => {
+    const own = pendingRef.current.id === skuId ? pendingRef.current.patch : {};
+    setDraft({ ...params, ...own });
+  }, [params, skuId]);
   const updateDraft = (key, value) => updateDraftMany({ [key]: value });
   /* Several fields move together (the default lane's baseline IS params.leadTime).
      Setting them one at a time would clobber, since each call reads the same draft. */
   const updateDraftMany = (patch) => {
-    const next = { ...draftParams, ...patch };
-    setDraft(next);
-    debouncedCommit(next);
+    if (pendingRef.current.id && pendingRef.current.id !== skuId) debouncedCommit.flush();
+    pendingRef.current = { id: skuId, patch: { ...pendingRef.current.patch, ...patch } };
+    setDraft(d => ({ ...d, ...patch }));
+    debouncedCommit();
   };
   /* The count-confirmation. Holds the typed value until the person says it is real. */
   const [pendingCount, setPendingCount] = useState(null);
+  /* What's being typed over an UNCOUNTED placeholder, held here until the person finishes
+     (Enter or leaving the box). The confirm used to open on the first keystroke with the
+     box still showing the placeholder, so typing 120 asked "record 1 units?" and a
+     habitual Yes recorded a count of 1. */
+  const [stockTyping, setStockTyping] = useState(null);
+  useEffect(() => { setStockTyping(null); setPendingCount(null); }, [skuId]);
+  const askToRecordCount = () => {
+    if (stockTyping == null) return;
+    const txt = String(stockTyping).trim();
+    const v = Math.round(Number(txt));
+    if (txt === "" || !Number.isFinite(v) || v < 0 || v === draftParams.stock) { setStockTyping(null); return; }
+    setPendingCount(v);
+  };
+  const cancelCount = () => { setPendingCount(null); setStockTyping(null); };
   const confirmCount = () => {
     updateDraftMany({
       stock: pendingCount,
@@ -371,6 +414,7 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
       stockCountedAt: new Date().toISOString(),
     });
     setPendingCount(null);
+    setStockTyping(null);
   };
 
   const openPO     = openPOs[skuId];
@@ -418,6 +462,9 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
     mlDataRef.current       = null;
     hasBootstrapped.current = false;
   }, [skuId]);
+  const fetchSeq = useRef(0);
+  // The previous product's figures never show under this one's name while it loads.
+  useEffect(() => { setMlData(null); }, [skuId]);
   const fetchData  = useCallback(() => {
     if (!skuId) return;
     // After bootstrap, read correct strategy from latest data
@@ -425,14 +472,18 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
       demandStratRef.current = autoStrategy(mlDataRef.current.demandVolatilityColor);
     }
     setLoading(true);
-    const { stock, leadTime, coverage, months } = params;
-    const costQ = (params.unitCost != null && params.unitCost !== "") ? `&unit_cost=${params.unitCost}` : "";
-    const feesQ = (params.fees != null && params.fees !== "") ? `&fees=${params.fees}` : "";
-    const protQ = params.protection ? `&protection=${params.protection}` : "";
-    const buildUrl = strat =>
-      `${API}/api/forecast?sku_id=${encodeURIComponent(skuId)}&stock=${stock}&lead_time_days=${plan.days}&coverage_days=${coverage}&strategy=${strat}&forecast_months=${months}&units_on_order=${onOrderQty}${onOrderEta != null ? `&on_order_eta_days=${onOrderEta}` : ""}${costQ}${feesQ}${protQ}&tz=${TZ}`;
+    // Only the newest request may show. A slow answer for the product you just left (or
+    // for settings you've since changed) used to land on top of the right one.
+    const reqId = ++fetchSeq.current;
+    const current = () => reqId === fetchSeq.current;
+    // The shared builder (lib/api.js). This page used to build its own URL and leave out
+    // where the stock figure came from, so a count typed here read as "not counted": no
+    // reorder date and "order 0" on this page while the Fleet showed it overdue.
+    const buildUrl = strat => forecastUrl(skuId, params, {
+      leadTime: plan.days, months: params.months, onOrderQty, onOrderEta, strategy: strat });
     const stratUsed = demandStratRef.current;
     fetchJson(buildUrl(stratUsed), undefined, `Forecast for ${skuId}`).then(d => {
+      if (!current()) return;
       if (!d) { setLoading(false); return; }
       const correctStrat = autoStrategy(d.demandVolatilityColor);
       demandStratRef.current = correctStrat;
@@ -440,7 +491,7 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
         // First fetch used wrong strategy — silently re-fetch with correct one before showing
         hasBootstrapped.current = true;
         fetchJson(buildUrl(correctStrat), undefined, `Forecast for ${skuId}`)
-          .then(d2 => { setMlData(d2 || d); setLoading(false); });
+          .then(d2 => { if (!current()) return; setMlData(d2 || d); setLoading(false); });
       } else {
         hasBootstrapped.current = true;
         setMlData(d);
@@ -457,8 +508,31 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
     // modal open so the user can fix the event instead of silently losing it.
     if (res) { setShowEvents(false); fetchData(); }
   };
-  const handleSavePO = (po) => {
+  const handleSavePO = (poIn) => {
+    /* Editing the PO that's already open updates ITS supplier order. Saving again used to
+       file a second order for the same shipment. A new PO gets a new order, and the PO
+       carries that order's id, so marking one received never touches another. */
+    const prevPo = openPOs[skuId];
+    const linked = prevPo ? findPoOrder(suppliers, skuId, prevPo) : null;
+    const orderId = linked?.order?.id || makeOrdId();
+    const po = { ...poIn, orderId };
     const next = { ...openPOs, [skuId]: po }; setOpenPOs(next); saveStorage("logitrack_pos", next); setShowPoModal(false);
+    const sameSupplier = linked && !poIn.newSupplierName &&
+      ((poIn.supplierId || null) === (linked.supId === UNASSIGNED_SUP_ID ? null : linked.supId));
+    if (linked && setSuppliers && !sameSupplier) {
+      // Moved to another supplier: take the order out of the old one's history; it's
+      // filed under the new one below, keeping its id.
+      setSuppliers(prev => ({ ...prev, [linked.supId]: { ...prev[linked.supId],
+        orders: (prev[linked.supId]?.orders || []).filter(o => o.id !== orderId) } }));
+    }
+    if (linked && setSuppliers && sameSupplier) {
+      setSuppliers(prev => updateOrder(prev, linked.supId, orderId, {
+        orderedDate: po.ordered, expectedDate: po.delivery, qty: po.qty,
+        freightMode: po.freightMode ?? linked.order.freightMode ?? null,
+        ...(po.notes ? { notes: po.notes } : {}),
+      }));
+      return;
+    }
     // The one-off "next order will be slower" expectation was ABOUT this order. Placing
     // it consumes the expectation — otherwise it silently inflates every future
     // recommendation forever, and nothing in the UI would tell you why.
@@ -481,7 +555,7 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
     }
     if (!setSuppliers) return;
     const order = {
-      id: makeOrdId(), orderedDate: po.ordered, receivedDate: null,
+      id: orderId, orderedDate: po.ordered, receivedDate: null,
       expectedDate: po.delivery, qty: po.qty, skuId,
       freightMode: po.freightMode ?? params.freightMode ?? null,
       notes: [po.notes, slowShipmentNote(slow)].filter(Boolean).join(" · "),
@@ -504,22 +578,12 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
     const po = openPOs[skuId];
     // The PO has arrived: add its quantity to on-hand stock.
     if (po?.qty && receiveStock) receiveStock(skuId, po.qty);
-    // Mark the linked supplier in-transit order received too, so it can't be counted again.
-    if (po && setSuppliers) {
-      setSuppliers(prev => {
-        const next = { ...prev };
-        for (const sid of Object.keys(next)) {
-          const orders = next[sid].orders || [];
-          const idx = orders.findIndex(o => o.skuId === skuId && !o.receivedDate);
-          if (idx >= 0) {
-            const copy = orders.slice();
-            copy[idx] = { ...copy[idx], receivedDate: todayStr() };
-            next[sid] = { ...next[sid], orders: copy };
-            break;
-          }
-        }
-        return next;
-      });
+    // Mark ITS supplier order received, so it can't be counted again. This used to mark
+    // the first open order for the product, which with two on the water was often the
+    // other one.
+    const linked = po ? findPoOrder(suppliers, skuId, po) : null;
+    if (linked && setSuppliers) {
+      setSuppliers(prev => updateOrder(prev, linked.supId, linked.order.id, { receivedDate: todayStr() }));
     }
     const next = { ...openPOs }; delete next[skuId]; setOpenPOs(next); saveStorage("logitrack_pos", next); setShowPoModal(false);
   };
@@ -544,6 +608,10 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
   const projTotal = mlData.currentMonth.unitsSoFar + mlData.currentMonth.forecastRemaining;
   const pctChange = mlData.currentMonth.lastMonthTotal > 0
     ? ((projTotal - mlData.currentMonth.lastMonthTotal) / mlData.currentMonth.lastMonthTotal) * 100 : 0;
+  // The same month a year ago: the season cancels out, so this is the one that says
+  // whether the product is growing. Absent until there's a full year of history.
+  const lyTotal = mlData.currentMonth.lastYearTotal;
+  const pctYoY = lyTotal > 0 ? ((projTotal - lyTotal) / lyTotal) * 100 : null;
   const hasOpenPO   = !!openPO;
   /* plan.days, not the default. The reorder bands are a fraction of a product's OWN
      lead time (at-risk = lead/2, due = lead x1.5), and omitting it fell back to 14 days
@@ -615,7 +683,7 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
           the tool is willing to claim about this product from here on. */}
       {pendingCount !== null && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50"
-             onClick={() => setPendingCount(null)}>
+             onClick={cancelCount}>
           <div onClick={e => e.stopPropagation()}
                className={`w-[min(440px,92vw)] rounded-xl border p-5 space-y-3 ${"bg-[var(--t-panel)] border-[var(--t-line2)]"}`}>
             <div className={`text-[16px] font-semibold ${"text-[var(--t-ink)]"}`}>
@@ -632,7 +700,7 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
               stock is a placeholder. Saving makes them appear.
             </p>
             <div className="flex gap-2 justify-end pt-1">
-              <button onClick={() => setPendingCount(null)}
+              <button onClick={cancelCount}
                 className={`px-3 py-1.5 rounded-lg text-[14px] border ${"border-[var(--t-line2)] text-[var(--t-soft)] hover:bg-[var(--t-sunken)]"}`}>
                 Cancel
               </button>
@@ -653,8 +721,11 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
         <div className="space-y-4">
           <div>
             <label className={lbl}>Units in Stock</label>
-            <input type="number" value={draftParams.stock}
+            <input type="number" value={stockTyping ?? draftParams.stock}
+              onBlur={() => { if (!stockCounted) askToRecordCount(); }}
+              onKeyDown={e => { if (e.key === "Enter" && !stockCounted) { e.preventDefault(); askToRecordCount(); } }}
               onChange={e => {
+                if (!stockCounted) { setStockTyping(e.target.value); return; }
                 const v = Number(e.target.value);
                 /* Editing an UNCOUNTED figure is a different act from adjusting a counted
                    one. The number on screen was a placeholder; typing over it is the
@@ -663,7 +734,6 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
                    and partly because everything downstream changes at that instant: the
                    stockout date, the reorder countdown and the order quantity all appear,
                    having been deliberately withheld while the level was invented. */
-                if (!stockCounted && v !== draftParams.stock) { setPendingCount(v); return; }
                 updateDraft("stock", v);
               }} className={inp} />
             {stockCounted ? (
@@ -1015,8 +1085,14 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
             {/* SKU lead time comparison card */}
             {skuSt.n > 0 && (() => {
               const reliable    = skuSt.n >= 3;
-              const activeAvg   = draftParams.leadTime === skuSt.avg;
-              const activeP80   = skuSt.p80 !== null && draftParams.leadTime === skuSt.p80;
+              // Planning never uses the average (half of orders would land late), and it
+              // uses the measured P80 by itself once there are 3+ deliveries. The old
+              // "Use avg" / "Use P80" buttons only rewrote the typed lead time, which
+              // planning ignores at that point, so they did nothing while showing
+              // "Selected". "In use" now reflects what planning actually does.
+              const activeAvg   = false;
+              const activeP80   = plan.source === "measured";
+              const pinned      = params.leadTimeMode === "manual";
               const daysGap     = skuSt.p80 !== null && skuSt.avg !== null ? skuSt.p80 - skuSt.avg : null;
               return (
                 <div className={`rounded-xl border overflow-hidden ${"border-[var(--t-line)]"}`}>
@@ -1037,7 +1113,7 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
                     <div className={`p-3 transition-colors ${activeAvg ? ("bg-[var(--t-sunken)]") : ("bg-[var(--t-panel)]")}`}>
                       <div className="flex items-center justify-between mb-1.5">
                         <span className={`text-[13px] uppercase tracking-widest font-bold ${"text-[var(--t-dim)]"}`}>Avg</span>
-                        {activeAvg && <span className={`text-[13px] font-semibold rounded-full px-1.5 py-0.5 ${"bg-[var(--t-line)] text-[var(--t-soft)]"}`}>active</span>}
+                        {activeAvg && <span className={`text-[13px] font-semibold rounded-full px-1.5 py-0.5 ${"bg-[var(--t-line)] text-[var(--t-soft)]"}`}>in use</span>}
                       </div>
                       <div className={`text-xl font-bold tabular-nums leading-none ${"text-[var(--t-ink)]"}`}>{skuSt.avg}d</div>
                       <div className={`text-[14px] mt-1.5 leading-snug ${"text-[var(--t-dim)]"}`}>
@@ -1046,17 +1122,7 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
                       <div className={`text-[14px] ${"text-[var(--t-dim)]"}`}>
                         ~50% on-time
                       </div>
-                      {reliable && (
-                        <button onClick={() => updateDraft("leadTime", skuSt.avg)}
-                          className={`mt-2 w-full py-1 rounded-md text-[14px] font-semibold border transition-all ${
-                            activeAvg
-                              ? ("bg-[var(--t-line)] border-[var(--t-line2)] text-[var(--t-dim)] cursor-default")
-                              : ("bg-[var(--t-panel)] border-[var(--t-line2)] text-[var(--t-soft)] hover:border-[var(--t-line2)]")
-                          }`}
-                          disabled={activeAvg}>
-                          {activeAvg ? "Selected" : "Use avg"}
-                        </button>
-                      )}
+                      <div className={`text-[13px] mt-1 ${"text-[var(--t-dim)]"}`}>For reference, not planned on</div>
                     </div>
 
                     {/* P80 column */}
@@ -1064,7 +1130,7 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
                       <div className={`p-3 transition-colors ${activeP80 ? ("bg-[var(--t-accent-soft)]") : ("bg-[var(--t-panel)]")}`}>
                         <div className="flex items-center justify-between mb-1.5">
                           <span className={`text-[13px] uppercase tracking-widest font-bold ${"text-[var(--t-accent)]"}`}>P80</span>
-                          {activeP80 && <span className={`text-[13px] font-semibold rounded-full px-1.5 py-0.5 ${"bg-[var(--t-accent-soft)] text-[var(--t-accent)]"}`}>active</span>}
+                          {activeP80 && <span className={`text-[13px] font-semibold rounded-full px-1.5 py-0.5 ${"bg-[var(--t-accent-soft)] text-[var(--t-accent)]"}`}>in use</span>}
                         </div>
                         <div className={`text-xl font-bold tabular-nums leading-none ${"text-[var(--t-accent)]"}`}>{skuSt.p80}d</div>
                         <div className={`text-[14px] mt-1.5 leading-snug font-medium ${"text-[var(--t-accent)]"}`}>
@@ -1073,15 +1139,10 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
                         <div className={`text-[14px] ${"text-[var(--t-dim)]"}`}>
                           80% on-time
                         </div>
-                        {reliable && skuSt.p80 !== skuSt.avg && (
-                          <button onClick={() => updateDraft("leadTime", skuSt.p80)}
-                            className={`mt-2 w-full py-1 rounded-md text-[14px] font-semibold border transition-all ${
-                              activeP80
-                                ? ("bg-[var(--t-accent-soft)] border-[var(--t-accent-line)] text-[var(--t-accent)] cursor-default")
-                                : ("bg-[var(--t-accent-soft)] border-[var(--t-accent-line)] text-[var(--t-accent)] hover:bg-[var(--t-accent-soft)]")
-                            }`}
-                            disabled={activeP80}>
-                            {activeP80 ? "Selected" : "Use P80 ↑"}
+                        {reliable && pinned && (
+                          <button onClick={() => updateDraft("leadTimeMode", undefined)}
+                            className={`mt-2 w-full py-1 rounded-md text-[14px] font-semibold border transition-all ${"bg-[var(--t-accent-soft)] border-[var(--t-accent-line)] text-[var(--t-accent)] hover:bg-[var(--t-accent-soft)]"}`}>
+                            Plan on measured P80 ↑
                           </button>
                         )}
                       </div>
@@ -1221,7 +1282,7 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
                       </button>
                       {showBufferMath && (() => {
                         const sigma = mlData.residualStd;
-                        const lt    = draftParams.leadTime;
+                        const lt    = plan.days;   // what the buffer was sized over, not the typed field
                         const rootL = lt != null ? Math.sqrt(lt) : null;
                         const rowC  = "text-[var(--t-dim)]";
                         const valC  = "text-[var(--t-soft)]";
@@ -1266,7 +1327,10 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
               // so delivery is today + leadTime — which can fall AFTER the stockout,
               // exposing an unavoidable out-of-stock gap. This matches the backend's
               // order-quantity math (which also assumes "order today" when overdue).
-              const deliveryOffset = Math.max(mlData.daysUntilReorder ?? 0, 0) + draftParams.leadTime;
+              // plan.days, the lead time the order math used. The typed field can differ
+              // (a measured P80, a supplier's baseline, a one-off slow shipment), and
+              // using it here drew coverage dates and hid the out-of-stock gap.
+              const deliveryOffset = Math.max(mlData.daysUntilReorder ?? 0, 0) + plan.days;
               const deliveryDate = new Date(todayMs());
               deliveryDate.setUTCDate(deliveryDate.getUTCDate() + deliveryOffset);
               const coverageEnd = new Date(deliveryDate.getTime());
@@ -1489,7 +1553,7 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
             <div className="flex-1">
               <div className={`text-[16.5px] font-bold mb-1 ${"text-[var(--t-warn)]"}`}>UPCOMING REORDER: {mlData.daysUntilReorder} days</div>
               <p className={`text-[15px] leading-relaxed ${"text-[var(--t-warn)]"}`}>
-                Place order by <span className={`font-semibold ${textMain}`}>{formatDate(mlData.daysUntilReorder)}</span> to cover your {params.leadTime}-day lead time.
+                Place order by <span className={`font-semibold ${textMain}`}>{formatDate(mlData.daysUntilReorder)}</span> to cover your {plan.days}-day lead time.
                 Stockout projected <span className={`font-semibold ${textMain}`}>{formatDate(mlData.daysUntilStockout)}</span>.
               </p>
             </div>
@@ -1552,7 +1616,8 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
           <div className={`${cardBg} border rounded-2xl p-5 h-[320px]`}>
             <ForecastChart historyPoints={mlData.chartDataHistory} futurePoints={[]} rangePoints={[]}
               stockoutTime={null} reorderTime={null} intervalWidth={mlData.intervalWidth}
-              upcomingPromos={mlData.upcomingPromos} lm={lm} todaySales={mlData.todaySales} />
+              upcomingPromos={mlData.upcomingPromos} lm={lm} todaySales={mlData.todaySales}
+              closedDays={mlData.closedDays || []} />
           </div>
           <div className={`${cardBg} border rounded-2xl p-6`}>
             <div className="flex items-center gap-2 mb-2">
@@ -1588,7 +1653,7 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
               <div><div className={`text-[14px] uppercase tracking-widest font-bold mb-1 ${textMuted}`}>Stock covers</div><span className={`text-2xl font-bold tabular-nums ${textMain}`}>{mlData.observedRunwayDays != null ? `~${mlData.observedRunwayDays}` : "-"}</span><span className={`text-[15px] ${textMuted}`}>{mlData.observedRunwayDays != null ? " days" : ""}</span></div>
             </div>
             {mlData.observedRunwayDays != null && (() => {
-              const soon = mlData.observedRunwayDays <= (params.leadTime || 14);
+              const soon = mlData.observedRunwayDays <= plan.days;
               return (
                 <div className={`mt-4 rounded-xl border px-4 py-3 text-[15px] leading-relaxed ${soon
                   ? ("bg-[var(--t-warn-soft)] border-[var(--t-warn-line)] text-[var(--t-warn)]")
@@ -1596,7 +1661,7 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
                   {soon ? "⚠️ " : "ℹ️ "}At its current pace (~{mlData.observedDailyRate}/day), this runs out around{" "}
                   <span className="font-semibold">{mlData.observedStockoutTs ? new Date(mlData.observedStockoutTs).toLocaleDateString("en-US", { month: "short", day: "numeric" }) : `~${mlData.observedRunwayDays} days`}</span>
                   , about {mlData.observedRunwayDays} days of stock left.
-                  {soon ? ` That's inside your ${params.leadTime}-day lead time, so it's worth ordering now even though the forecast is still warming up.` : ""}
+                  {soon ? ` That's inside your ${plan.days}-day lead time, so it's worth ordering now even though the forecast is still warming up.` : ""}
                 </div>
               );
             })()}
@@ -1666,13 +1731,21 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
                     stockoutTime={mlData.inactive ? null : mlData.stockoutTimestamp}
                     reorderTime={mlData.inactive ? null : mlData.reorderTimestamp} intervalWidth={mlData.intervalWidth}
                     poLandsTime={openPO?.delivery ? new Date(`${openPO.delivery}T12:00:00Z`).getTime() : null}
-                    upcomingPromos={mlData.upcomingPromos} holidayWindows={wins} lm={lm} todaySales={mlData.todaySales} />
+                    upcomingPromos={mlData.upcomingPromos} holidayWindows={wins} lm={lm} todaySales={mlData.todaySales}
+                    closedDays={mlData.closedDays || []} />
                 </div>
                 {wins.length > 0 && (
                   <div className={`pt-2 text-[13.5px] leading-snug ${textMuted} truncate`}
-                    title={wins.map(w => `${w.name} ${w.pct > 0 ? "+" : ""}${w.pct}% (${fmt(w.start)}${w.end !== w.start ? ` to ${fmt(w.end)}` : ""})`).join(" · ")}>
+                    title={wins.map(w => `${w.name} (${fmt(w.start)} to ${fmt(w.end)})${w.peakDate ? `, busiest ${fmt(w.peakDate)}` : ""}`).join(" · ")}>
                     <span className="inline-block h-2.5 w-2.5 mr-1.5 align-middle rounded-sm bg-[var(--t-sunken)] border border-[var(--t-line2)]" />
-                    Holidays: {wins.map(w => `${w.name} ${w.pct > 0 ? "+" : ""}${w.pct}% (${fmt(w.start)})`).join(" · ")}
+                    Holiday stretches: {wins.map(w => `${w.name} (${fmt(w.start)}–${fmt(w.end)})`).join(" · ")}
+                  </div>
+                )}
+                {(mlData.closedDays || []).length > 0 && (
+                  <div className={`pt-1.5 text-[13.5px] leading-snug ${textMuted}`}>
+                    <span className="inline-block h-2.5 w-2.5 mr-1.5 align-middle rounded-full" style={{ background: "#F07A1A" }} />
+                    Store closed ({mlData.closedDays.length} day{mlData.closedDays.length === 1 ? "" : "s"} on this chart):
+                    left out of training, and forecast at 0. Set them under Closed days on the Fleet overview.
                   </div>
                 )}
               </div>
@@ -1692,6 +1765,15 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
                 </span>
                 <span className={`text-[16.5px] ${textMuted}`}>vs last month</span>
               </div>
+              {pctYoY != null && (
+                <div className="flex items-center gap-2 mt-0.5"
+                  title={`${lyTotal.toLocaleString()} sold in the same month last year. Unlike last month, the season cancels out here, so this shows whether the product is growing.`}>
+                  <span className={`text-[16.5px] font-mono font-bold ${pctYoY >= 0 ? "text-[var(--t-good)]" : "text-[var(--t-bad)]"}`}>
+                    {pctYoY >= 0 ? "▲" : "▼"} {Math.abs(pctYoY).toFixed(1)}%
+                  </span>
+                  <span className={`text-[16.5px] ${textMuted}`}>vs last year</span>
+                </div>
+              )}
             </div>
             {/* Middle: sold / remaining */}
             <div className={`grid grid-cols-2 gap-4 py-5 border-y ${divider}`}>
@@ -1720,7 +1802,7 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
         </div>
 
         {/* Order Math — two columns on a wide panel, stacked on a narrow one */}
-        <OrderMathCard data={mlData} leadTime={params.leadTime} coverageDays={params.coverage} unitsOnOrder={onOrderQty} lm={lm} skuSt={skuSt} demandVolatilityColor={mlData?.demandVolatilityColor} />
+        <OrderMathCard data={mlData} leadTime={plan.days} planSource={plan.source} planNeeded={plan.needed} coverageDays={params.coverage} unitsOnOrder={onOrderQty} lm={lm} skuSt={skuSt} demandVolatilityColor={mlData?.demandVolatilityColor} />
 
         <div>
           <div className={`text-[14px] uppercase tracking-widest font-bold mb-3 ${textMuted}`}>Sales Forecast by Month</div>
@@ -1749,7 +1831,7 @@ export default function SkuDetailPanel({ skuId, skuList, params, onParamChange, 
         priceTiers={mlData.priceTiers} priceTrainedMin={mlData.priceTrainedMin} priceTrainedMax={mlData.priceTrainedMax}
         priceSafeMin={mlData.priceSafeMin} priceSafeMax={mlData.priceSafeMax} priceModeled={mlData.priceModeled}
         priceResponse={mlData.priceResponse} priceMixedDays={mlData.priceMixedDays || 0}
-        holidays={((mlData.holidays || {}).effects || []).filter(h => h.active)}
+        holidays={((mlData.holidays || {}).effects || []).filter(h => h.status === "moves")}
         posEvents={mlData.posEvents || []} livePrice={mlData.livePrice}
         lastRecordedDate={mlData.lastRecordedDate}
         onSave={handleSaveEvents} onClose={() => setShowEvents(false)} lm={lm} />}

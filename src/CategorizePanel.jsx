@@ -16,6 +16,7 @@
 import React, { useState, useEffect } from 'react';
 import { loadStorage, saveStorage } from './lib/storage';
 import { fetchJson } from './lib/api';
+import { todayStr } from './lib/helpers';
 import { GROQ_URL, GROQ_MODEL, GROQ_LOW_REASONING } from './lib/ai';
 import { terminal, fs, MONO, SANS, scrim } from './lib/theme';
 
@@ -164,7 +165,9 @@ export default function CategorizePanel({ skuList = [], api = "http://localhost:
           const known = (g.skus || []).find(s => s.skuId === sid)?.attributes || {};
           if (!Object.keys(known).length && skuList.some(s => s.id === sid)) missing[sid] = attrs;
         });
-        if (Object.keys(missing).length) { try { await saveAttributes(missing); } catch {} }
+        // Put back as AI tags (fill-in only): they came from an earlier classification,
+        // and must not override a category the file or store gives.
+        if (Object.keys(missing).length) { try { await saveAttributes(missing, "ai"); } catch {} }
         else explainGroups(g);
         return g;
       }
@@ -180,11 +183,16 @@ export default function CategorizePanel({ skuList = [], api = "http://localhost:
   // SKU is remembered in a persisted set the moment it's auto-classified, so it is
   // never auto-classified again — subsequent re-runs are manual. Newly-added
   // products (ids not in the set) still get their single automatic pass.
+  // Waits for the server's groups: it used to run on mount, before they arrived, when
+  // every product looked uncategorised, so it classified the whole catalogue, including
+  // products whose file or store already gave a Category.
   useEffect(() => {
     if (!(open || embedded)) return;
-    if (!apiKey || phase !== "idle" || !skuList.length) return;
+    if (!apiKey || phase !== "idle" || !skuList.length || !groups) return;
     const seen = loadStorage(AUTOCLASSIFIED_KEY, {});
-    const neverClassified = skuList.filter(s => !(classes[s.id] && classes[s.id].category) && !seen[s.id]);
+    const serverCat = (id) => (groups.skus || []).find(s => s.skuId === id)?.attributes?.category;
+    const neverClassified = skuList.filter(s => !(classes[s.id] && classes[s.id].category)
+                                                && !serverCat(s.id) && !seen[s.id]);
     if (neverClassified.length === 0) return;
     // Mark every current SKU as seen up front (persisted synchronously) so a re-render
     // mid-classification can't trigger a second pass.
@@ -192,7 +200,7 @@ export default function CategorizePanel({ skuList = [], api = "http://localhost:
     skuList.forEach(s => { nextSeen[s.id] = true; });
     saveStorage(AUTOCLASSIFIED_KEY, nextSeen);
     classifyAndApply();
-  }, [open, embedded, apiKey, skuList, phase, classes]);
+  }, [open, embedded, apiKey, skuList, phase, classes, groups]);
 
   function buildClassificationPrompt() {
     const lines = skuList.map(s => {
@@ -222,11 +230,13 @@ ${lines}`
     );
   }
 
-  async function saveAttributes(skus) {
+  // source "ai": the server only fills empty attributes (or ones the AI set before) and
+  // doesn't record them as set by hand, so the file's own Category is never replaced.
+  async function saveAttributes(skus, source = "user") {
     let res;
     try {
       res = await fetch(`${api}/api/attributes`, {
-        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ skus }),
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ skus, source }),
       });
     } catch (e) {
       // fetch rejected = no response at all → backend not listening / blocked by CORS.
@@ -289,7 +299,7 @@ ${lines}`
     // local backend, NOT the AI — so say so (the tags were generated fine).
     try {
       setPhase("applying");
-      await saveAttributes(next);
+      await saveAttributes(next, "ai");
     } catch (e) {
       if (e?.kind === "http") {
         setErr(`Tags were generated, but the backend rejected the save (HTTP ${e.status}). Check the LogiTrack terminal window for the error.`);
@@ -383,7 +393,7 @@ ${lines}`
     const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const el = document.createElement("a");
-    el.href = url; el.download = `logitrack_grouping_${new Date().toISOString().slice(0, 10)}.csv`; el.click();
+    el.href = url; el.download = `logitrack_grouping_${todayStr()}.csv`; el.click();
     URL.revokeObjectURL(url);
   }
 
@@ -778,7 +788,12 @@ ${lines}`;
                           {(gi.splitCols || []).join(" + ")}
                         </span>
                       )}
-                      {gi.level === "base" && gi.reason && (
+                      {s.categoryLevel && (
+                        <span title={`It has no subgroup of its own, so it is compared across all of ${catOf(s)}. It moves with ${(s.categoryLevelWith || []).join(", ")}, so it is shown with them.`}
+                          style={{ ...mono, flexShrink:0, fontSize:fs.tick, padding:"2px 6px",
+                            background:T.blueBg, color:T.blueFg, border:`2px solid ${T.blue}33` }}>category level</span>
+                      )}
+                      {gi.level === "base" && gi.reason && !s.categoryLevel && (
                         <span title={gi.reason}
                           style={{ ...mono, flexShrink:0, fontSize:fs.tick, padding:"2px 6px",
                             background:T.sunken, color:T.soft, border:`2px solid ${T.line}` }}>broad group</span>
@@ -826,9 +841,14 @@ ${lines}`;
                           {entry.clusters.map((ck, idx) => {
                             const members = vByCluster[ck];
                             const borrowers = newByCluster[ck] || [];
-                            const coh = members[0]?.clusterCohesion ?? null;
-                            const poolInfo = members[0]?.groupInfo || {};
-                            const groupTitle = behaviorGroupTitle(members, cat, idx);
+                            /* The card speaks for its own group. A category-level product shown
+                               here because it moves with this group (categoryLevel) is listed,
+                               but the title, split and scores stay the group's own. */
+                            const core = members.filter(m => !m.categoryLevel);
+                            const lead = core[0] || members[0];
+                            const coh = lead?.clusterCohesion ?? null;
+                            const poolInfo = lead?.groupInfo || {};
+                            const groupTitle = behaviorGroupTitle(core.length ? core : members, cat, idx);
                             const collapsed = !!openGroups[ck];
                             const d = coh?.distinctive;
                             const hSplit = poolInfo.level === "subgroup" ? (poolInfo.splitCols || []).join("+") : "";
@@ -905,15 +925,22 @@ ${lines}`;
                                     {coh && (
                                       <div style={{ marginTop:14, paddingTop:12, borderTop:`2px solid ${T.line}` }}>
                                         <div style={{ display:"flex", gap:26, flexWrap:"wrap", alignItems:"flex-start" }}>
+                                          {/* The specific score leads: it is the one every
+                                              decision uses (who groups, who pools, whether a
+                                              season is borrowed). The overall figure includes
+                                              the rhythm every product shares, so it sits second
+                                              and says so. */}
                                           <div>
-                                            <div style={cap}>Move together</div>
-                                            <div style={{ ...mono, fontSize:22, fontWeight:600, color:T.ink, marginTop:4 }}>{pct(coh.avg)}%</div>
+                                            <div style={cap}>
+                                              <span title="Whether the shared seasonality is special to this group, rather than the normal store rhythm (weekends, holidays, broad summer/winter lifts). This is the score grouping and borrowing decisions use.">Specific to this group</span>
+                                            </div>
+                                            <div style={{ ...mono, fontSize:30, fontWeight:600, color:cohColor(coh.distinctive), marginTop:4 }}>{distPct(coh) ?? "-"}%</div>
                                           </div>
                                           <div>
                                             <div style={cap}>
-                                              <span title="Whether the shared seasonality is special to this group, rather than the normal store rhythm (weekends, holidays, broad summer/winter lifts).">Specific to this group</span>
+                                              <span title="How alike their sales patterns are overall, including the weekend and holiday rhythm every product in the store shares. Shown for context; decisions use the specific score.">Overall, incl. store rhythm</span>
                                             </div>
-                                            <div style={{ ...mono, fontSize:22, fontWeight:600, color:cohColor(coh.distinctive), marginTop:4 }}>{distPct(coh) ?? "-"}%</div>
+                                            <div style={{ ...mono, fontSize:22, fontWeight:600, color:T.soft, marginTop:4 }}>{pct(coh.avg)}%</div>
                                           </div>
                                           {/* The weakest pair on the same scale as the headline
                                               figure and the threshold. It used to show the raw
@@ -971,10 +998,17 @@ ${lines}`;
                                      it was wrong. A product lands here when it has no behavioural match
                                      of its own inside this category, which does not stop it borrowing
                                      from the nearest cluster that does cohere. */
-                                  const why = s.route === "global"
+                                  const bf = s.borrowsFrom;
+                                  const bfNames = bf ? bf.skus.map(x => x.skuName) : [];
+                                  const why = bf
+                                    ? [`borrows ${bf.what} from ${bfNames.length > 2 ? `${bfNames.slice(0, 2).join(", ")} +${bfNames.length - 2}` : bfNames.join(" & ")}`,
+                                       `It doesn't sit in a group here, but its sales matched these products closely enough (35%+) that it takes ${bf.what} from them: ${bfNames.join(", ")}.`]
+                                    : s.route === "global"
                                     ? ["borrowing from the closest group", "No close match of its own here, but it borrows a pooled forecast from the nearest group in its category with a similar sales shape."]
                                     : s.usesYearlyPool
                                     ? ["borrows yearly shape only", "Forecasts directly with Prophet, but borrows its yearly pattern from related products until it has enough yearly history."]
+                                    : s.familyNote && /match no family/.test(s.familyNote)
+                                    ? ["forecasts on its own", `Its own sales ${s.familyNote.replace(/^its own sales /, "")}, so it borrows nothing from a family and forecasts from its own sales.`]
                                     : ["forecasts on its own", "Has enough history of its own to forecast directly, so it doesn't need to borrow a pooled forecast."];
                                   const link = kase.link;
                                   const strong = kase.kind === "near";
@@ -1001,8 +1035,20 @@ ${lines}`;
                                                       : `Needs ${thresholdPct(link)}% to join the pooled group.`)
                                             : (strong ? "Strong match, but it still needs a reliable multi-product subgroup to form a pool."
                                                       : `Needs ${thresholdPct(link)}% to form a pool.`)}>
-                                          <b style={{ ...mono, color: strong ? T.green : T.over }}>{linkPct(link)}%</b>
-                                          {" "}closest to {link.skuName}
+                                          {link.score > 0 ? (<>
+                                            <b style={{ ...mono, color: strong ? T.green : T.over }}>{linkPct(link)}%</b>
+                                            {" "}closest to {link.skuName}
+                                          </>) : link.score <= -0.2 ? (
+                                            /* A negative score means the two move OPPOSITE ways (a Halloween
+                                               line against a Christmas one), not a percentage of anything. */
+                                            <span title={`Its busy months are ${link.skuName}'s quiet ones, and the other way round.`}>
+                                              moves opposite to {link.skuName}
+                                            </span>
+                                          ) : (
+                                            <span title={`Its sales pattern has nothing in common with ${link.skuName}'s, the closest product in its category.`}>
+                                              no match, even with {link.skuName}
+                                            </span>
+                                          )}
                                           {!strong && <span style={{ color:T.faint }}> · needs {thresholdPct(link)}%</span>}
                                           {strong && <span style={{ color:T.faint }}> · no reliable group formed around it</span>}
                                         </div>
