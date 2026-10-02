@@ -68,6 +68,7 @@ SLOW_DESEASON = os.environ.get("LOGITRACK_SLOW_DESEASON", "1").strip() not in ("
 _holidays = _HOL.HolidaySettings()
 import closed_days as _CD
 import holiday_shape as _HS
+import holiday_cover as _HC
 import store_clock as _CLOCK
 import bands as _BANDS
 # Holidays are handled by holiday_shape: each holiday's stretch keeps the forecast's own
@@ -292,6 +293,7 @@ def _restore_backtest():
     globals()["_last_backtest_combos"] = saved.get("combos") or []
     globals()["_backtest_tier_cache"] = saved.get("tiers") or {}
     globals()["_backtest_exclusions"] = saved.get("exclusions") or {}
+    _sync_holiday_rates(saved.get("report"))
     _backtest_inputs.clear(); _backtest_inputs.update(saved.get("inputs") or {})
     globals()["_backtest_fingerprint"] = _BTSTORE.fingerprint(_catalog)
     globals()["_backtest_parts"] = _BTSTORE.fingerprint_parts(_catalog)
@@ -307,6 +309,7 @@ def _drop_backtest_state(why: str) -> None:
     globals()["_backtest_exclusions"] = {}
     globals()["_backtest_fingerprint"] = None
     globals()["_backtest_parts"] = {}
+    _HC.set_rates(None)
     _backtest_inputs.clear()
     _BTSTORE.clear()
     print(f"Measured protection levels dropped — {why}. Estimates apply until a new test runs.")
@@ -323,6 +326,7 @@ def _forget_backtest_memory() -> None:
     globals()["_backtest_exclusions"] = {}
     globals()["_backtest_fingerprint"] = None
     globals()["_backtest_parts"] = {}
+    _HC.set_rates(None)
     _backtest_inputs.clear()
 
 
@@ -1210,6 +1214,15 @@ def _with_future(forecast, future_fc, last_actual):
     return pd.concat([past, future_fc], ignore_index=True, sort=False)
 
 
+def _hs_years_of(fc, occ):
+    """Own years behind the shape of holiday occurrence `occ` ("key|anchor") in a forecast
+    frame carrying holiday_cover's columns."""
+    if fc is None or "holiday" not in fc.columns or "hs_years" not in fc.columns:
+        return 0
+    v = pd.to_numeric(fc.loc[fc["holiday"] == occ, "hs_years"], errors="coerce").dropna()
+    return int(v.iloc[0]) if len(v) else 0
+
+
 def _effect_sd(fc):
     """Per-day uncertainty of the price and holiday effects, combined."""
     tot = pd.Series(0.0, index=fc.index)
@@ -1775,6 +1788,7 @@ def build_entry(sku_id, sku_name, df_clean, mode, filename, today, events, relat
     # already under way is split as a whole, the units already sold counting toward its
     # total, so the days left never take the whole stretch.
     hs_info = {}
+    hs_apply = {}
     if hs_levels and hs_A and len(future_fc):
         try:
             _wdi = _HS._wdi_of(df_imp)
@@ -1782,6 +1796,7 @@ def build_entry(sku_id, sku_name, df_clean, mode, filename, today, events, relat
                      if (last_actual - pd.Timestamp(x)).days < 60}
             _old = future_fc["yhat"].clip(lower=0).to_numpy(float)
             _apply = {k: v for k, v in hs_levels.items() if _HS.significant(v)}
+            hs_apply = _apply
             _new, hs_info = _HS.redistribute(future_fc["ds"].tolist(), _old, _to_real, hs_A, _apply, _wdi,
                                              past=_past, closed=_closed_mask(future_fc["ds"], sku_id))
             if hs_info:
@@ -1844,6 +1859,18 @@ def build_entry(sku_id, sku_name, df_clean, mode, filename, today, events, relat
                     future_fc[_c] = pd.to_numeric(future_fc[_c], errors="coerce").fillna(0.0).to_numpy(float) * _cm
             forecast = _with_future(forecast, future_fc, last_actual)
             closed_ahead = int(_cz.sum())
+
+    # HOLIDAY COVER (holiday_cover.py): each day of a stretch this forecast reshapes carries
+    # an uncertainty in proportion to its units, at the store's measured holiday rate. The
+    # order math adds it up per holiday over the order window, so holiday weeks get the
+    # extra buffer they've been measured to need. After every multiplier, so a closed day
+    # carries none and a promoted day its lifted units' share.
+    if hs_apply and len(future_fc):
+        try:
+            future_fc = _HC.attach(future_fc, hs_A, hs_apply, hs_levels, _to_real)
+            forecast = _with_future(forecast, future_fc, last_actual)
+        except Exception:                                   # noqa: BLE001 — never fail a build over it
+            import traceback; traceback.print_exc()
 
     # What the Holidays tab shows, read off the final forecast (promotions and closed days
     # included), so it always says what the chart says and moves whenever it does.
@@ -2206,6 +2233,7 @@ def warmup():
     leak into a forecast, a backtest or an export."""
     global _backtest_tier_cache, _backtest_exclusions, _last_backtest
     _backtest_tier_cache, _backtest_exclusions, _last_backtest = {}, {}, None
+    _HC.set_rates(None)
     _sheet_costs.clear()
     _cost_sources.clear()
     _backtest_inputs.clear()
@@ -5294,17 +5322,27 @@ def get_forecast(sku_id: str = Query(...), stock: int = Query(default=ASSUMED_ST
     _win = fc_fwd.head(decision_horizon)
     _sx = float(pd.to_numeric(_win["x_sd"], errors="coerce").fillna(0.0).sum()) if "x_sd" in _win.columns else 0.0
     _sh2 = 0.0
+    _hol_units = {}     # holiday "key|anchor" → its forecast units inside the order window
     if "h_sd" in _win.columns:
         _hs = pd.to_numeric(_win["h_sd"], errors="coerce").fillna(0.0)
         _hk = _win["holiday"] if "holiday" in _win.columns else pd.Series([None] * len(_win), index=_win.index)
         for _k in {k for k in _hk.tolist() if k}:
             _sh2 += float(_hs[_hk == _k].sum()) ** 2
+            _hol_units[_k] = float(pd.to_numeric(_win.loc[_hk == _k, "yhat"], errors="coerce")
+                                   .fillna(0.0).clip(lower=0).sum())
     _x_extra = float(np.sqrt(_sx ** 2 + _sh2))
-    if _x_extra > 0:
-        _basis = float(np.sqrt(_basis ** 2 + _x_extra ** 2))
+    if _sx > 0:
+        _basis = float(np.sqrt(_basis ** 2 + _sx ** 2))
+    # The standing buffer stops here. Holiday cover goes on top of it, but only while a
+    # holiday is inside the order window: it's a temporary top-up sold down afterwards,
+    # so the cost curve (which prices the buffer as carried all year) is given the buffer
+    # without it, and the cover is reported, and priced, on its own line.
+    _basis_standing = _basis
+    if _sh2 > 0:
+        _basis = float(np.sqrt(_basis ** 2 + _sh2))
     rec_key, rec_reason, rec_source, rec_economics = recommend_economic_protection(
         price=price, unit_cost=unit_cost, fees=fees, margin_pct=margin_pct,
-        demand_spread=_basis, coverage_days=coverage_days,
+        demand_spread=_basis_standing, coverage_days=coverage_days,
         days_history=days_hist, total_sales=total_sales, demand_class=e.get("demand_class"),
         lead_time_days=lead_time_days, sku_id=str(sku_id),
         # Use the rate the user actually set. This defaulted to 25% no matter what they'd
@@ -5317,8 +5355,30 @@ def get_forecast(sku_id: str = Query(...), stock: int = Query(default=ASSUMED_ST
     tier = _TIER_BY_KEY[chosen_key]
     z = tier["z"]
     safety = round(z * _basis)
+    # Of which, holiday cover: what the holidays in the order window add to the standing
+    # buffer at this protection level. Its carrying cost is one order cycle's (it is
+    # bought before the holiday and sold down over the cycle after), not a year's.
+    _hc_units = max(0, safety - round(z * _basis_standing))
     if inactive:
         safety = 0   # no safety stock for a discontinued item — don't buffer demand of 0
+        _hc_units = 0
+    _hc_now = _HC.current()
+    holiday_cover = None
+    if _hol_units:
+        _hc_cost = (_hc_units * float(unit_cost) * max(0.0, _session_holding_pct / 100.0)
+                    * coverage_days / 365.0) if unit_cost not in (None, "") else None
+        holiday_cover = {
+            "units": int(_hc_units),
+            "standingUnits": int(safety - _hc_units),
+            "carryCost": round(_hc_cost, 2) if _hc_cost is not None else None,
+            "carryDays": int(coverage_days),
+            "rateSource": _hc_now["source"],
+            "holidays": [{"key": k.split("|")[0], "name": _HS.name_of(k.split("|")[0]),
+                          "anchor": k.split("|")[1] if "|" in k else None,
+                          "unitsInWindow": round(u, 1),
+                          "rate": _HC.rate_for(k.split("|")[0], _hs_years_of(fc_fwd, k))}
+                         for k, u in sorted(_hol_units.items(), key=lambda kv: -kv[1])],
+        }
     # Is a better recommendation being computed right now? The cost curve is a real
     # answer, not a placeholder — but if a backtest is mid-flight the number is about to
     # change, and showing it as settled invites a decision the user would then revisit.
@@ -5570,6 +5630,10 @@ def get_forecast(sku_id: str = Query(...), stock: int = Query(default=ASSUMED_ST
         # discount goes past known prices and how few years a holiday was learned from.
         "effectBuffer": {"price": round(_sx, 1), "holiday": round(float(np.sqrt(_sh2)), 1),
                          "total": round(_x_extra, 1)},
+        # Temporary extra buffer for the holidays inside the order window (holiday_cover.py):
+        # already inside safetyStock and the order quantity; split out so the page can show
+        # it on its own line and price it as one cycle's carrying, not a year's.
+        "holidayCover": holiday_cover,
         "holidays": _holidays_view(e.get("holidays"), tot_fc_days),
         "priceTiers": e.get("price_tiers", []), "priceTrainedMin": e.get("price_trained_min"),
         "priceTrainedMax": e.get("price_trained_max"), "priceSafeMin": e.get("price_safe_min"),
@@ -7339,6 +7403,14 @@ def _cache_backtest_tiers(res: dict) -> None:
         })
     _backtest_tier_cache = next_cache
     _record_backtest_exclusions(res)
+    _sync_holiday_rates(res)
+
+
+def _sync_holiday_rates(res: dict | None) -> None:
+    """Hand the store's measured holiday rates (backtest.py → holiday_cover.py) to the
+    forecast. No run, or a run without holiday windows: the defaults stand."""
+    hc = (res or {}).get("holidayCover") or {}
+    _HC.set_rates(hc.get("rates"), (res or {}).get("ranAt"))
 
 
 # /api/backtest/file and /api/backtest/shopify were REMOVED deliberately.

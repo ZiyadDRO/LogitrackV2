@@ -27,6 +27,7 @@ Usage:
 """
 from __future__ import annotations
 import argparse
+import json
 import numpy as np
 import pandas as pd
 
@@ -34,6 +35,7 @@ import router as R
 from main import build_entry, lead_window_sigma, _exclude_from_pooling   # the REAL routing + engines — no reimplementation
 from forecast_engine import fill_daily_gaps
 import censoring as _CEN
+import holiday_cover as _HCV
 
 # The self-calibration inside build_entry refits the engine per holdout window. The
 # backtest ALREADY refits at every cutoff, so run it with fewer windows — the buffer
@@ -391,7 +393,8 @@ def _run_cutoff(df, sku, sku_df, cutoff, horizon, combos, service_pct,
                         store_peers=_store_peers_as_of(df, sku, cutoff, pool_cache))
     fc = entry["forecast"]
     end = cutoff + pd.Timedelta(days=horizon)
-    pred = fc[(fc["ds"] > cutoff) & (fc["ds"] <= end)][["ds", "yhat", "yhat_lower", "yhat_upper"]]
+    _hcols = [c for c in ("holiday", "hs_years") if c in fc.columns]
+    pred = fc[(fc["ds"] > cutoff) & (fc["ds"] <= end)][["ds", "yhat", "yhat_lower", "yhat_upper"] + _hcols]
     # Score the days training keeps. Grading against days the shelf was empty all day
     # (sales 0 because there was nothing to sell) reads as over-forecasting that scales
     # with how often a product was out; grading only fully-stocked days skips the
@@ -463,6 +466,15 @@ def _run_cutoff(df, sku, sku_df, cutoff, horizon, combos, service_pct,
             # still counts; NaN the decision metrics so they're excluded, not faked.
             f_lt = a_lt = _basis = 0.0
             covered, short = np.nan, np.nan
+        # Which reshaped holidays the lead window carries, and their forecast units in it
+        # (in-stock days only, like f_lt): what holiday_cover calibrates its rates on and
+        # replays the window with. {"key|anchor": [units, own years behind its shape]}.
+        hol_expo = {}
+        if buffer_testable and "holiday" in lt.columns:
+            for _k, _g in lt[lt["holiday"].notna()].groupby("holiday"):
+                _yrs = pd.to_numeric(_g["hs_years"], errors="coerce").dropna() if "hs_years" in _g.columns else []
+                hol_expo[str(_k)] = [round(float(_g["yhat"].clip(lower=0).sum()), 3),
+                                     int(_yrs.iloc[0]) if len(_yrs) else 0]
 
         # Order-quantity test: forecast vs actual demand over the post-delivery coverage window.
         f_cov = s("yhat", deliver, deliver + pd.Timedelta(days=coverage))
@@ -479,6 +491,12 @@ def _run_cutoff(df, sku, sku_df, cutoff, horizon, combos, service_pct,
                "fees": round(fees, 4),
                "trainDays": train_days, "leadDaysScored": n_lt,
                "bufferTestable": bool(buffer_testable),
+               # The window's forecast, actual and ordinary buffer σ, kept so the holiday
+               # cover can be replayed on these rows without refitting (holiday_cover.apply).
+               "fcLead": round(f_lt, 4) if buffer_testable else np.nan,
+               "actLead": round(a_lt, 4) if buffer_testable else np.nan,
+               "basisLead": round(float(_basis), 6) if buffer_testable else np.nan,
+               "holExpo": json.dumps(hol_expo) if hol_expo else "",
                # model coefficients behind the buffer (averaged across cutoffs for display)
                "sigma": round(float(entry.get("residual_std", 0.0)), 2),
                "cv": round(float(entry.get("residual_cv", 0.0)) * 100, 1)}
@@ -839,7 +857,9 @@ def _bootstrap_tier_ranking(costed, tiers, cycles_per_year, holding_annual, n_bo
             if f"lost_{pct}" not in g.columns or f"safety_{pct}" not in g.columns:
                 continue
             row[pct] = (_nanmean(g[f"lost_{pct}"]) * cycles_per_year * margin      # lost profit/yr
-                        + _nanmean(g[f"safety_{pct}"]) * unit_cost * holding_annual)  # holding/yr
+                        + _nanmean(g[f"safety_{pct}"]) * unit_cost * holding_annual   # holding/yr
+                        + _HCV.cost_per_year(g, Z[pct], unit_cost, holding_annual,
+                                             round(365.0 / cycles_per_year)))           # holiday cover/yr
         if row:
             per_sku[str(sku)] = row
     keys = list(per_sku)
@@ -914,7 +934,10 @@ def _mixed_policy(costed, tiers, cycles_per_year, holding_annual):
                 continue
             lost = pd.to_numeric(g[f"lost_{p}"], errors="coerce").to_numpy(float)
             saf = pd.to_numeric(g[f"safety_{p}"], errors="coerce").to_numpy(float)
-            cols[p] = lost * cycles_per_year * margin + saf * unit_cost * holding_annual
+            # Holiday cover's yearly carrying is a per-product constant at a tier; spread
+            # over the windows it keeps their mean equal to the yearly total, as above.
+            hol = _HCV.cost_per_year(g, Z[p], unit_cost, holding_annual, round(365.0 / cycles_per_year))
+            cols[p] = lost * cycles_per_year * margin + saf * unit_cost * holding_annual + hol
         if not cols:
             continue
         usable = ~np.isnan(np.vstack([cols[p] for p in cols])).any(axis=0)
@@ -1023,6 +1046,9 @@ def _tier_summary(frame, coverage=30, holding_annual=0.25):
     Returns {} when empty."""
     if frame is None or frame.empty:
         return {}
+    # Holiday weeks are replayed with the holiday cover the app carries (holiday_cover.py):
+    # cov_/lost_ below already include it, and its carrying cost is priced on its own.
+    frame, hc_fit = _HCV.apply(frame, Z)
     cycles_per_year = 365.0 / max(int(coverage), 1)
     total_skus = int(frame["sku"].nunique())
 
@@ -1072,7 +1098,7 @@ def _tier_summary(frame, coverage=30, holding_annual=0.25):
         # meaningful, and they're what you actually order — the dollars are just
         # units × a rate, so showing only the money hid half the arithmetic.
         safety_units = float(frame.groupby("sku")[saf_c].mean().dropna().sum())
-        stockout = holding = buffer_cash = 0.0
+        stockout = holding = buffer_cash = holiday = 0.0
         for _sku, g in costed.groupby("sku"):       # profit-positive, cost-known SKUs only
             margin_per_unit = float(g["marginUnit"].mean())
             unit_cost  = float(g["unitCost"].mean())
@@ -1081,6 +1107,8 @@ def _tier_summary(frame, coverage=30, holding_annual=0.25):
             stockout += avg_lost * cycles_per_year * margin_per_unit
             holding  += avg_safety * unit_cost * holding_annual
             buffer_cash += avg_safety * unit_cost    # standing capital parked in the buffer (one-time)
+            # Holiday cover: a temporary top-up, carried one order cycle per holiday.
+            holiday  += _HCV.cost_per_year(g, Z[pct], unit_cost, holding_annual, coverage)
         out.append({
             "tier": pct, "achievedService": achieved,
             # CI on the calibration figure. A "gap" smaller than this interval is noise,
@@ -1093,7 +1121,8 @@ def _tier_summary(frame, coverage=30, holding_annual=0.25):
             "safetyUnits": round(safety_units, 0),                      # buffer units carried (all SKUs)
             "stockoutCost": round(stockout, 2) if priced else None,   # lost PROFIT/yr (costed SKUs)
             "holdingCost": round(holding, 2) if priced else None,     # = "Buffer cost / yr" in the UI
-            "totalCost": round(stockout + holding, 2) if priced else None,
+            "holidayCost": round(holiday, 2) if priced else None,     # holiday cover carrying / yr
+            "totalCost": round(stockout + holding + holiday, 2) if priced else None,
             "bufferCash": round(buffer_cash, 2) if priced else None,  # working capital tied up (a LEVEL, not /yr)
             "windows": int(frame[cov_c].notna().sum()),   # buffer-testable windows only
         })
@@ -1125,7 +1154,8 @@ def _tier_summary(frame, coverage=30, holding_annual=0.25):
                 continue
             if n_test == 0:
                 st[str(pct)] = {"unitsYr": None, "safetyUnits": None, "profitYr": None,
-                                "holdingCostYr": None, "totalCostYr": None, "bufferCash": None}
+                                "holdingCostYr": None, "holidayCostYr": None, "totalCostYr": None,
+                                "bufferCash": None}
                 continue
             lost_mean = _nanmean(g[f"lost_{pct}"])
             safety_mean = _nanmean(g[f"safety_{pct}"])
@@ -1133,11 +1163,15 @@ def _tier_summary(frame, coverage=30, holding_annual=0.25):
             buffer_cash = safety_mean * uc if profitable else None
             holding_yr = buffer_cash * holding_annual if buffer_cash is not None else None
             profit_yr = uyr * margin if profitable else None
+            hol_yr = (_HCV.cost_per_year(g, Z[pct], uc, holding_annual, coverage)
+                      if profitable else None)
             st[str(pct)] = {"unitsYr": round(uyr, 1),
                             "safetyUnits": round(safety_mean, 0),
                             "profitYr": round(profit_yr, 0) if profit_yr is not None else None,
                             "holdingCostYr": round(holding_yr, 0) if holding_yr is not None else None,
-                            "totalCostYr": round(profit_yr + holding_yr, 0) if (profit_yr is not None and holding_yr is not None) else None,
+                            "holidayCostYr": round(hol_yr, 0) if hol_yr is not None else None,
+                            "totalCostYr": (round(profit_yr + holding_yr + hol_yr, 0)
+                                            if (profit_yr is not None and holding_yr is not None) else None),
                             "bufferCash": round(buffer_cash, 0) if buffer_cash is not None else None}
         best_sku_tier = None
         if profitable:
@@ -1192,6 +1226,10 @@ def _tier_summary(frame, coverage=30, holding_annual=0.25):
         "mixedPolicy": (_mixed_policy(costed, out, cycles_per_year, holding_annual)
                         if priced else None),
         "tiers": out, "bySku": by_sku, "bestTier": best,
+        # Holiday weeks with and without the holiday cover, per holiday, and the store's
+        # measured rates (the app's forecast uses the primary pair's; see holiday_cover).
+        "holidayCover": ({**(_HCV.summary(frame, Z, hc_fit) or {}), "rates": hc_fit["rates"]}
+                         if hc_fit else None),
     }
 
 
@@ -1270,7 +1308,7 @@ def rebuild_from_rows(result: dict, rows: pd.DataFrame, *, combos, holding_pct=2
         sub = primary[primary["sku"] == r["sku"]]
         r["engine"] = (sub["route"].mode().iloc[0] if len(sub) and not sub["route"].mode().empty else None)
         r["source"] = (sku_sources or {}).get(str(r["sku"]))
-    return {
+    out = {
         **result,
         "tested": int(primary["sku"].nunique()) if not primary.empty else 0,
         "forecasts": int(len(primary)),
@@ -1286,6 +1324,14 @@ def rebuild_from_rows(result: dict, rows: pd.DataFrame, *, combos, holding_pct=2
             for L, C in combos},
         "combos": [{"lead": L, "coverage": C} for L, C in combos],
     }
+    return _with_holiday_cover(out)
+
+
+def _with_holiday_cover(res: dict) -> dict:
+    """The store's holiday rates and holiday-week results at the top of a run, from the
+    primary (lead, coverage) pair: the one the app's forecast reads (main._sync_holiday_rates)."""
+    res["holidayCover"] = (res.get("tierAnalysis") or {}).get("holidayCover")
+    return res
 
 
 def _apply_costs(rows: pd.DataFrame, sku_costs: dict | None) -> pd.DataFrame:
@@ -1345,14 +1391,14 @@ def recost(result: dict, rows: pd.DataFrame, sku_costs: dict | None,
     holding_annual = max(0.0, float(holding_pct) / 100.0)
     combos = combos or [(int(df["leadDays"].iloc[0]), int(df["coverageDays"].iloc[0]))]
     primary = df[(df["leadDays"] == combos[0][0]) & (df["coverageDays"] == combos[0][1])]
-    return {
+    return _with_holiday_cover({
         **result,
         "tierAnalysis": _tier_summary(primary, combos[0][1], holding_annual),
         "tierAnalysisByCombo": {
             f"{L}/{C}": _tier_summary(df[(df["leadDays"] == L) & (df["coverageDays"] == C)], C, holding_annual)
             for L, C in combos},
         "recosted": True,
-    }
+    })
 
 
 def run_for_api(df, horizon=44, n_cutoffs=AUTO_CUTOFFS, step=28, lead=14, coverage=30,
@@ -1408,7 +1454,7 @@ def run_for_api(df, horizon=44, n_cutoffs=AUTO_CUTOFFS, step=28, lead=14, covera
         except Exception as ex:
             baseline = {"route": baseline_route, "error": f"{type(ex).__name__}: {ex}"}
 
-    return _json_safe({
+    return _json_safe(_with_holiday_cover({
         "params": {"horizon": horizon, "cutoffs": n_cutoffs, "step": step, "lead": lead,
                    "coverage": coverage, "service": service_pct, "minTrain": min_train,
                    "minWindowsReportable": MIN_WINDOWS_REPORTABLE},
@@ -1434,7 +1480,7 @@ def run_for_api(df, horizon=44, n_cutoffs=AUTO_CUTOFFS, step=28, lead=14, covera
             f"{L}/{C}": _tier_summary(results[(results["leadDays"] == L) & (results["coverageDays"] == C)],
                                       C, holding_annual)
             for L, C in combos} if not results.empty else {},
-    })
+    }))
 
 
 def report(results: pd.DataFrame, service_pct=95, holding_annual=0.25, coverage=30):

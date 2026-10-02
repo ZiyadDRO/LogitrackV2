@@ -151,6 +151,7 @@ const buildCsv = (res) => {
     { label: "Missed units/yr", get: (t) => t.unitsShortYr },
     { label: "Lost profit $/yr", get: (t) => t.stockoutCost },
     { label: "Buffer holding $/yr", get: (t) => t.holdingCost },
+    { label: "Holiday cover $/yr", get: (t) => t.holidayCost },
     { label: "Total $/yr", get: (t) => t.totalCost },
     { label: "Cash in buffer $", get: (t) => t.bufferCash },
   ], ta.tiers);
@@ -183,6 +184,7 @@ const buildCsv = (res) => {
       { label: `${t}% buffer units`, get: (r) => r.tiers?.[t]?.safetyUnits },
       { label: `${t}% cash in buffer $`, get: (r) => r.tiers?.[t]?.bufferCash },
       { label: `${t}% buffer holding $/yr`, get: (r) => r.tiers?.[t]?.holdingCostYr },
+      { label: `${t}% holiday cover $/yr`, get: (r) => r.tiers?.[t]?.holidayCostYr },
       { label: `${t}% total $/yr`, get: (r) => r.tiers?.[t]?.totalCostYr },
     ]),
   ], ta.bySku);
@@ -219,6 +221,124 @@ const whenRan = (ts) => {
 // A gap only counts as evidence if the target falls OUTSIDE the interval. Inside it,
 // the honest read is "not enough windows to tell", not "the buffer is mis-sized".
 const ciCovers = (ci, target) => Array.isArray(ci) && ci.length === 2 && target >= ci[0] && target <= ci[1];
+
+/* ─── HOLIDAY WEEKS ─────────────────────────────────────────────────────────────
+ * Holiday weeks sell less predictably than ordinary ones, so orders placed while a
+ * holiday is inside the order window carry temporary extra cover (holiday_cover.py).
+ * These show what that cover bought in the replay: how often holiday weeks stayed in
+ * stock with it and without it, at the store's measured rate per holiday. The "with"
+ * figures are out of sample (each year graded with a rate measured without it). */
+const HMUTED = "text-[var(--t-dim)]";
+const HTEXT = "text-[var(--t-ink)]";
+const hpct = (v) => (v == null ? "-" : `${v}%`);
+const hrateText = (r) => {
+  const vs = ["1", "2", "3"].map((b) => r?.[b]);
+  if (vs.every((v) => v == null)) return "-";
+  return vs.map((v) => (v == null ? "-" : `${Math.round(v * 100)}%`)).join(" / ");
+};
+const tierRow = (hc, tier) => (hc?.tiers || []).find((t) => t.tier === tier)
+  || (hc?.tiers || []).find((t) => t.tier === 95);
+
+function HolidayWeeksTable({ hc, lm }) {
+  const rows = hc?.byHoliday || [];
+  const th = `text-left text-[14px] uppercase tracking-widest font-bold ${HMUTED} px-3 py-2`;
+  return (
+    <div>
+      <div className={`px-4 py-3 border-b text-[15px] leading-relaxed border-[var(--t-line)] bg-[var(--t-accent-soft)] text-[var(--t-soft)]`}>
+        Holiday weeks get temporary extra cover, sized by how far off holiday weeks have run in this store.
+        A holiday gets <span className="font-semibold">its own rate</span> once it has {hc?.rules?.minOwnWindows ?? 100}+
+        tested weeks across {hc?.rules?.minOwnSkus ?? 20}+ products; the rest <span className="font-semibold">share one</span>.
+        Rates are stepped by how many of the product&apos;s own years the holiday&apos;s pattern rests on (1 / 2 / 3+), and
+        graded leave-one-year-out.
+      </div>
+      <div className="overflow-x-auto">
+        <table className="w-full">
+          <thead><tr>
+            <th className={th} title="The holiday stretch the forecast reshapes.">Holiday</th>
+            <th className={th} title="Own: measured on this holiday's weeks alone. Shared: not enough of its weeks yet, so it uses the rate measured on every holiday together.">Rate source</th>
+            <th className={th} title="Extra cover as a share of the holiday's forecast units, for a pattern resting on 1 / 2 / 3+ of the product's own years. Fewer years, less certain, more cover.">Rate by history (1 / 2 / 3+ yrs)</th>
+            <th className={th} title="Replayed weeks that carried this holiday.">Weeks</th>
+            <th className={th} title="Products those weeks came from.">Products</th>
+            <th className={th} title="How often those weeks stayed in stock at the 95% level, without the cover and with it.">In stock: without → with</th>
+            <th className={th} title="Typical extra units carried before this holiday at the 95% level.">Avg cover</th>
+          </tr></thead>
+          <tbody>
+            {rows.map((r) => (
+              <tr key={r.key} className="border-t border-[var(--t-line)]">
+                <td className={`px-3 py-2 text-[15px] font-semibold ${HTEXT}`}>{r.name}</td>
+                <td className={`px-3 py-2 text-[14px] ${r.rateSource === "own" ? HTEXT : HMUTED}`}>{r.rateSource === "own" ? "own" : "shared"}</td>
+                <td className={`px-3 py-2 text-[15px] tabular-nums ${HTEXT}`}>{hrateText(r.rates)}</td>
+                <td className={`px-3 py-2 text-[15px] tabular-nums ${HMUTED}`}>{r.windows}</td>
+                <td className={`px-3 py-2 text-[15px] tabular-nums ${HMUTED}`}>{r.skus}</td>
+                <td className="px-3 py-2 text-[15px] tabular-nums">
+                  <span className={tone(lm, lvlSvc(r.without, 95))}>{hpct(r.without)}</span>
+                  <span className={HMUTED}> → </span>
+                  <span className={`font-bold ${tone(lm, lvlSvc(r.with, 95))}`}>{hpct(r.with)}</span>
+                </td>
+                <td className={`px-3 py-2 text-[15px] tabular-nums ${HMUTED}`}>{r.avgCoverUnits == null ? "-" : `+${Math.round(r.avgCoverUnits)} units`}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <div className={`px-4 py-2 text-[14px] ${HMUTED} border-t border-[var(--t-line)]`}>
+        {hc.windows} holiday weeks and {hc.ordinaryWindows} ordinary weeks replayed. Shared rate (1 / 2 / 3+ yrs): {hrateText(hc.shared)}.
+      </div>
+    </div>
+  );
+}
+
+function HolidayWeeksCard({ hc, tier, lm, money, holidayCost }) {
+  const rows = hc?.byHoliday || [];
+  const t = tierRow(hc, tier);
+  if (!rows.length || !t) return null;
+  const shared = rows.filter((r) => r.rateSource !== "own");
+  const own = rows.filter((r) => r.rateSource === "own");
+  const th = `text-left text-[14px] uppercase tracking-widest font-bold ${HMUTED} px-3 py-2`;
+  return (
+    <div className="bg-[var(--t-panel)] border-[var(--t-line)] border rounded-2xl overflow-hidden">
+      <div className="p-4">
+        <h3 className={`text-[16.5px] font-bold ${HTEXT}`}>Holiday weeks</h3>
+        <p className={`text-[15px] ${HMUTED} mt-1 max-w-[720px] leading-relaxed`}>
+          Holiday weeks sell less predictably than ordinary ones, so orders placed before a holiday carry
+          temporary extra cover, sold down after it. Without it you&apos;d have stayed in stock
+          in <span className="font-semibold">{hpct(t.holidayWithout)}</span> of holiday weeks; with it,{" "}
+          <span className={`font-semibold ${tone(lm, lvlSvc(t.holidayWith, t.ordinary ?? 95))}`}>{hpct(t.holidayWith)}</span>,
+          against {hpct(t.ordinary)} of ordinary weeks.
+          {holidayCost != null && <> It costs about {money(holidayCost)}/yr to carry, included in the totals below.</>}
+        </p>
+      </div>
+      <table className="w-full">
+        <thead><tr>
+          <th className={th}>Holiday</th>
+          <th className={th} title="Replayed weeks that carried this holiday.">Weeks tested</th>
+          <th className={th} title="How often those weeks stayed in stock at the 95% level, without the holiday cover and with it.">In stock: without → with</th>
+          <th className={th} title="Typical extra units carried before this holiday, per product, at the 95% level.">Typical cover</th>
+        </tr></thead>
+        <tbody>
+          {[...own, ...shared].map((r) => (
+            <tr key={r.key} className="border-t border-[var(--t-line)]">
+              <td className={`px-3 py-2 text-[15px] font-semibold ${HTEXT}`}>
+                {r.name}{r.rateSource !== "own" && <span className={HMUTED}>*</span>}
+              </td>
+              <td className={`px-3 py-2 text-[15px] tabular-nums ${HMUTED}`}>{r.windows}</td>
+              <td className="px-3 py-2 text-[15px] tabular-nums">
+                <span className={HMUTED}>{hpct(r.without)} → </span>
+                <span className={`font-bold ${tone(lm, lvlSvc(r.with, 95))}`}>{hpct(r.with)}</span>
+              </td>
+              <td className={`px-3 py-2 text-[15px] tabular-nums ${HMUTED}`}>{r.avgCoverUnits == null ? "-" : `+${Math.round(r.avgCoverUnits)} units`}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {shared.length > 0 && (
+        <div className={`px-4 py-2 text-[14px] ${HMUTED} border-t border-[var(--t-line)]`}>
+          * Shares one rate measured on every holiday together: not enough of its own weeks yet to measure it alone.
+        </div>
+      )}
+    </div>
+  );
+}
 
 export default function BacktestTab({ api = "http://localhost:8000", lm = false,
                                      holdingPct = 25, setHoldingPct = null,
@@ -637,6 +757,7 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
                headline's sign, because an interval spanning zero is the maseUnsure case. */
             const accRange = (!mci || maseUnsure) ? null
               : `95% confident: ${Math.round((1 - mci[1]) * 100)} to ${Math.round((1 - mci[0]) * 100)}% ${accDir}`;
+            const hcRow = tierRow(res.holidayCover, ta.bestTier ?? 95);
             const costNote = !ta.priced ? ""
               : ta.costBasis === "actual" ? "Based on your real per-unit cost and fees."
               : `Based on the ${ta.costedSkus} of ${ta.totalSkus} tested products with a cost entered. Add costs for the rest to include them.`;
@@ -665,6 +786,11 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
                           95% confident: {ciText(bestRow?.achievedServiceCI ?? ov["service_achieved%_ci"], "%")}
                         </div>
                       )}
+                      {hcRow?.holidayWith != null && (
+                        <div className={`text-[13px] ${muted} mt-1`} title="Weeks a holiday reshapes, graded with the temporary holiday cover, against every other week.">
+                          Holiday weeks {hcRow.holidayWith}% · other weeks {hcRow.ordinary}%
+                        </div>
+                      )}
                     </div>
                     <div className={`flex-1 min-w-[150px] rounded-xl border p-4 bg-[var(--t-panel)] border-[var(--t-line)]`}>
                       <div className={`text-[13px] uppercase tracking-widest font-bold ${muted} mb-1`}>Order sizing</div>
@@ -684,6 +810,9 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
                     </div>
                   </div>
                 </div>
+
+                <HolidayWeeksCard hc={res.holidayCover} tier={ta.bestTier ?? 95} lm={lm} money={money}
+                  holidayCost={bestRow?.holidayCost} />
 
                 {ta.priced && ta.bestTier && (
                   <div className={`rounded-2xl border p-4 bg-[var(--t-good-soft)] border-[var(--t-good-line)]`}>
@@ -765,6 +894,12 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
                             <span className="inline-block w-3 h-3" style={{ background: "var(--t-info)" }} />
                             Cost of holding buffer
                           </span>
+                          {rows.some((t) => (t.holidayCost || 0) > 0) && (
+                            <span className="flex items-center gap-2">
+                              <span className="inline-block w-3 h-3" style={{ background: "var(--t-warn)" }} />
+                              Holiday cover
+                            </span>
+                          )}
                         </div>
                       </div>
 
@@ -772,13 +907,15 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
                         {rows.map((t) => {
                           const isBest = t.tier === cheapest.tier;
                           const h = Math.max(Math.round((t.totalCost / max) * H), 6);
-                          const sc = t.stockoutCost, hc = t.holdingCost;
-                          const known = sc != null && hc != null && (sc + hc) > 0;
-                          const scH = known ? Math.round((sc / (sc + hc)) * h) : 0;
+                          const sc = t.stockoutCost, hc = t.holdingCost, hh = t.holidayCost || 0;
+                          const known = sc != null && hc != null && (sc + hc + hh) > 0;
+                          const scH = known ? Math.round((sc / (sc + hc + hh)) * h) : 0;
+                          const hhH = known ? Math.round((hh / (sc + hc + hh)) * h) : 0;
                           return (
                             <div key={t.tier} className="flex-1 flex flex-col items-center justify-end gap-2"
                               title={`${t.tier}% · ${money(t.totalCost)}/yr total`
-                                + (known ? `\n${money(sc)} profit lost to stockouts\n${money(hc)} cost of holding buffer` : "")}>
+                                + (known ? `\n${money(sc)} profit lost to stockouts\n${money(hc)} cost of holding buffer`
+                                  + (hh > 0 ? `\n${money(hh)} holiday cover` : "") : "")}>
                               <div className={`text-[15.5px] font-bold tabular-nums ${isBest ? "text-[var(--t-accent)]" : text}`}>
                                 {money(t.totalCost)}
                               </div>
@@ -786,6 +923,7 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
                                 {known ? (<>
                                   <div style={{ height: scH, background: "var(--t-bad)", opacity: isBest ? 1 : .55 }} />
                                   <div style={{ flex: 1, background: "var(--t-info)", opacity: isBest ? 1 : .55 }} />
+                                  {hhH > 0 && <div style={{ height: hhH, background: "var(--t-warn)", opacity: isBest ? 1 : .55 }} />}
                                 </>) : (
                                   <div style={{ flex: 1, background: "var(--t-info)", opacity: isBest ? 1 : .55 }} />
                                 )}
@@ -816,7 +954,7 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
                       <thead><tr>
                         <Th tip="Service-level target. A higher level keeps more spare stock on hand.">Level</Th>
                         <Th tip="How often the buffer would have prevented a stockout in past reorder cycles.">Stayed in stock</Th>
-                        <Th tip="Projected yearly cost = profit lost on sales you'd miss + cost of holding the safety buffer. Lowest wins.">Est. cost / yr</Th>
+                        <Th tip="Projected yearly cost = profit lost on sales you'd miss + cost of holding the safety buffer + cost of the extra stock carried before holidays. Lowest wins.">Est. cost / yr</Th>
                       </tr></thead>
                       <tbody>
                         {(() => {
@@ -922,6 +1060,7 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
               { key: "safetyUnits",   label: "Buffer units",        fmt: (v) => Math.round(v).toLocaleString(), total: (t) => t.safetyUnits, round: true },
               { key: "bufferCash",    label: "Cash in buffer",      fmt: money, total: (t) => t.bufferCash },
               { key: "holdingCostYr", label: "Buffer holding / yr", fmt: money, total: (t) => t.holdingCost },
+              { key: "holidayCostYr", label: "Holiday cover / yr",  fmt: money, total: (t) => t.holidayCost },
             ];
 
             /* A product that never ran short in ANY window forfeits no profit at any tier,
@@ -942,7 +1081,9 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
               return vs.length ? [Math.min(...vs), Math.max(...vs)] : [0, 0];
             };
 
+            const hcv = res.holidayCover;
             const TABS = [{ key: "summary", label: "Calibration & annual cost" },
+                          ...(hcv?.byHoliday?.length ? [{ key: "holidays", label: "Holiday weeks" }] : []),
                           ...METRICS.map((m) => ({ key: m.key, label: m.label }))];
             const activeKey = TABS.some((t) => t.key === matrixMetric) ? matrixMetric : "summary";
             const metric = METRICS.find((m) => m.key === activeKey);
@@ -1005,7 +1146,8 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
                         <span className="underline decoration-dotted decoration-[var(--t-faint)] underline-offset-4 cursor-help">Cash in buffer</span>
                       </th>
                       <Th tip="Yearly cost of holding the safety buffer: Cash in buffer × your holding rate. Covers tied-up capital, storage, insurance and obsolescence. Rises with the tier, since more stock costs more to hold.">Buffer holding / yr</Th>
-                      <Th tip="Lost profit/yr + Buffer holding/yr. The lowest total is the most profitable tier. Cash in buffer is not included: it's capital tied up, not a yearly expense.">Total $/yr</Th>
+                      <Th tip="Yearly cost of the extra stock carried before holidays (Holiday weeks tab). It's a temporary top-up bought before each holiday and sold down after, so each holiday costs one order cycle of holding, not a year's.">Holiday cover / yr</Th>
+                      <Th tip="Lost profit/yr + Buffer holding/yr + Holiday cover/yr. The lowest total is the most profitable tier. Cash in buffer is not included: it's capital tied up, not a yearly expense.">Total $/yr</Th>
                     </tr></thead>
                     <tbody>
                       {ta.tiers.map((t) => {
@@ -1041,6 +1183,7 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
                               <div className={`text-[13px] ${muted}`}>{isBest ? "baseline" : t.bufferCashDelta == null ? "" : `${t.bufferCashDelta > 0 ? "+" : "−"}$${Math.round(Math.abs(t.bufferCashDelta)).toLocaleString()} vs ${best}%`}</div>
                             </td>
                             <td className={`px-3 py-2 text-[15px] tabular-nums ${muted}`}>{money(t.holdingCost)}</td>
+                            <td className={`px-3 py-2 text-[15px] tabular-nums ${muted}`}>{money(t.holidayCost)}</td>
                             <td className={`px-3 py-2 text-[15px] font-bold tabular-nums ${isBest ? tone(lm, "good") : text}`}>{money(t.totalCost)}</td>
                           </tr>
                         );
@@ -1059,7 +1202,7 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
                           // not a full row competing for attention with the real answer.
                           return (
                             <tr className={`border-t border-[var(--t-line)]`}>
-                              <td colSpan={ta.ranking ? 11 : 10} className={`px-3 py-2 text-[14px] ${muted}`}
+                              <td colSpan={ta.ranking ? 12 : 11} className={`px-3 py-2 text-[14px] ${muted}`}
                                   title="Each product's own best level was tried and scored on unseen weeks. It cost more than the best single level, so one level is used for everything.">
                                 A custom level per product was tested ({spread}): {money(mp.totalCost)}/yr, no better than the best single level. One level is in use for everything.
                               </td>
@@ -1077,7 +1220,7 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
                               Each product at its own best level.
                             </td>
                             <td className={`px-3 py-2.5 text-[15px] font-bold tabular-nums ${tone(lm, "good")}`}>{money(mp.totalCost)}</td>
-                            <td className={`px-3 py-2.5 text-[14px] tabular-nums ${muted}`} colSpan={2}>
+                            <td className={`px-3 py-2.5 text-[14px] tabular-nums ${muted}`} colSpan={3}>
                               saves {money(saves)}/yr
                             </td>
                           </tr>
@@ -1092,10 +1235,12 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
                   <Guide id="tiers" cols={["tier","achieved","ci","vstarget","pcheap","bufunits","missunits","lostprofit","buffercost","totalcost","cash"]}
                     extra={[
                       ...(ta.mixedPolicy ? [["Per-product mix", "Every product on its own cheapest level instead of one shared level. Scored fairly: each reorder is graded with a level picked from that product's other test windows, so lucky results can't win it. Hindsight scoring would have claimed " + money(ta.mixedPolicy.inSampleTotal) + "/yr.", "If it beats the best single level, the app uses per-product levels; if not, every product gets the winning single level. Applied automatically either way."]] : []),
-                      ["How the dollars are built", "Lost profit/yr = missed units/yr × profit per unit (price − cost − fees), summed per product. Buffer holding/yr = buffer units × unit cost × your holding rate. The shortfall is simulated per tier (would forecast + that tier's buffer have covered the next lead time's real demand?), not the stockouts in your history.", "Costs cover only the safety-stock policy, the part the tier changes."],
+                      ["How the dollars are built", "Lost profit/yr = missed units/yr × profit per unit (price − cost − fees), summed per product. Buffer holding/yr = buffer units × unit cost × your holding rate. Holiday cover/yr = the extra stock carried before each holiday × unit cost × holding rate × one order cycle. The shortfall is simulated per tier (would forecast + that tier's buffer have covered the next lead time's real demand?), not the stockouts in your history.", "Costs cover only the safety-stock policy, the part the tier changes."],
                       ["Cash in buffer vs Buffer holding", "Cash in buffer is one-time working capital parked in safety stock. It's not a yearly cost and not added to Total; its yearly cost is the Buffer holding column (cash × holding rate).", "Use it to judge affordability, not to rank tiers."],
                     ]} />
-                </>) : bySku.length === 0 ? (
+                </>) : activeKey === "holidays" ? (
+                  <HolidayWeeksTable hc={hcv} lm={lm} />
+                ) : bySku.length === 0 ? (
                   <div className={`px-4 py-4 text-[15px] ${muted}`}>No per-product breakdown in this run.</div>
                 ) : (
                   <div>

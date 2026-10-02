@@ -107,7 +107,17 @@ export function OrderMathCard({ data, leadTime, planSource, planNeeded, coverage
       <div className="p-3.5 font-mono text-[15px] space-y-1.5">
         <div className={`text-[14px] uppercase tracking-widest font-bold pb-1.5 mb-0.5 border-b ${head}`}>Order qty breakdown</div>
         <div className={`flex justify-between ${label}`}><span>Demand after delivery ({coverageDays}d)</span><span className={`${val} tabular-nums`}>{data.coverageQty.toLocaleString()}</span></div>
-        <div className={`flex justify-between ${label}`}><span>Demand buffer</span><span className="text-[var(--t-accent)] tabular-nums">+ {data.safetyStock.toLocaleString()}</span></div>
+        {data.holidayCover?.units > 0 ? (<>
+          <div className={`flex justify-between ${label}`}><span>Demand buffer</span><span className="text-[var(--t-accent)] tabular-nums">+ {data.holidayCover.standingUnits.toLocaleString()}</span></div>
+          {/* Temporary: only while a holiday is inside the order window, sold down after. */}
+          <div className={`flex justify-between ${label}`}
+            title={`Extra cover for ${data.holidayCover.holidays.map(h => h.name).join(" and ")}: holiday weeks sell less predictably, so this order carries more spare stock. It's temporary: once the holiday passes, the next order is smaller by whatever's left.${data.holidayCover.carryCost != null ? ` About $${Math.round(data.holidayCover.carryCost).toLocaleString()} to carry for one order cycle.` : ""}`}>
+            <span className="truncate pr-2">Holiday cover ({data.holidayCover.holidays[0]?.name}{data.holidayCover.holidays.length > 1 ? ` +${data.holidayCover.holidays.length - 1}` : ""})</span>
+            <span className="text-[var(--t-accent)] tabular-nums">+ {data.holidayCover.units.toLocaleString()}</span>
+          </div>
+        </>) : (
+          <div className={`flex justify-between ${label}`}><span>Demand buffer</span><span className="text-[var(--t-accent)] tabular-nums">+ {data.safetyStock.toLocaleString()}</span></div>
+        )}
         <div className={`flex justify-between ${sub} border-t pt-1.5 mt-0.5`}><span>Target stock level</span><span className="font-bold tabular-nums">{data.targetInventory.toLocaleString()}</span></div>
         <div className={`flex justify-between text-[14px] ${label}`}><span>Est. stock at delivery</span><span className="text-[var(--t-bad)] tabular-nums">− {(data.stockAtDelivery ?? data.projectedStockReorder).toLocaleString()}</span></div>
         {unitsOnOrder > 0 && (
@@ -1291,7 +1301,10 @@ export default function SkuDetailPanel({ skuId, skuList, params: paramsIn, onPar
                         // swing MEASURED over real lead-time windows (bigger when demand clumps). Back
                         // the swing actually used out of the held buffer so the rows stay consistent.
                         const formulaSpread = (sigma != null && rootL != null) ? sigma * rootL : null;
-                        const usedSpread = (zScore && mlData.safetyStock != null) ? mlData.safetyStock / zScore : formulaSpread;
+                        // The swing is the standing buffer's; holiday cover is on its own line.
+                        const hcv = mlData.holidayCover?.units > 0 ? mlData.holidayCover : null;
+                        const standing = hcv ? hcv.standingUnits : mlData.safetyStock;
+                        const usedSpread = (zScore && standing != null) ? standing / zScore : formulaSpread;
                         const widened = (usedSpread != null && formulaSpread != null) && usedSpread > formulaSpread * 1.08;
                         return (
                           <div className={`px-3 py-2.5 space-y-1.5 text-[14px] ${"bg-[var(--t-sunken)]"}`}>
@@ -1299,7 +1312,15 @@ export default function SkuDetailPanel({ skuId, skuList, params: paramsIn, onPar
                             <div className={`flex justify-between ${rowC}`}><span>Day-to-day swing (σ)</span><span className={`font-mono ${valC}`}>±{sigma}/day</span></div>
                             <div className={`flex justify-between ${rowC}`}><span>Swing over the {lt}-day wait</span><span className={`font-mono ${valC}`}>±{usedSpread?.toFixed(1)} {widened ? "(measured)" : `≈ σ×√${lt}`}</span></div>
                             <div className={`flex justify-between ${rowC}`}><span>Protection factor</span><span className={`font-mono ${valC}`}>×{zScore?.toFixed(2)} ({p.servicePct}%)</span></div>
+                            {hcv && (
+                              <div className={`flex justify-between ${rowC}`}><span>Holiday cover ({hcv.holidays.map(h => h.name).join(", ")})</span><span className={`font-mono ${valC}`}>+{hcv.units}</span></div>
+                            )}
                             <div className={`flex justify-between font-semibold border-t pt-1.5 ${"border-[var(--t-line)] text-[var(--t-soft)]"}`}><span>Buffer held</span><span className="font-mono">{mlData.safetyStock} units</span></div>
+                            {hcv && (
+                              <p className={`leading-relaxed ${"text-[var(--t-dim)]"}`}>
+                                Of which <span className="font-semibold">{hcv.units}</span> is holiday cover: holiday weeks sell less predictably, so orders placed while a holiday is inside the order window carry extra. It&apos;s temporary; once the holiday passes the next order is smaller by whatever&apos;s left{hcv.carryCost != null ? `, so it costs about $${Math.round(hcv.carryCost).toLocaleString()} to carry, not a year's holding` : ""}.
+                              </p>
+                            )}
                             <p className={`pt-1 leading-relaxed ${"text-[var(--t-dim)]"}`}>
                               We hold <span className="font-semibold">{mlData.safetyStock}</span> spare units to cover demand swings during the {lt}-day wait about {p.servicePct}% of the time{p.achievedPct != null ? ` (replayed against your history: ${p.achievedPct}%, since real demand has a longer tail than the bell curve the buffer assumes)` : ""}. The swing comes from how far past forecasts missed over real {lt}-day stretches{widened ? "; this item sells in clumps, so it's wider than a steady seller's and earns extra buffer" : ", and here it matches the day-to-day swing stretched over the wait"}. A noisier or clumpier item, or a longer lead time, raises this; a steadier one lowers it.
                             </p>
