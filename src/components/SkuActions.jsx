@@ -384,7 +384,9 @@ function HYears({ r }) {
     <div className="mt-3 rounded-lg overflow-y-auto" style={{ maxHeight: 260, border: "1px solid var(--t-line)", background: "var(--t-panel)" }}>
       <div className="grid px-3 py-2 text-[12px] uppercase tracking-wider font-semibold sticky top-0"
         style={{ gridTemplateColumns: "56px 1fr 70px 80px", gap: "0 10px", color: "var(--t-dim)", background: "var(--t-panel)", borderBottom: "1px solid var(--t-line)" }}>
-        <span>Year</span><span>Busiest day</span><span className="text-right">Units</span><span className="text-right">vs prior</span>
+        <span>Year</span>
+        <span title="The single best day as it actually sold, against that year's average day. One real day swings much more than a forecast, which shows the expected average for each day, so these read higher than this year's figure.">Busiest day (actual)</span>
+        <span className="text-right">Units</span><span className="text-right">vs prior</span>
       </div>
       {ys.map(y => (
         <div key={y.anchor} className="grid px-3 py-2 text-[14px] items-baseline"
@@ -400,6 +402,10 @@ function HYears({ r }) {
           </span>
         </div>
       ))}
+      <div className="px-3 py-2 text-[12.5px]" style={{ color: "var(--t-dim)", borderTop: "1px solid var(--t-line)" }}>
+        Past years show real days as they sold, so a single strong day can read 3× or more. This year&apos;s figure is the
+        forecast&apos;s expected day, which is smoother by nature.
+      </div>
       {ys.some(y => !y.complete) && (
         <div className="px-3 py-2 text-[12.5px]" style={{ color: "var(--t-dim)", borderTop: "1px solid var(--t-line)" }}>
           * Only part of that year's stretch is in the sales history, so it isn't compared as a percentage.

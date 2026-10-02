@@ -1052,9 +1052,10 @@ def _hs_report(df, future_fc, lv, own, off, to_real, settings, shift=0, peer_inf
         # from the holiday's shape alone, before the weekday pattern, the blend into the
         # stretch's edges and any promotion, so a Saturday could stand taller than a day
         # marked 1.58x. Days past the end of the forecast (no units) keep the shape's
-        # figure and are left out of busiest/quietest.
+        # figure and are left out of busiest/quietest. "Typical" is the stretch's average
+        # day, the same yardstick the past years below use.
         _u = [dd["units"] for dd in days if not dd["closed"] and dd["units"] is not None]
-        _med_u = float(np.median(_u)) if _u else 0.0
+        _med_u = float(np.mean(_u)) if _u else 0.0
         if _med_u > 0:
             for dd in days:
                 if dd["units"] is not None and not dd["closed"]:
