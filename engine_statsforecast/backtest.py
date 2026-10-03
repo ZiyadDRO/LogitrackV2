@@ -72,6 +72,10 @@ AUTO_CUTOFFS = "auto"
 # history, was ~300. Both scale with the horizon, which is lead + coverage per product.
 AUTO_MIN_CUTOFFS = 4
 
+class BacktestCancelled(Exception):
+    """A newer request replaced this run (the settings it was measuring changed)."""
+
+
 # Per-SKU metrics computed from fewer than this many windows are too noisy to show.
 MIN_WINDOWS_REPORTABLE = 4
 
@@ -601,7 +605,7 @@ def _normalise_combos(combos, lead, coverage):
 
 def run_backtest(df, horizon=44, n_cutoffs=AUTO_CUTOFFS, step=28, lead=14, coverage=30,
                  service_pct=95, min_train=120, verbose=True, skipped=None,
-                 sku_costs=None, force_route=None, combos=None, only_skus=None):
+                 sku_costs=None, force_route=None, combos=None, only_skus=None, should_stop=None):
     """`only_skus` refits just those products. Relatedness still reads the WHOLE catalog
     (a product's peers don't change because you edited its lead time), so a partial run
     produces exactly the rows a full run would for those products — at a fraction of the
@@ -612,6 +616,10 @@ def run_backtest(df, horizon=44, n_cutoffs=AUTO_CUTOFFS, step=28, lead=14, cover
     rows = []
     pool_cache = {}   # cutoff → (catalog, groups, clusters); shared across SKUs
     for sku, g in df.groupby("sku"):
+        # Checked between products: a run whose settings were changed under it stops
+        # within one product's fits, so the new one starts now instead of queuing.
+        if should_stop is not None and should_stop():
+            raise BacktestCancelled()
         if want is not None and str(sku) not in want:
             continue
         g = g.sort_values("ds").reset_index(drop=True)
@@ -1403,7 +1411,8 @@ def recost(result: dict, rows: pd.DataFrame, sku_costs: dict | None,
 
 def run_for_api(df, horizon=44, n_cutoffs=AUTO_CUTOFFS, step=28, lead=14, coverage=30,
                 service_pct=95, min_train=120, holding_pct=25, sku_costs=None,
-                baseline_route="prophet", combos=None, sku_sources=None, rows_sink=None):
+                baseline_route="prophet", combos=None, sku_sources=None, rows_sink=None,
+                should_stop=None):
     """Run the backtest and return JSON-friendly results for the web UI.
     `sku_costs` = {sku_id: {"cost": float, "fees": float}} from the dashboard Scorecard,
     so the tier economics use each product's real cost (SKUs without one are skipped).
@@ -1415,7 +1424,7 @@ def run_for_api(df, horizon=44, n_cutoffs=AUTO_CUTOFFS, step=28, lead=14, covera
     horizon = effective_horizon(horizon, combos)
     results = run_backtest(df, horizon, n_cutoffs, step, lead, coverage, service_pct,
                            min_train, verbose=False, skipped=skipped, sku_costs=sku_costs,
-                           combos=combos)
+                           combos=combos, should_stop=should_stop)
     # Accuracy is identical across pairs (same fits), so report it from the primary one —
     # otherwise every SKU would appear N times in the fleet averages.
     primary = results[(results["leadDays"] == combos[0][0]) & (results["coverageDays"] == combos[0][1])] \
@@ -1445,12 +1454,15 @@ def run_for_api(df, horizon=44, n_cutoffs=AUTO_CUTOFFS, step=28, lead=14, covera
         try:
             b_res = run_backtest(df, horizon, n_cutoffs, step, lead, coverage, service_pct,
                                  min_train, verbose=False, skipped=b_skipped,
-                                 sku_costs=sku_costs, force_route=baseline_route)
+                                 sku_costs=sku_costs, force_route=baseline_route,
+                                 should_stop=should_stop)
             if not b_res.empty:
                 baseline = {"route": baseline_route, "overall": _agg(b_res, ci=True),
                             "bySku": _grouped(b_res, "sku").to_dict("records"),
                             "skipped": b_skipped,
                             "failedCutoffs": int(sum(1 for s in b_skipped if s.get("kind") == "error"))}
+        except BacktestCancelled:
+            raise
         except Exception as ex:
             baseline = {"route": baseline_route, "error": f"{type(ex).__name__}: {ex}"}
 

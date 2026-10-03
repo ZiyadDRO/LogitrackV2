@@ -482,19 +482,17 @@ export default function App() {
   // STRUCTURAL (lead time, coverage) changes which windows the buffer is judged over —
   // that needs a real re-run. ECONOMIC (cost, fees, holding) only changes what the
   // already-measured units are worth, so it re-prices the stored rows in milliseconds.
-  /* Products whose lead time is still an untouched default are skipped, exactly as the
-     engine already skips products with no unit cost — a backtest against a placeholder
-     reads as evidence when it is a guess. They join automatically once you set one. */
-  const btReady = useMemo(
-    () => skuList.filter(s => leadTimeConfirmed(s.id, getParams(s.id), suppliers)).map(s => s.id),
-    [skuList, skuParams, suppliers]);   // eslint-disable-line react-hooks/exhaustive-deps
+  /* Products whose lead time is still an untouched default are named on the Backtest tab
+     ("tested against the default lead time"), but they ARE tested, at that default, by
+     every run including the automatic re-tests. Re-tests used to skip them, so changing
+     such a product's coverage never re-measured it: it sat on "re-testing" forever, on an
+     untested estimate that could disagree with the level the store was using. */
   const btWaiting = useMemo(
     () => skuList.filter(s => !leadTimeConfirmed(s.id, getParams(s.id), suppliers)).map(s => s.id),
     [skuList, skuParams, suppliers]);   // eslint-disable-line react-hooks/exhaustive-deps
 
   const btSignature = JSON.stringify(
     Object.entries(skuParams).sort(([a], [b]) => a.localeCompare(b))
-      .filter(([id]) => btReady.includes(id))
       .map(([id, p]) => [id, planningLeadTime(id, p, suppliers, { ignoreOneOff: true }).days, p?.coverage ?? DEFAULT_PARAMS.coverage])
   );
   const btCostSignature = JSON.stringify(
@@ -509,11 +507,10 @@ export default function App() {
     // Debounced: each run refits every engine at every cutoff, so firing per keystroke
     // while someone types a lead time would queue minutes of work for nothing.
     btDebounce.current = setTimeout(() => {
-      // Only products whose lead time is settled get a fingerprint. One that isn't ready
-      // is simply absent; the moment it becomes ready it appears, and planRecompute reads
-      // that as "needs testing" rather than silently skipping it forever.
+      // Every product gets a fingerprint, including one still on the default lead time
+      // (it's tested at that default), so changing its coverage re-tests it too.
       const now = {};
-      skuList.filter((s) => btReady.includes(s.id)).forEach((s) => {
+      skuList.forEach((s) => {
         const q = getParams(s.id);
         now[s.id] = `${planningLeadTime(s.id, q, suppliers, { ignoreOneOff: true }).days}/${q.coverage ?? DEFAULT_PARAMS.coverage}`;
       });
@@ -578,13 +575,12 @@ export default function App() {
       if (Number.isFinite(c) && q?.unitCost !== "" && q?.unitCost != null) costs[sku] = { cost: c, fees: Number(q?.fees) || 0 };
     });
     const seen = new Set(), combos = [];
-    skuList.filter(s => btReady.includes(s.id)).forEach((s) => {
+    skuList.forEach((s) => {
       const q = getParams(s.id);
       const L = planningLeadTime(s.id, q, suppliers, { ignoreOneOff: true }).days, C = Number(q.coverage ?? DEFAULT_PARAMS.coverage);
       const k = `${L}/${C}`;
       if (!seen.has(k)) { seen.add(k); combos.push({ lead: L, coverage: C }); }
     });
-    skus = skus.filter(id => btReady.includes(id));
     if (!skus.length) return;
     try {
       const r = await fetch(`${API}/api/backtest/partial`, {
@@ -603,14 +599,14 @@ export default function App() {
     // and without this a product whose lead time you changed could never be re-measured —
     // the run used the fleet's typical values, so its own pair stayed untested forever.
     const seen = new Set(), combos = [];
-    skuList.filter(s => btReady.includes(s.id)).forEach((s) => {
+    skuList.forEach((s) => {
       const q = getParams(s.id);
       const L = planningLeadTime(s.id, q, suppliers, { ignoreOneOff: true }).days;
       const C = Number(q.coverage ?? DEFAULT_PARAMS.coverage);
       const k = `${L}/${C}`;
       if (!seen.has(k)) { seen.add(k); combos.push({ lead: L, coverage: C }); }
     });
-    if (!combos.length) return false;   // nothing has a confirmed lead time yet
+    if (!combos.length) return false;   // no products loaded
     const commonest = (key, fallback) => {
       const counts = {};
       skuList.forEach((s) => { const v = getParams(s.id)[key] ?? fallback; counts[v] = (counts[v] || 0) + 1; });

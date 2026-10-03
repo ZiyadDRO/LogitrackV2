@@ -1206,7 +1206,8 @@ export default function SkuDetailPanel({ skuId, skuList, params: paramsIn, onPar
                 {!p.testRunning && p.status === "stale" && (
                   <div className="mb-2 text-[14px] text-[var(--t-dim)]">
                     Tested for a different lead time or coverage than this product&apos;s current settings, so the level
-                    below is an estimate until it&apos;s re-tested (Backtest tab → Re-test now).
+                    below is an estimate until it&apos;s re-tested. Changing a setting starts a re-test on its own; Backtest
+                    tab → Re-test now runs one by hand.
                   </div>
                 )}
                 <div className={`rounded-xl border overflow-hidden ${"bg-[var(--t-sunken)] border-[var(--t-line)]"}`}>

@@ -6591,6 +6591,8 @@ _bt_job: dict = {"status": "idle", "startedAt": None, "finishedAt": None,
                  "queued": False}
 _bt_job_lock = threading.Lock()
 _bt_pending: dict | None = None      # newest request that arrived mid-run, if any
+# Set when a newer request replaces the running test; the run checks it between products.
+_bt_cancel = threading.Event()
 
 
 class _StaleBacktest(Exception):
@@ -6618,11 +6620,18 @@ def _run_backtest_job(params: dict, sku_costs: dict, trigger: str) -> bool:
     global _bt_pending
     with _bt_job_lock:
         if _bt_job["status"] == "running":
+            # Replace, don't wait: the running test is measuring settings that just changed,
+            # so it stops at its next product and this one starts straight after. Its
+            # half-finished numbers are dropped; the last finished run stays on screen
+            # until this one lands.
             _bt_pending = {"params": dict(params), "sku_costs": dict(sku_costs), "trigger": trigger}
             _bt_job["queued"] = True
+            _bt_cancel.set()
             return False
+        _bt_cancel.clear()
         _bt_job.update({"status": "running", "startedAt": time.time(), "finishedAt": None,
-                        "params": dict(params), "error": None, "trigger": trigger, "queued": False})
+                        "params": dict(params), "error": None, "trigger": trigger, "queued": False,
+                        "summary": None})
 
     def work():
         BT = _bt()          # checked import: verifies Z matches PROTECTION_TIERS
@@ -6639,7 +6648,8 @@ def _run_backtest_job(params: dict, sku_costs: dict, trigger: str) -> bool:
             # sheet costs are the floor no matter when — or from where — the job starts.
             _eff = _effective_sku_costs(sku_costs) or {}
             _sink = []
-            res = BT.run_for_api(df, **params, sku_costs=_eff, sku_sources=srcs, rows_sink=_sink)
+            res = BT.run_for_api(df, **params, sku_costs=_eff, sku_sources=srcs, rows_sink=_sink,
+                                 should_stop=_bt_cancel.is_set)
             with _state_lock:
                 global _last_backtest_rows, _last_backtest_combos
                 if not _bt_stamp_still_valid(stamp):
@@ -6660,6 +6670,10 @@ def _run_backtest_job(params: dict, sku_costs: dict, trigger: str) -> bool:
             with _bt_job_lock:
                 _bt_job.update({"status": "done", "finishedAt": time.time(), "error": None,
                                 "summary": {"discarded": "the loaded products changed while it ran"}})
+        except BT.BacktestCancelled:
+            with _bt_job_lock:
+                _bt_job.update({"status": "done", "finishedAt": time.time(), "error": None,
+                                "summary": {"discarded": "replaced by a newer test (settings changed)"}})
         except Exception as ex:
             with _bt_job_lock:
                 _bt_job.update({"status": "error", "finishedAt": time.time(),
@@ -6993,10 +7007,12 @@ def _run_partial_job(skus: list, params: dict, combos: list, sku_costs: dict, ho
     """Background refit of `skus` only, merged into the stored rows."""
     with _bt_job_lock:
         if _bt_job["status"] == "running":
+            # The caller falls back to a full run, which replaces the running one.
             return False
+        _bt_cancel.clear()
         _bt_job.update({"status": "running", "startedAt": time.time(), "finishedAt": None,
                         "params": dict(params), "error": None, "trigger": f"partial:{len(skus)}",
-                        "queued": False})
+                        "queued": False, "summary": None})
 
     def work():
         BT = _bt()          # checked import: verifies Z matches PROTECTION_TIERS
@@ -7011,7 +7027,8 @@ def _run_partial_job(skus: list, params: dict, combos: list, sku_costs: dict, ho
             fresh = BT.run_backtest(df, params["horizon"], params["n_cutoffs"], params["step"],
                                     params["lead"], params["coverage"], params["service_pct"],
                                     params["min_train"], verbose=False, sku_costs=sku_costs,
-                                    combos=combos or prev_combos or None, only_skus=skus)
+                                    combos=combos or prev_combos or None, only_skus=skus,
+                                    should_stop=_bt_cancel.is_set)
             merged = BT.merge_rows(prev_rows, fresh)
             all_combos = sorted({(int(a), int(b)) for a, b in
                                  zip(merged["leadDays"], merged["coverageDays"])})
@@ -7034,6 +7051,10 @@ def _run_partial_job(skus: list, params: dict, combos: list, sku_costs: dict, ho
             with _bt_job_lock:
                 _bt_job.update({"status": "done", "finishedAt": time.time(), "error": None,
                                 "summary": {"discarded": "the loaded products changed while it ran"}})
+        except BT.BacktestCancelled:
+            with _bt_job_lock:
+                _bt_job.update({"status": "done", "finishedAt": time.time(), "error": None,
+                                "summary": {"discarded": "replaced by a newer test (settings changed)"}})
         except Exception as ex:
             with _bt_job_lock:
                 _bt_job.update({"status": "error", "finishedAt": time.time(),

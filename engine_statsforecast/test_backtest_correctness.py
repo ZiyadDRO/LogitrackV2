@@ -148,5 +148,15 @@ check("the calibration windows were fitted with the forced route", len(calib) >=
 check("each saw its relatives only up to its own cutoff",
       all(mx is None or mx <= today for today, mx in seen), seen)
 
+print("\na run replaced by a newer request stops")
+import backtest as _BTC
+_df = pd.DataFrame({"sku": ["A"] * 400, "ds": pd.date_range("2024-01-01", periods=400),
+                    "y": np.random.default_rng(1).poisson(4, 400).astype(float)})
+try:
+    _BTC.run_backtest(_df, verbose=False, should_stop=lambda: True)
+    check("it raises BacktestCancelled before fitting anything", False, "no exception")
+except _BTC.BacktestCancelled:
+    check("it raises BacktestCancelled before fitting anything", True)
+
 print(f"\n{'All backtest correctness tests passed.' if not FAILURES else f'{len(FAILURES)} FAILED: ' + ', '.join(FAILURES)}")
 sys.exit(1 if FAILURES else 0)
