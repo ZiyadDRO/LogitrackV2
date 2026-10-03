@@ -608,7 +608,8 @@ def run_backtest(df, horizon=44, n_cutoffs=AUTO_CUTOFFS, step=28, lead=14, cover
                  sku_costs=None, force_route=None, combos=None, only_skus=None, should_stop=None,
                  progress=None):
     """`progress(order, done, current)` is told which products the run covers, in order,
-    and is called as each one starts (and once more, current=None, at the end).
+    and is called as each one starts, after each of its test windows (done is then
+    fractional), and once more with current=None at the end.
 
     `only_skus` refits just those products. Relatedness still reads the WHOLE catalog
     (a product's peers don't change because you edited its lead time), so a partial run
@@ -645,7 +646,12 @@ def run_backtest(df, horizon=44, n_cutoffs=AUTO_CUTOFFS, step=28, lead=14, cover
         # Per SKU, not one number for the catalog: a 900-day product supports far more
         # windows than a 200-day one, and forcing a shared count wastes the long histories.
         n_this = _resolve_cutoffs(n_cutoffs, first_allowed, last_possible, horizon)
-        for cutoff, block in _cutoff_schedule(first_allowed, last_possible, n_this, step):
+        sched = list(_cutoff_schedule(first_allowed, last_possible, n_this, step))
+        for j, (cutoff, block) in enumerate(sched):
+            # Within a product too: a one-product refit is all one product, so counting only
+            # whole products left its bar at 0% until the very end.
+            if progress is not None and j:
+                progress(order, done - 1 + j / len(sched), str(sku))
             try:
                 r = _run_cutoff(df, sku, g, cutoff, horizon, combos, service_pct,
                                 (sku_costs or {}).get(str(sku)), pool_cache, force_route)

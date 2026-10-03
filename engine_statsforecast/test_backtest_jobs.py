@@ -83,6 +83,7 @@ BT.run_backtest = fake_run_backtest
 BT.run_for_api = fake_run_for_api
 BT.merge_rows = lambda old, new: new
 BT.rebuild_from_rows = lambda *a, **k: {"tested": len(SKUS)}
+REAL_CACHE_TIERS = M._cache_backtest_tiers
 for name in ("_cache_backtest_tiers", "_store_backtest_result", "_persist_backtest", "_record_backtest_inputs"):
     setattr(M, name, lambda *a, **k: None)
 M.catalog_to_frame = lambda: pd.DataFrame({"sku": SKUS, "ds": pd.Timestamp("2025-01-01"), "y": 1.0})
@@ -179,6 +180,27 @@ wait_idle()
 check("the refit stops, the whole-store run replaces it, nothing extra after",
       RUNS == [("partial", ("P1",)), ("full", tuple(SKUS))], RUNS)
 check("after the run, the page has nothing to show", M._bt_sku_progress("P1") is None, M._bt_sku_progress("P1"))
+
+print("\nthe level a product on its own settings gets")
+
+
+def analysis(best, skus, mixed_cost=None):
+    tiers = [{"tier": t, "totalCost": (100 if t == best else 200)} for t in (95, 99, 99.5)]
+    return {"tiers": tiers, "bestTier": best, "nearestTier": best, "ranking": {"decisive": True},
+            "mixedPolicy": {"totalCost": mixed_cost} if mixed_cost is not None else None,
+            "assumptions": {"holdingPct": 25},
+            "bySku": [{"sku": s, "costKnown": True, "lossMaking": False, "bestTier": 95,
+                       "windows": 23, "tiers": {"95": {}, "99": {}, "99.5": {}}} for s in skus]}
+
+
+store = analysis(99.5, SKUS)
+alone = analysis(95, ["P2"])          # P2 moved to 21 days' coverage: a "store" of one
+REAL_CACHE_TIERS({"params": {"lead": 14, "coverage": 30}, "tierAnalysis": store,
+                  "tierAnalysisByCombo": {"14/30": store, "14/21": alone}})
+got = M._backtest_tier_cache.get("P2|14|21") or {}
+check("a product on different settings gets the store-wide level, not one picked from itself alone",
+      got.get("pct") == 99.5 and got.get("policy") == "uniform", got)
+check("and so does everyone else", (M._backtest_tier_cache.get("P0|14|30") or {}).get("pct") == 99.5)
 
 print(f"\n{'All backtest-job tests passed.' if not FAILURES else f'{len(FAILURES)} FAILED: ' + ', '.join(FAILURES)}")
 sys.exit(1 if FAILURES else 0)

@@ -234,6 +234,21 @@ const hpct = (v) => (v == null ? "-" : `${v}%`);
 const tierRow = (hc, tier) => (hc?.tiers || []).find((t) => t.tier === tier)
   || (hc?.tiers || []).find((t) => t.tier === 95);
 
+
+/* The single level the app actually runs, by the same rule the engine applies
+   (main.py _combo_policy): the cheapest level, unless the cost ranking was a coin flip,
+   in which case the level whose achieved in-stock lands closest to optimal. null when a
+   level per product won. The "in use" row used to mark the cheapest level regardless, so
+   the table said 99% while every product ran 99.5%. */
+function inUseTier(ta) {
+  if (!ta?.tiers?.length) return null;
+  const mp = ta.mixedPolicy;
+  const bestUniformCost = Math.min(...ta.tiers.map((t) => t.totalCost).filter((v) => v != null));
+  if (mp?.totalCost != null && mp.totalCost < bestUniformCost) return null;
+  const tied = ta.ranking && !ta.ranking.decisive;
+  return tied && ta.nearestTier != null ? ta.nearestTier : (ta.bestTier ?? ta.nearestTier);
+}
+
 function HolidayWeeksTable({ hc, lm }) {
   const rows = hc?.byHoliday || [];
   const th = `text-left text-[14px] uppercase tracking-widest font-bold ${HMUTED} px-3 py-2`;
@@ -729,7 +744,8 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
             const ov = res.overall || {};
             const ta = res.tierAnalysis || {};
             const money = (v) => v == null ? "-" : `$${Math.round(v).toLocaleString()}`;
-            const bestRow = (ta.tiers || []).find((t) => t.tier === ta.bestTier);
+            const useTier = inUseTier(ta) ?? ta.bestTier;
+            const bestRow = (ta.tiers || []).find((t) => t.tier === useTier);
             const svc = bestRow ? bestRow.achievedService : ov["service_achieved%"];
             const oe = ov["order_err%"];
             const orderText = oe == null ? "no order data" : Math.abs(oe) < 8 ? "right-sized on average" : `ran ${Math.abs(Math.round(oe))}% too ${oe > 0 ? "high" : "low"}`;
@@ -761,7 +777,7 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
                headline's sign, because an interval spanning zero is the maseUnsure case. */
             const accRange = (!mci || maseUnsure) ? null
               : `95% confident: ${Math.round((1 - mci[1]) * 100)} to ${Math.round((1 - mci[0]) * 100)}% ${accDir}`;
-            const hcRow = tierRow(res.holidayCover, ta.bestTier ?? 95);
+            const hcRow = tierRow(res.holidayCover, useTier ?? 95);
             const costNote = !ta.priced ? ""
               : ta.costBasis === "actual" ? "Based on your real per-unit cost and fees."
               : `Based on the ${ta.costedSkus} of ${ta.totalSkus} tested products with a cost entered. Add costs for the rest to include them.`;
@@ -782,7 +798,7 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
                     <div className={`flex-1 min-w-[150px] rounded-xl border p-4 bg-[var(--t-panel)] border-[var(--t-line)]`}>
                       <div className={`text-[13px] uppercase tracking-widest font-bold ${muted} mb-1`}>Stayed in stock</div>
                       <div className={`text-2xl font-bold tabular-nums ${text}`}>{svc == null ? "-" : `${svc}%`}</div>
-                      <div className={`text-[14px] ${muted} mt-0.5`}>{bestRow ? `at the recommended ${ta.bestTier}% level` : "of past reorder cycles"}</div>
+                      <div className={`text-[14px] ${muted} mt-0.5`}>{bestRow ? `at the ${useTier}% level in use` : "of past reorder cycles"}</div>
                       {/* Show the range, not just the headline — a single number here reads as
                           far more precise than a few dozen overlapping test windows support. */}
                       {ciText(bestRow?.achievedServiceCI ?? ov["service_achieved%_ci"], "%") && (
@@ -815,7 +831,7 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
                   </div>
                 </div>
 
-                <HolidayWeeksCard hc={res.holidayCover} tier={ta.bestTier ?? 95} lm={lm} money={money}
+                <HolidayWeeksCard hc={res.holidayCover} tier={useTier ?? 95} lm={lm} money={money}
                   holidayCost={bestRow?.holidayCost} />
 
                 {ta.priced && ta.bestTier && (
@@ -970,7 +986,7 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
                           return (
                             <>
                               {ta.tiers.map((t) => {
-                                const isBest = !mixWins && t.tier === ta.bestTier;
+                                const isBest = !mixWins && t.tier === inUseTier(ta);
                                 return (
                                   <tr key={t.tier} className={`border-t border-[var(--t-line)] ${isBest ? ("bg-[var(--t-good-soft)]") : ""}`}>
                                     <td className={`px-3 py-2 text-[15px] font-bold ${text}`}>Everything at {t.tier}%{isBest && <span className={`ml-2 text-[13px] font-semibold px-1.5 py-0.5 rounded-full bg-[var(--t-good-soft)] text-[var(--t-good)]`}>in use</span>}</td>
@@ -1161,6 +1177,7 @@ export default function BacktestTab({ api = "http://localhost:8000", lm = false,
                           <tr key={t.tier} className={`border-t border-[var(--t-line)] ${rowBg}`}>
                             <td className={`px-3 py-2 text-[15px] font-bold tabular-nums ${text}`}>
                               {t.tier}%{isBest && <span className={`ml-2 text-[13px] font-semibold px-1.5 py-0.5 rounded-full bg-[var(--t-good-soft)] text-[var(--t-good)]`}>lowest cost</span>}
+                              {t.tier === inUseTier(ta) && <span className={`ml-2 text-[13px] font-semibold px-1.5 py-0.5 rounded-full border border-[var(--t-good-line)] text-[var(--t-good)]`}>in use</span>}
                             </td>
                             <td className={`px-3 py-2 text-[15px] font-bold tabular-nums ${tone(lm, lvlSvc(t.achievedService, t.tier))}`}>{t.achievedService}%</td>
                             <td className={`px-3 py-2 text-[14px] tabular-nums ${muted}`}>{ciText(t.achievedServiceCI, "%") || "-"}</td>

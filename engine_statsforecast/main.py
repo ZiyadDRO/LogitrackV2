@@ -4827,8 +4827,8 @@ def recommend_economic_protection(*, price, unit_cost, fees, margin_pct, demand_
                     reason = (f"Recommended from the last backtest: one shared level performed best. "
                               f"Per-product tuning didn't hold up on unseen weeks (the differences were "
                               f"mostly noise), so every product runs {tier['label']} protection "
-                              f"({tier['pct']}%), the catalog-wide winner across "
-                              f"{int(backtest_rec.get('windows') or 0)} historical tests.")
+                              f"({tier['pct']}%), the store-wide winner. This product was "
+                              f"tested on {int(backtest_rec.get('windows') or 0)} past reorders.")
                 else:
                     reason = (f"Recommended from the last backtest: {tier['label']} protection "
                               f"({tier['pct']}%) was the cheapest tier for this SKU, {cost_txt}, "
@@ -5412,8 +5412,11 @@ def get_forecast(sku_id: str = Query(...), stock: int = Query(default=ASSUMED_ST
     if _bt_cached is None:
         _bt_cached = next((v for k, v in _backtest_tier_cache.items()
                            if k.startswith(f"{sku_id}|")), None)
-    # A test running, or queued behind one, is about to replace these numbers.
-    _test_running = bool(_job.get("status") == "running" or _job.get("queued"))
+    # A test running, or queued behind one, is about to replace THIS product's numbers.
+    # A refit of other products doesn't: their rows are swapped in, but the store-wide
+    # level is read from the store's main analysis, which a settings change elsewhere
+    # leaves as it was. So their pages stay as they are instead of all saying "running".
+    _test_running = _bt_touches(str(sku_id))
     if _test_running and rec_source != "backtest":
         _status = "calculating"
     elif rec_source == "backtest":
@@ -6603,7 +6606,7 @@ def _bt_on_progress(phase: str, order: list, done: int, current) -> None:
         if phase == "fitting":
             _bt_order = list(order)
         _bt_job["progress"] = {"phase": phase if current is not None or phase == "fitting" else "finishing",
-                               "done": int(done), "total": len(order), "current": current}
+                               "done": float(done), "total": len(order), "current": current}
         if phase == "fitting" and current is None:
             # Every product's own fits are done; what's left is the comparison pass (full
             # runs) or the store-wide totals.
@@ -6633,6 +6636,18 @@ def _bt_pending_covers(sku: str) -> bool:
     if not pend:
         return False
     return pend.get("kind") != "partial" or sku in set(pend.get("skus") or [])
+
+
+def _bt_touches(sku: str) -> bool:
+    """Will the running or waiting test change this product's results?"""
+    with _bt_job_lock:
+        job = dict(_bt_job)
+        queued = _bt_pending_covers(str(sku))
+    if job.get("status") == "running":
+        part = job.get("partialSkus")
+        if part is None or str(sku) in set(part):
+            return True
+    return queued
 
 
 def _bt_sku_progress(sku: str) -> dict | None:
@@ -7149,8 +7164,13 @@ def _run_partial_job(skus: list, params: dict, combos: list, sku_costs: dict, ho
                                     should_stop=_bt_cancel.is_set,
                                     progress=lambda o, d, c: _bt_on_progress("fitting", o, d, c))
             merged = BT.merge_rows(prev_rows, fresh)
-            all_combos = sorted({(int(a), int(b)) for a, b in
-                                 zip(merged["leadDays"], merged["coverageDays"])})
+            # The previous run's main pair stays first: it's what the store-wide analysis
+            # (and so the store-wide level) is read from. Sorting put whichever pair was
+            # smallest first, so moving one product to a shorter coverage made the store's
+            # "main" analysis a store of one.
+            have = {(int(a), int(b)) for a, b in zip(merged["leadDays"], merged["coverageDays"])}
+            all_combos = [c for c in dict.fromkeys(tuple(map(int, c)) for c in prev_combos) if c in have]
+            all_combos += sorted(have - set(all_combos))
             with _state_lock:
                 if not _bt_stamp_still_valid(stamp):
                     raise _StaleBacktest()
@@ -7521,12 +7541,18 @@ def _cache_backtest_tiers(res: dict) -> None:
     measured_at = res.get("ranAt")
 
     by_combo = res.get("tierAnalysisByCombo") or {}
+    # ONE store-wide decision, read off the main analysis (every product, at the store's
+    # usual settings) — the one the Backtest tab shows as "in use". It used to be decided
+    # per settings pair, from only the products tested at that pair: one product moved to
+    # a 21-day coverage made a "store" of one, whose own "shared level" (95%) disagreed
+    # with the 99.5% every other product was on.
+    store_policy, store_pct = _combo_policy(res.get("tierAnalysis") or {})
     for combo_key, analysis in (by_combo or {}).items():
         try:
             c_lead, c_cov = (int(x) for x in str(combo_key).split("/"))
         except ValueError:
             continue
-        policy, uniform_pct = _combo_policy(analysis)
+        policy, uniform_pct = store_policy, store_pct
         for row in (analysis or {}).get("bySku") or []:
             if not row.get("costKnown") or row.get("lossMaking") or not row.get("bestTier"):
                 continue
@@ -7550,7 +7576,7 @@ def _cache_backtest_tiers(res: dict) -> None:
                 "holdingCostYr": tier.get("holdingCostYr"), "totalCostYr": tier.get("totalCostYr"),
                 "bufferCash": tier.get("bufferCash"),
             }
-    _legacy_policy, _legacy_uniform = _combo_policy(res.get("tierAnalysis") or {})
+    _legacy_policy, _legacy_uniform = store_policy, store_pct
     for row in (res.get("tierAnalysis") or {}).get("bySku") or []:
         if not row.get("costKnown") or row.get("lossMaking") or not row.get("bestTier"):
             continue
