@@ -5412,7 +5412,9 @@ def get_forecast(sku_id: str = Query(...), stock: int = Query(default=ASSUMED_ST
     if _bt_cached is None:
         _bt_cached = next((v for k, v in _backtest_tier_cache.items()
                            if k.startswith(f"{sku_id}|")), None)
-    if _job.get("status") == "running" and rec_source != "backtest":
+    # A test running, or queued behind one, is about to replace these numbers.
+    _test_running = bool(_job.get("status") == "running" or _job.get("queued"))
+    if _test_running and rec_source != "backtest":
         _status = "calculating"
     elif rec_source == "backtest":
         _status = "backtest"
@@ -5441,6 +5443,9 @@ def get_forecast(sku_id: str = Query(...), stock: int = Query(default=ASSUMED_ST
 
     protection_info = {
         "chosen": chosen_key, "recommended": rec_key, "options": PROTECTION_TIERS,
+        # A backtest is running (or queued) right now: the page says so plainly, since the
+        # level and buffer shown may change when it finishes.
+        "testRunning": _test_running,
         # Measured stayed-in-stock rate for the chosen tier; None until a backtest exists.
         "achievedPct": _achieved_pct,
         "reason": rec_reason, "marginPct": round(margin_pct, 1) if margin_pct is not None else None,

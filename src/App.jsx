@@ -417,6 +417,10 @@ export default function App() {
     clearInterval(btPoll.current);
     setBtJob({ status: "running" });
     skuList.forEach((s) => refreshSkuSummary(s.id, getParams(s.id)));   // flip to "calculating" now
+    // The open product page fetches its own forecast: nudge it too, so its "Backtest
+    // running now" banner appears at the start and clears at the end. It only refetched
+    // on its own inputs, so it kept showing "calculating" after the run had finished.
+    setRefreshNonce(n => n + 1);
     const started = Date.now();
     btPoll.current = setInterval(async () => {
       const st = await fetchJson(`${API}/api/backtest/status`).catch(() => null);
@@ -426,6 +430,7 @@ export default function App() {
       // Pull fresh forecasts so "calculating…" resolves into the measured number.
       skuList.forEach((s) => refreshSkuSummary(s.id, getParams(s.id)));
       loadScorecardRows(skuList, skuParams, openPOs);
+      setRefreshNonce(n => n + 1);
       // A finished run is the moment to check whether anything is STILL unmeasured. The
       // upload's own run only covers the defaults, so a product on a custom lead time
       // needs a follow-up — and this is the only point where we know one is due.

@@ -169,7 +169,9 @@ export function OrderMathCard({ data, leadTime, planSource, planNeeded, coverage
                   </svg>
                   Calculating…
                 </span>
-              ) : prot?.status === "stale" ? "re-testing for your new settings…"
+              ) : prot?.testRunning ? (
+                <span className="text-[var(--t-accent)] font-semibold">Backtest running now · this may update when it finishes</span>
+              ) : prot?.status === "stale" ? "tested for a different lead time or coverage · estimate until re-tested"
                 : prot?.source === "backtest" ? "cheapest across your own sales history"
                 : prot?.source === "economics" ? "provisional estimate, not yet tested against your history"
                 : prot?.costKnown ? `set from ${Math.round(prot.marginPct)}% margin (too little history to test)`
@@ -1183,6 +1185,30 @@ export default function SkuDetailPanel({ skuId, skuList, params: paramsIn, onPar
                 <label className={lbl}>
                   <Tip text="How hard to guard against running out. With enough history and a unit cost, it's picked from the item's expected stockout cost vs. buffer holding cost; otherwise from the margin rule. You can override it.">Stockout Protection</Tip>
                 </label>
+                {/* A test running (or queued) is about to replace what's below. Said loudly,
+                    not as a quiet tag: a level picked now may be a different one in minutes. */}
+                {p.testRunning && (
+                  <div className="mb-2 rounded-xl border px-3 py-2.5 flex items-start gap-2.5 bg-[var(--t-accent-soft)] border-[var(--t-accent-line)]">
+                    <svg className="h-4 w-4 mt-0.5 shrink-0 animate-spin text-[var(--t-accent)]" fill="none" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.4 0 0 5.4 0 12h4z" />
+                    </svg>
+                    <div>
+                      <div className="text-[15px] font-semibold text-[var(--t-accent)]">Backtest running now</div>
+                      <div className="text-[14px] text-[var(--t-soft)]">
+                        Testing protection levels against your sales history. This product&apos;s level and buffer
+                        {p.status === "calculating" ? " will appear" : " may change"} when it finishes, usually within a few minutes.
+                        No need to stay on this page.
+                      </div>
+                    </div>
+                  </div>
+                )}
+                {!p.testRunning && p.status === "stale" && (
+                  <div className="mb-2 text-[14px] text-[var(--t-dim)]">
+                    Tested for a different lead time or coverage than this product&apos;s current settings, so the level
+                    below is an estimate until it&apos;s re-tested (Backtest tab → Re-test now).
+                  </div>
+                )}
                 <div className={`rounded-xl border overflow-hidden ${"bg-[var(--t-sunken)] border-[var(--t-line)]"}`}>
                   {/* While a test is running, show NOTHING — no tiers, no percentages, no
                       buffer. A provisional figure that appears and then changes invites a
@@ -1198,7 +1224,7 @@ export default function SkuDetailPanel({ skuId, skuList, params: paramsIn, onPar
                       <div>
                         <div className={`text-[15px] font-semibold ${"text-[var(--t-soft)]"}`}>Calculating…</div>
                         <div className={`text-[14px] ${"text-[var(--t-dim)]"}`}>
-                          Testing protection levels against this product&apos;s sales history. Usually a few minutes.
+                          The protection levels appear here when the backtest finishes.
                         </div>
                       </div>
                     </div>
@@ -1282,7 +1308,7 @@ export default function SkuDetailPanel({ skuId, skuList, params: paramsIn, onPar
                         <Tip text={`Protection level: the probability of not stocking out during a replenishment cycle. z=${zScore?.toFixed(3)} is the standard normal score for ${p.servicePct}%.`}>
                           <span className={"text-[var(--t-dim)]"}>Protection (z={zScore?.toFixed(2)})</span>
                         </Tip>
-                        <span className={`font-mono font-bold ${"text-[var(--t-accent)]"}`}>{p.status === "calculating" ? "calculating…" : `${p.servicePct}%${p.achievedPct != null ? ` → ${p.achievedPct}% store-wide` : ""}${p.status === "stale" ? " · re-testing" : p.source === "backtest" ? " · tested" : p.source === "economics" ? " · provisional" : p.marginPct != null ? ` · ${Math.round(p.marginPct)}% margin` : ""}`}</span>
+                        <span className={`font-mono font-bold ${"text-[var(--t-accent)]"}`}>{p.status === "calculating" ? "calculating…" : `${p.servicePct}%${p.achievedPct != null ? ` → ${p.achievedPct}% store-wide` : ""}${p.status === "stale" ? " · tested for other settings" : p.source === "backtest" ? " · tested" : p.source === "economics" ? " · provisional" : p.marginPct != null ? ` · ${Math.round(p.marginPct)}% margin` : ""}`}</span>
                       </div>
                       {/* Show details: plain-English buffer math */}
                       <button onClick={() => setShowBufferMath(v => !v)}
