@@ -1736,8 +1736,8 @@ export default function SkuDetailPanel({ skuId, skuList, params: paramsIn, onPar
             )}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
           {(() => {
-            /* Holidays inside the chart's horizon, named once under it (the shading has
-               no labels: neighbouring holidays would print over each other). */
+            /* Holidays inside the chart's horizon, named once under it. The shading is
+               named too, but only where its band is wide enough (see ForecastChart). */
             const fut = mlData.inactive ? [] : (mlData.chartDataFuture || []);
             const endX = fut.length ? fut[fut.length - 1].x : 0;
             const wins = ((mlData.holidays || {}).windows || [])

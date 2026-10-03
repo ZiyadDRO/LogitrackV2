@@ -427,8 +427,14 @@ function HBasis({ r }) {
   const parts = [];
   if (b.ownYears > 0) parts.push(`${b.ownYears} year${b.ownYears === 1 ? "" : "s"} of this product's sales (${b.ownPct}%)`);
   if (b.peerCount > 0) parts.push(`${b.peerCount} ${peers} (${b.peerPct}%)`);
-  const tip = "Each day's level is this product's own, pulled toward the same day across similar products by how few units it rests on: the more this product sold around the holiday, the more its own pattern counts. No one product counts for more than a typical one. Only the day-by-day split comes from here; the total is always this forecast's own."
-    + ((b.peers || []).length ? `\n\n${b.peers.map(p => `${p.name} ${p.pct}%`).join(", ")}` : "");
+  // Every share here is of the whole pattern, so they add up to 100%.
+  const shares = [b.ownYears > 0 ? `This product: ${b.ownPct}%` : null,
+                  ...(b.peers || []).map(p => `${p.name}: ${p.pct}%`)].filter(Boolean);
+  const tip = "How sales spread across the holiday's days is learned from this product's past years, "
+    + "mixed with similar products' when this product has sold too little around the holiday to go on alone. "
+    + "The less it has sold, the more the similar products count, and no single one counts for more than a typical one. "
+    + "This only decides how the holiday's units are spread over its days; how many units comes from this product's own forecast."
+    + (shares.length ? `\n\nShare of the pattern:\n${shares.join("\n")}` : "");
   return (
     <div className="mt-2 text-[13px] leading-relaxed" style={{ color: "var(--t-dim)" }}>
       Pattern based on {parts.join(" and ")}{" "}

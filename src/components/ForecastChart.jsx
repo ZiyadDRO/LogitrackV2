@@ -272,13 +272,20 @@ export function ForecastChart({ historyPoints, futurePoints, rangePoints, stocko
         <Tooltip content={<ChartTooltip lm={lm} />} />
         <Legend wrapperStyle={{ fontSize: 10, fontFamily: "ui-monospace, monospace", color: legendColor, paddingBottom: 4 }} />
 
-        {/* Holidays the forecast shapes, shaded on their own dates. Grey and unlabelled;
-            the line under the chart names them. Day spans run to the end of the last day. */}
-        {(holidayWindows || []).map((h, i) => (
-          <ReferenceArea key={`h${i}`} ifOverflow="hidden" x1={new Date(h.start + "T00:00:00Z").getTime()}
-            x2={new Date(h.end + "T00:00:00Z").getTime() + 86400000}
-            fill={CT.ink} fillOpacity={lm ? 0.05 : 0.06} />
-        ))}
+        {/* Holidays the forecast shapes, shaded grey on their own dates and named at the
+            top of the band: unnamed, a holiday overlapping the lead time read as part of it
+            (or as the coverage period). Day spans run to the end of the last day. */}
+        {(holidayWindows || []).map((h, i) => {
+          const a = new Date(h.start + "T00:00:00Z").getTime(), b = new Date(h.end + "T00:00:00Z").getTime() + 86400000;
+          // Named only when the band is wide enough for its name (the lead-time label's
+          // rule), so neighbouring holidays never print over each other.
+          const fits = (pxOf(Math.min(b, x1)) - pxOf(Math.max(a, x0))) > String(h.name).length * 6.2 + 12;
+          return (
+            <ReferenceArea key={`h${i}`} ifOverflow="hidden" x1={a} x2={b}
+              fill={CT.ink} fillOpacity={lm ? 0.05 : 0.06}
+              label={fits ? { value: h.name, position: "insideTopLeft", fill: CT.dim, fontSize: 10.5, fontFamily: MONO, offset: 6 } : undefined} />
+          );
+        })}
         {(upcomingPromos || []).map((p, i) => (
           <ReferenceArea key={i} ifOverflow="hidden" x1={new Date(p.date + "T00:00:00Z").getTime()} x2={new Date((p.end_date || p.date) + "T00:00:00Z").getTime()}
             fill={CT.blue} fillOpacity={lm ? 0.12 : 0.10} label={{ value: p.label || "Promo", fill: CT.blue, fontSize: 11 }} />

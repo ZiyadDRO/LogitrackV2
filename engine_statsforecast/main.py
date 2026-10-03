@@ -1094,9 +1094,15 @@ def _hs_report(df, future_fc, lv, own, off, to_real, settings, shift=0, peer_inf
         # which similar products steady it and how much of their evidence each one is.
         own_pct = float(L.get("ownShare") or 0.0) if L else 0.0
         shares = list(L.get("peerShares") or []) if L else []
+        # Each similar product's share of the WHOLE pattern, not of the similar products'
+        # part: two peers splitting a 54% part evenly are 27% each. Shown as 50% / 50%
+        # next to "similar products: 54%", they read as if the pattern were all theirs.
+        _peer_part = (100 - own_pct) if n_pool else 0.0
+        peers_whole = [{**p_, "pct": round(float(p_.get("pct") or 0) * _peer_part / 100.0),
+                        "pctOfPeers": p_.get("pct")} for p_ in shares[:12]]
         basis = {"ownYears": n_own, "ownPct": round(own_pct) if (n_own or n_pool) else None,
                  "peerPct": (round(100 - own_pct) if n_pool else 0),
-                 "peers": shares[:12], "peerCount": n_pool,
+                 "peers": peers_whole, "peerCount": n_pool,
                  "scope": (peer_info or {}).get("scope"), "category": (peer_info or {}).get("category"),
                  "alone": _none}
         if n_own and n_pool:
