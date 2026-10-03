@@ -151,8 +151,8 @@ export function OrderMathCard({ data, leadTime, planSource, planNeeded, coverage
                 {prot?.label || "Standard"} protection ({prot?.servicePct ?? 95}%)
                 {prot?.achievedPct != null && (
                   <span className={`ml-1.5 font-mono font-normal text-[14px] ${"text-[var(--t-warn)]"}`}
-                        title={`Replayed against your own sales history, this level actually kept ${prot.achievedPct}% of lead-time windows in stock. The tier name is the target; this is what it delivered.`}>
-                    · {prot.achievedPct}% measured
+                        title={`Store-wide, not this product alone: replayed against your sales history, the ${prot.servicePct}% level kept ${prot.achievedPct}% of lead-time windows in stock across all tested products. The level's name is the target; this is what it delivered across your store.`}>
+                    · {prot.achievedPct}% store-wide
                   </span>
                 )}
                 <span className={`ml-1.5 font-mono font-normal text-[14px] ${"text-[var(--t-dim)]"}`}>+{data.safetyStock} units</span>
@@ -1282,7 +1282,7 @@ export default function SkuDetailPanel({ skuId, skuList, params: paramsIn, onPar
                         <Tip text={`Protection level: the probability of not stocking out during a replenishment cycle. z=${zScore?.toFixed(3)} is the standard normal score for ${p.servicePct}%.`}>
                           <span className={"text-[var(--t-dim)]"}>Protection (z={zScore?.toFixed(2)})</span>
                         </Tip>
-                        <span className={`font-mono font-bold ${"text-[var(--t-accent)]"}`}>{p.status === "calculating" ? "calculating…" : `${p.servicePct}%${p.achievedPct != null ? ` → ${p.achievedPct}% measured` : ""}${p.status === "stale" ? " · re-testing" : p.source === "backtest" ? " · tested" : p.source === "economics" ? " · provisional" : p.marginPct != null ? ` · ${Math.round(p.marginPct)}% margin` : ""}`}</span>
+                        <span className={`font-mono font-bold ${"text-[var(--t-accent)]"}`}>{p.status === "calculating" ? "calculating…" : `${p.servicePct}%${p.achievedPct != null ? ` → ${p.achievedPct}% store-wide` : ""}${p.status === "stale" ? " · re-testing" : p.source === "backtest" ? " · tested" : p.source === "economics" ? " · provisional" : p.marginPct != null ? ` · ${Math.round(p.marginPct)}% margin` : ""}`}</span>
                       </div>
                       {/* Show details: plain-English buffer math */}
                       <button onClick={() => setShowBufferMath(v => !v)}
@@ -1322,7 +1322,7 @@ export default function SkuDetailPanel({ skuId, skuList, params: paramsIn, onPar
                               </p>
                             )}
                             <p className={`pt-1 leading-relaxed ${"text-[var(--t-dim)]"}`}>
-                              We hold <span className="font-semibold">{mlData.safetyStock}</span> spare units to cover demand swings during the {lt}-day wait about {p.servicePct}% of the time{p.achievedPct != null ? ` (replayed against your history: ${p.achievedPct}%, since real demand has a longer tail than the bell curve the buffer assumes)` : ""}. The swing comes from how far past forecasts missed over real {lt}-day stretches{widened ? "; this item sells in clumps, so it's wider than a steady seller's and earns extra buffer" : ", and here it matches the day-to-day swing stretched over the wait"}. A noisier or clumpier item, or a longer lead time, raises this; a steadier one lowers it.
+                              We hold <span className="font-semibold">{mlData.safetyStock}</span> spare units to cover demand swings during the {lt}-day wait about {p.servicePct}% of the time{p.achievedPct != null ? ` (replayed against your history, this level kept ${p.achievedPct}% of windows in stock across your store, since real demand has a longer tail than the bell curve the buffer assumes)` : ""}. The swing comes from how far past forecasts missed over real {lt}-day stretches{widened ? "; this item sells in clumps, so it's wider than a steady seller's and earns extra buffer" : ", and here it matches the day-to-day swing stretched over the wait"}. A noisier or clumpier item, or a longer lead time, raises this; a steadier one lowers it.
                             </p>
                           </div>
                         );
