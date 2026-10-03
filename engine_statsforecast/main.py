@@ -6593,6 +6593,78 @@ _bt_job_lock = threading.Lock()
 _bt_pending: dict | None = None      # newest request that arrived mid-run, if any
 # Set when a newer request replaces the running test; the run checks it between products.
 _bt_cancel = threading.Event()
+_bt_order: list = []                 # the products the running test covers, in fitting order
+
+
+def _bt_on_progress(phase: str, order: list, done: int, current) -> None:
+    """Called by the backtest as each product starts. Feeds the product page's bar."""
+    global _bt_order
+    with _bt_job_lock:
+        if phase == "fitting":
+            _bt_order = list(order)
+        _bt_job["progress"] = {"phase": phase if current is not None or phase == "fitting" else "finishing",
+                               "done": int(done), "total": len(order), "current": current}
+        if phase == "fitting" and current is None:
+            # Every product's own fits are done; what's left is the comparison pass (full
+            # runs) or the store-wide totals.
+            _bt_job["progress"]["phase"] = "baseline" if _bt_job.get("partialSkus") is None else "finishing"
+
+
+def _bt_fraction(job: dict) -> float | None:
+    """How far through the running test is, 0–1. A full run spends roughly as long on its
+    single-model comparison pass as on the real fits, so each is weighted about half."""
+    pr = job.get("progress") or {}
+    total = pr.get("total") or 0
+    if job.get("status") != "running" or not total:
+        return None
+    partial = job.get("partialSkus") is not None
+    frac = min(1.0, (pr.get("done") or 0) / total)
+    if pr.get("phase") == "finishing":
+        return 0.97
+    if partial:
+        return round(0.95 * frac, 3)
+    if pr.get("phase") == "baseline":
+        return round(0.5 + 0.45 * frac, 3)
+    return round(0.5 * frac, 3)
+
+
+def _bt_pending_covers(sku: str) -> bool:
+    pend = _bt_pending
+    if not pend:
+        return False
+    return pend.get("kind") != "partial" or sku in set(pend.get("skus") or [])
+
+
+def _bt_sku_progress(sku: str) -> dict | None:
+    """Where ONE product stands in the running test, for the bar on its page:
+    refitting | done | waiting (with how many ahead) | queued (after this run) |
+    other (the run is re-testing other products, not this one)."""
+    sku = str(sku)
+    with _bt_job_lock:
+        job = dict(_bt_job)
+        order = list(_bt_order)
+        queued = _bt_pending_covers(sku)
+    out = {"fraction": _bt_fraction(job)}
+    if job.get("status") != "running":
+        return {**out, "state": "queued"} if queued else None
+    in_run = job.get("partialSkus") is None or sku in set(job.get("partialSkus") or [])
+    if not in_run:
+        return {**out, "state": "queued" if queued else "other",
+                "refitting": len(job.get("partialSkus") or [])}
+    pr = job.get("progress") or {}
+    if pr.get("phase") in ("baseline", "finishing"):
+        return {**out, "state": "done"}
+    if sku not in order:
+        # The run hasn't reported its list yet (it's still reading the catalog).
+        return {**out, "state": "waiting", "ahead": None}
+    pos = order.index(sku)
+    cur = pr.get("current")
+    at = order.index(cur) if cur in order else int(pr.get("done") or 0)
+    if pos < at:
+        return {**out, "state": "done"}
+    if pos == at:
+        return {**out, "state": "refitting"}
+    return {**out, "state": "waiting", "ahead": pos - at}
 
 
 class _StaleBacktest(Exception):
@@ -6602,6 +6674,9 @@ class _StaleBacktest(Exception):
 def _bt_job_snapshot() -> dict:
     with _bt_job_lock:
         snap = dict(_bt_job)
+        pend = _bt_pending
+    snap["fraction"] = _bt_fraction(snap)
+    snap["queuedSkus"] = None if not pend else ("all" if pend.get("kind") != "partial" else list(pend.get("skus") or []))
     # When the STORED REPORT last changed. A recost re-prices the last run without
     # starting a job, so a client watching only job transitions never learns that the
     # numbers moved — which is exactly what happened when the holding rate changed: the
@@ -6624,14 +6699,18 @@ def _run_backtest_job(params: dict, sku_costs: dict, trigger: str) -> bool:
             # so it stops at its next product and this one starts straight after. Its
             # half-finished numbers are dropped; the last finished run stays on screen
             # until this one lands.
-            _bt_pending = {"params": dict(params), "sku_costs": dict(sku_costs), "trigger": trigger}
+            # A whole-store run measures every product, so it also covers any one-product
+            # re-test that was waiting.
+            _bt_pending = {"kind": "full", "params": dict(params), "sku_costs": dict(sku_costs), "trigger": trigger}
             _bt_job["queued"] = True
             _bt_cancel.set()
             return False
         _bt_cancel.clear()
+        _bt_order.clear()
         _bt_job.update({"status": "running", "startedAt": time.time(), "finishedAt": None,
                         "params": dict(params), "error": None, "trigger": trigger, "queued": False,
-                        "summary": None})
+                        "summary": None, "partialSkus": None,
+                        "progress": {"phase": "starting", "done": 0, "total": 0, "current": None}})
 
     def work():
         BT = _bt()          # checked import: verifies Z matches PROTECTION_TIERS
@@ -6649,7 +6728,7 @@ def _run_backtest_job(params: dict, sku_costs: dict, trigger: str) -> bool:
             _eff = _effective_sku_costs(sku_costs) or {}
             _sink = []
             res = BT.run_for_api(df, **params, sku_costs=_eff, sku_sources=srcs, rows_sink=_sink,
-                                 should_stop=_bt_cancel.is_set)
+                                 should_stop=_bt_cancel.is_set, progress=_bt_on_progress)
             with _state_lock:
                 global _last_backtest_rows, _last_backtest_combos
                 if not _bt_stamp_still_valid(stamp):
@@ -6685,8 +6764,7 @@ def _run_backtest_job(params: dict, sku_costs: dict, trigger: str) -> bool:
             with _bt_job_lock:
                 nxt, _bt_pending = _bt_pending, None
                 _bt_job["queued"] = False
-            if nxt:
-                _run_backtest_job(nxt["params"], nxt["sku_costs"], nxt["trigger"])
+            _bt_start_pending(nxt)
 
     threading.Thread(target=work, daemon=True, name="backtest-job").start()
     return True
@@ -6991,7 +7069,9 @@ def backtest_partial(payload: dict = Body(default={})):
     combos = _parse_combos(p.get("combos"))
     costs = _effective_sku_costs(_parse_sku_costs(p.get("costs"))) or {}
     started = _run_partial_job(skus, params, combos, costs, int(p.get("holding", _session_holding_pct)))
-    return {"started": started, "skus": skus, **_bt_job_snapshot()}
+    # "queued" still counts as started: it runs on its own as soon as the current test
+    # ends, so the dashboard must NOT fall back to a whole-store run.
+    return {"started": True, "queued": started == "queued", "skus": skus, **_bt_job_snapshot()}
 
 
 @app.get("/api/backtest/last")
@@ -7003,16 +7083,54 @@ def backtest_last():
     return {"available": True, "result": _last_backtest, "job": _bt_job_snapshot()}
 
 
-def _run_partial_job(skus: list, params: dict, combos: list, sku_costs: dict, holding_pct: int) -> bool:
-    """Background refit of `skus` only, merged into the stored rows."""
+def _bt_start_pending(nxt: dict | None) -> None:
+    """Start whatever arrived while the last test was busy."""
+    if not nxt:
+        return
+    if nxt.get("kind") == "partial":
+        _run_partial_job(nxt["skus"], nxt["params"], nxt["combos"], nxt["sku_costs"], nxt["holding_pct"])
+    else:
+        _run_backtest_job(nxt["params"], nxt["sku_costs"], nxt["trigger"])
+
+
+def _union_combos(a, b) -> list:
+    return sorted({(int(x), int(y)) for x, y in list(a or []) + list(b or [])})
+
+
+def _run_partial_job(skus: list, params: dict, combos: list, sku_costs: dict, holding_pct: int) -> str:
+    """Background refit of `skus` only, merged into the stored rows.
+
+    Returns "started", or "queued" when a test is already running. A one-product change
+    never turns into a whole-store run:
+      · a one-product test is running → it's stopped and restarted with both products
+        (its own fits are redone, everything else is left alone);
+      · a whole-store test is running → it finishes (it's measuring everyone else, and
+        throwing that away would cost minutes), then just these products are refitted;
+      · a whole-store test is already waiting → it's told about the new settings."""
+    global _bt_pending
     with _bt_job_lock:
         if _bt_job["status"] == "running":
-            # The caller falls back to a full run, which replaces the running one.
-            return False
+            pend = _bt_pending
+            if pend and pend.get("kind") != "partial":
+                pend["params"]["combos"] = _union_combos(pend["params"].get("combos"), combos)
+            else:
+                running = _bt_job.get("partialSkus")
+                carry = set((pend or {}).get("skus") or [])
+                if running is not None:
+                    carry |= set(running)
+                    _bt_cancel.set()
+                _bt_pending = {"kind": "partial", "skus": sorted(carry | {str(x) for x in skus}),
+                               "params": dict(params), "sku_costs": dict(sku_costs),
+                               "holding_pct": int(holding_pct),
+                               "combos": _union_combos((pend or {}).get("combos"), combos)}
+            _bt_job["queued"] = True
+            return "queued"
         _bt_cancel.clear()
+        _bt_order.clear()
         _bt_job.update({"status": "running", "startedAt": time.time(), "finishedAt": None,
                         "params": dict(params), "error": None, "trigger": f"partial:{len(skus)}",
-                        "queued": False, "summary": None})
+                        "queued": False, "summary": None, "partialSkus": [str(x) for x in skus],
+                        "progress": {"phase": "starting", "done": 0, "total": len(skus), "current": None}})
 
     def work():
         BT = _bt()          # checked import: verifies Z matches PROTECTION_TIERS
@@ -7028,7 +7146,8 @@ def _run_partial_job(skus: list, params: dict, combos: list, sku_costs: dict, ho
                                     params["lead"], params["coverage"], params["service_pct"],
                                     params["min_train"], verbose=False, sku_costs=sku_costs,
                                     combos=combos or prev_combos or None, only_skus=skus,
-                                    should_stop=_bt_cancel.is_set)
+                                    should_stop=_bt_cancel.is_set,
+                                    progress=lambda o, d, c: _bt_on_progress("fitting", o, d, c))
             merged = BT.merge_rows(prev_rows, fresh)
             all_combos = sorted({(int(a), int(b)) for a, b in
                                  zip(merged["leadDays"], merged["coverageDays"])})
@@ -7064,15 +7183,14 @@ def _run_partial_job(skus: list, params: dict, combos: list, sku_costs: dict, ho
             with _bt_job_lock:
                 nxt, _bt_pending = _bt_pending, None
                 _bt_job["queued"] = False
-            if nxt:
-                _run_backtest_job(nxt["params"], nxt["sku_costs"], nxt["trigger"])
+            _bt_start_pending(nxt)
 
     threading.Thread(target=work, daemon=True, name="backtest-partial").start()
-    return True
+    return "started"
 
 
 @app.get("/api/backtest/status")
-def backtest_status():
+def backtest_status(sku: str | None = None):
     """Where the background run is up to, plus WHICH (lead, coverage) pairs have actually
     been measured.
 
@@ -7083,8 +7201,11 @@ def backtest_status():
     combos = sorted({f"{v.get('lead')}/{v.get('coverage')}"
                      for v in _backtest_tier_cache.values()
                      if v.get("lead") is not None and v.get("coverage") is not None})
-    return {**_bt_job_snapshot(), "cachedCombos": combos,
-            "cachedSkus": sorted({k.split("|")[0] for k in _backtest_tier_cache})}
+    out = {**_bt_job_snapshot(), "cachedCombos": combos,
+           "cachedSkus": sorted({k.split("|")[0] for k in _backtest_tier_cache})}
+    if sku is not None:
+        out["sku"] = _bt_sku_progress(sku)      # one product's place in the run, for its page
+    return out
 
 
 @app.post("/api/backtest/catalog")

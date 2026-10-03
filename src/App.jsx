@@ -462,7 +462,15 @@ export default function App() {
     const missing = [...need].filter((k) => !have.has(k) && !btAsked.current.has(k));
     if (missing.length) {
       missing.forEach((k) => btAsked.current.add(k));
-      triggerBacktest("missing-pairs");
+      // Only the products on an unmeasured pair need fitting. With a finished run to merge
+      // into, re-test just those; the whole store only on the very first run.
+      const gap = new Set(missing);
+      const skus = skuList.filter((s) => {
+        const q = getParams(s.id);
+        return gap.has(`${planningLeadTime(s.id, q, suppliers, { ignoreOneOff: true }).days}/${q.coverage ?? DEFAULT_PARAMS.coverage}`);
+      }).map((s) => s.id);
+      if (st.lastRanAt && skus.length && skus.length < skuList.length) triggerPartial(skus);
+      else triggerBacktest("missing-pairs");
     } else if (st.status === "running") {
       watchBacktest();
     } else {
@@ -499,6 +507,27 @@ export default function App() {
     Object.entries(skuParams).sort(([a], [b]) => a.localeCompare(b))
       .map(([id, p]) => [id, p?.unitCost ?? null, p?.fees ?? null]).concat([["holding", holdingPct]])
   );
+  const btPairsNow = () => {
+    const now = {};
+    skuList.forEach((s) => {
+      const q = getParams(s.id);
+      now[s.id] = `${planningLeadTime(s.id, q, suppliers, { ignoreOneOff: true }).days}/${q.coverage ?? DEFAULT_PARAMS.coverage}`;
+    });
+    return now;
+  };
+  /* Remember each product's settings as soon as it's loaded, without testing anything.
+     The first edit after opening the app used to find nothing remembered, count as "first
+     run" and re-test the WHOLE store for one product's change. What's actually unmeasured
+     at load is ensurePairsMeasured's job, not this one's. */
+  const skuIdsSig = skuList.map((s) => s.id).join("\u0001");
+  useEffect(() => {
+    if (!skuList.length) return;
+    const now = btPairsNow();
+    const prev = btPrevPairs.current || {};
+    Object.keys(now).forEach((id) => { if (prev[id] === undefined) prev[id] = now[id]; });
+    btPrevPairs.current = prev;
+  }, [skuIdsSig]);   // eslint-disable-line react-hooks/exhaustive-deps
+
   const btFirstRun = useRef(true);
   useEffect(() => {
     if (btFirstRun.current) { btFirstRun.current = false; return; }   // don't fire on mount
@@ -509,11 +538,7 @@ export default function App() {
     btDebounce.current = setTimeout(() => {
       // Every product gets a fingerprint, including one still on the default lead time
       // (it's tested at that default), so changing its coverage re-tests it too.
-      const now = {};
-      skuList.forEach((s) => {
-        const q = getParams(s.id);
-        now[s.id] = `${planningLeadTime(s.id, q, suppliers, { ignoreOneOff: true }).days}/${q.coverage ?? DEFAULT_PARAMS.coverage}`;
-      });
+      const now = btPairsNow();
       const prev = btPrevPairs.current;
       btPrevPairs.current = now;
       const plan = planRecompute(prev, now);
@@ -588,7 +613,10 @@ export default function App() {
         body: JSON.stringify({ skus, combos, costs, holding: Number(holdingPct) || 25 }),
       });
       const d = await r.json();
-      if (!d?.started) { triggerBacktest("params-changed"); return; }   // nothing to merge into
+      // Not started only when there's no finished run to merge into. A test already
+      // running isn't a reason for a whole-store run: the backend queues just these
+      // products (d.queued) and starts them itself.
+      if (!d?.started) { triggerBacktest("params-changed"); return; }
       watchBacktest();
     } catch { triggerBacktest("params-changed"); }
   }, [skuList, skuParams, holdingPct, watchBacktest]);   // eslint-disable-line react-hooks/exhaustive-deps

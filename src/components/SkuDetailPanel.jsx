@@ -327,6 +327,45 @@ export function SkuSignalStrip({ mlData, statusCfg, apiKey, lm, alwaysOpen = fal
 }
 
 // ─── SKU DETAIL PANEL ─────────────────────────
+/* Where this product is in the running backtest, polled about once a second while the
+   "Backtest running now" banner is up. The engine reports which product it's fitting, so
+   this can say "refitting this product" vs "waiting, 4 ahead" rather than one spinner. */
+function RefitProgress({ skuId }) {
+  const [st, setSt] = useState(null);
+  useEffect(() => {
+    let alive = true;
+    const tick = async () => {
+      const d = await fetchJson(`${API}/api/backtest/status?sku=${encodeURIComponent(skuId)}`).catch(() => null);
+      if (alive && d) setSt(d.sku ? { ...d.sku, partial: Array.isArray(d.partialSkus) } : null);
+    };
+    tick();
+    const t = setInterval(tick, 1200);
+    return () => { alive = false; clearInterval(t); };
+  }, [skuId]);
+  if (!st) return null;
+  const pct = st.fraction == null ? null : Math.round(st.fraction * 100);
+  const label = {
+    refitting: "Refitting this product",
+    done: st.partial ? "This product is refitted · updating the store totals" : "This product is refitted · finishing the rest of the store",
+    waiting: st.ahead ? `Waiting · ${st.ahead} product${st.ahead === 1 ? "" : "s"} ahead of this one` : "Starting",
+    queued: "Next up · starts when the current test finishes",
+    other: `Re-testing ${st.refitting || "other"} other product${st.refitting === 1 ? "" : "s"} · this one isn't refitted, its level may still shift with the store's`,
+  }[st.state] || "Working";
+  // A queued product has no progress of its own yet; show the current test's.
+  return (
+    <div className="mt-2">
+      <div className="flex items-center justify-between gap-2 text-[13px] text-[var(--t-dim)]">
+        <span className="truncate">{label}</span>
+        {pct != null && <span style={{ fontFamily: MONO }}>{pct}%</span>}
+      </div>
+      <div className="mt-1 h-1.5 rounded-full bg-[var(--t-line)] overflow-hidden">
+        <div className="h-full rounded-full bg-[var(--t-accent)] transition-[width] duration-700 ease-out"
+             style={{ width: `${pct ?? 0}%`, opacity: st.state === "queued" || st.state === "other" ? 0.45 : 1 }} />
+      </div>
+    </div>
+  );
+}
+
 export default function SkuDetailPanel({ skuId, skuList, params: paramsIn, onParamChange, openPOs, setOpenPOs, apiKey, lm, suppliers, setSuppliers, receiveStock, refreshNonce, onExport, exporting,
                                         arrival = null, onConfirmArrival = null, onIgnoreArrival = null }) {
   // The page builds a fresh params object on every render; keyed on content so the
@@ -1193,13 +1232,14 @@ export default function SkuDetailPanel({ skuId, skuList, params: paramsIn, onPar
                       <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
                       <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.4 0 0 5.4 0 12h4z" />
                     </svg>
-                    <div>
+                    <div className="flex-1 min-w-0">
                       <div className="text-[15px] font-semibold text-[var(--t-accent)]">Backtest running now</div>
                       <div className="text-[14px] text-[var(--t-soft)]">
                         Testing protection levels against your sales history. This product&apos;s level and buffer
-                        {p.status === "calculating" ? " will appear" : " may change"} when it finishes, usually within a few minutes.
+                        {p.status === "calculating" ? " will appear" : " may change"} when it finishes.
                         No need to stay on this page.
                       </div>
+                      <RefitProgress skuId={skuId} />
                     </div>
                   </div>
                 )}
